@@ -5,6 +5,7 @@ Run as a script in the coordinator image with the candidate b12x on PYTHONPATH.
 No timing loop. Numeric records go to JSONL; a failing verdict exits nonzero.
 """
 import argparse
+import faulthandler
 import importlib.util
 import hashlib
 import json
@@ -50,16 +51,25 @@ def row_errors(actual, expected):
 
 
 def run(args, emit):
+    # Keep markers off the numeric JSONL contract. The last marker plus
+    # Python's fatal stack identifies host faults before a partial exists.
+    def phase(name):
+        print(f"row56 phase: {name}", file=sys.stderr, flush=True)
+
+    phase("import benchmark fixture module")
     spec = importlib.util.spec_from_file_location('seeded_context_bench', args.bench)
     bench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bench)
     torch.backends.cuda.matmul.allow_tf32 = False
+    phase("set CPU thread count")
     torch.set_num_threads(4)
+    phase("create CUDA stream")
     stream = torch.cuda.Stream()
     handle = cuda.CUstream(stream.cuda_stream)
     bad = 0
     for family in args.cells.split(','):
         g = {'glm': GLM53, 'ml4': mistral_large4.rope_attention()}[family]
+        phase(f"{family}: build seeded fixture")
         gen = torch.Generator(device='cuda').manual_seed(bench.aot_cell_seed(41512, family, 'asymmetric'))
         cache, idx, _, mk, mv = bench.make_records(2048, 64, 576, False, gen, CAP, 'cuda')
         q = (torch.randn(CAP, 64, 576, generator=gen, device='cuda') * 2.5).bfloat16()
@@ -69,24 +79,29 @@ def run(args, emit):
             table = torch.full_like(idx, -1)
             table[:, :owned.shape[1]] = owned
             local.append((table, torch.full((CAP,), owned.shape[1], device='cuda', dtype=torch.int32)))
+        phase(f"{family}: compile combine (no launch)")
         combine = cs.compile_lse_combine2_aot(heads=32, has_sink=False)
         for begin in args.head_begin:
+            phase(f"{family} head={begin}: CPU FP64 reference")
             refs = independent(cache, q, idx, begin, g.softmax_scale)
             # Recompute exactly the benchmark output reference, including the
             # last batch at lo=56, and retain its original CPU snapshot.
             parts = []
             for lo in range(0, CAP, 8):
+                phase(f"{family} head={begin}: torch BMM reference lo={lo}")
                 ids = idx[lo:lo+8].long()
                 k, v = mk[ids], mv[ids]
                 score = torch.bmm(q[lo:lo+8, begin:begin+32].float(), k.transpose(1, 2)) * g.softmax_scale
                 parts.append(torch.bmm(score.softmax(-1), v))
             batched = torch.cat(parts)
+            phase(f"{family} head={begin}: synchronize and copy reference")
             frozen = batched[WATCH].cpu()
             ref_err = row_errors(frozen, refs[2][0])
             emit(dict(stage='reference', family=family, begin=begin, watch=WATCH, bmm_vs_cpu=ref_err))
             bad += not all(x < 1e-4 for x in ref_err)
             for splits in args.splits:
                 for arm in ('fp8', 'bf16'):
+                    phase(f"{family} head={begin} {splits=} {arm}: compile partial")
                     program = cs.compile_sparse_mla_partial_aot(g, max_rows=CAP, head_begin=begin,
                                 head_count=32, num_splits=splits, precision=arm)
                     scratch = [torch.empty(program.scratch_bytes(CAP)['scratch'], device='cuda', dtype=torch.uint8)
@@ -109,6 +124,7 @@ def run(args, emit):
                                 lses[rank].fill_(float('nan'))
                             combined.fill_(float('nan'))
 
+                        phase(f"{family} head={begin} {splits=} {arm} rows={n}: warm and capture")
                         torch.cuda.synchronize()
                         with torch.cuda.stream(stream):
                             for rank in (0, 1):
@@ -121,6 +137,7 @@ def run(args, emit):
                         count = sum(r < n for r in WATCH)
                         observed = []
                         for mode in ('eager-poison', 'replay-poison', 'replay-dirty', 'replay-poison-again'):
+                            phase(f"{family} head={begin} {splits=} {arm} rows={n}: {mode}")
                             with torch.cuda.stream(stream):
                                 if mode != 'replay-dirty':
                                     reset()
@@ -171,6 +188,7 @@ def main():
     p.add_argument('--rows', type=int, nargs='+', default=[56, 57, 64, 57])
     p.add_argument('--head-begin', type=int, nargs='+', choices=[0, 32], default=[0])
     args = p.parse_args()
+    faulthandler.enable(all_threads=True)
     if not all(56 <= x <= CAP for x in args.rows):
         p.error('this probe watches rows 55..63; use live counts in 56..64')
     with args.jsonl.open('w') as out:
