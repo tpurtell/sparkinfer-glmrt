@@ -91,3 +91,69 @@ def test_context_critical_path_pairs_alternating_blocks(tmp_path):
     args = parse_args(["--mode", "context-aot", "--cells", "v4p,ml4nope", "--output", str(tmp_path / "out.json")])
     assert args.cells == ["v4p", "ml4nope"]
     assert critical_path_samples([[1.0, 4.0, 1.0], [3.0, 2.0, 3.0]]) == [3.0, 4.0, 3.0]
+
+
+@pytest.mark.parametrize("family", ["glm", "glmf", "v4f", "v4p"])
+def test_aot_first_launch_inside_capture(family):
+    """A new process must not silently choose a different cold graph route."""
+    import os
+    import subprocess
+    import sys
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    child = r"""
+import sys
+import torch
+from cuda.bindings import driver as cuda
+from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
+from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
+from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
+from benchmarks.bench_mg_precision import make_records
+
+family = sys.argv[1]
+v4 = family.startswith("v4")
+g = {"glm": GLM53, "glmf": GLM53_FLASH, "v4f": FLASH, "v4p": PRO}[family]
+rows = 64
+device = torch.device("cuda", torch.cuda.current_device())
+gen = torch.Generator(device=device).manual_seed(2146)
+qdim = 512 if v4 else g.latent_dim
+width = 128 if v4 else getattr(g, "sparse_topk", g.index_topk)
+cache, indices, lengths, *_ = make_records(width, 256 if v4 else g.page_rows, qdim, v4, gen, rows, device)
+query = torch.randn((rows, g.heads, qdim), device=device, generator=gen).bfloat16()
+args = (query, cache, indices, lengths)
+with exportable_compilation():
+    if v4:
+        extra, ei, el, *_ = make_records(8192, 2, qdim, True, gen, rows, device)
+        args += (extra, ei, el, torch.zeros(g.heads, device=device))
+        program = compile_dsv4_sparse_mla_aot(g, route="decode", max_rows=rows,
+                   indexed_width=8192, indexed_page_rows=2, precision="bf16")
+    else:
+        program = compile_glm_sparse_mla_aot(g, route="decode", max_rows=rows,
+                   precision="bf16", fp32_partials=family == "glmf")
+out = torch.full((rows, g.heads, 512), float("nan"), device=device, dtype=torch.bfloat16)
+scratch = torch.empty(program.scratch_bytes(rows)["scratch"], device=device, dtype=torch.uint8)
+stream = torch.cuda.Stream()
+handle = cuda.CUstream(stream.cuda_stream)
+scalars = (rows,) if v4 else (rows, 8)
+def launch():
+    program.launch(*args, out, scratch, scalars=scalars, stream=handle)
+torch.cuda.synchronize()
+graph = torch.cuda.CUDAGraph()
+# First invocation of this compiled program, with no dispatch cache warm-up.
+with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+    launch()
+graph.replay()
+torch.cuda.synchronize()
+assert torch.isfinite(out).all(), "cold graph output is not finite"
+cold = out.clone()
+out.fill_(float("nan"))
+stream.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(stream):
+    launch()
+stream.synchronize()
+assert torch.equal(cold.view(torch.int16), out.view(torch.int16)), "cold graph differs from warm launch"
+"""
+    result = subprocess.run([sys.executable, "-c", child, family], env=os.environ.copy(),
+                            capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
