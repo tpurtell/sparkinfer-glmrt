@@ -323,7 +323,7 @@ class _Decode:
                 compact_smem_bytes=self.compact_smem_bytes,
             )
             cpr = Int32(self.h_blocks * s)
-            use_compact = eff_sms > Int32(0) and rows > (eff_sms // cpr)
+            use_compact = eff_sms > Int32(0) and (rows * cpr) > eff_sms
             if cutlass.const_expr(self.elide_single_split and s == 1):
                 direct = cute.make_tensor(out, cute.make_layout((m, n, 1, _DV), stride=(n * _DV, _DV, _DV, 1)))
                 if use_compact:

@@ -53,6 +53,7 @@ from .decode_math import (
     s1_qk_nope_block_scaled,
     s1_qk_nope_bf16_mg2,
     s1_qk_pv_bf16_slice_from_frags,
+    s1_qk_pv_bf16_slice_from_gmem,
     s1_qk_pv_bf16_slice_from_qp,
     s6_xv_nope_nvfp4_bf16,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
@@ -69,6 +70,7 @@ from .decode_math import (
     s5_fill_sm_p_bf16_pv,
     s5_fill_sm_p_full,
     s6_pv_bf16_slice_from_p_frags,
+    s6_pv_bf16_slice_from_qp,
     s6_xv_nope,
     s6_xv_nope_dsv4_h8_swap_ab,
     s6_xv_nope_glm_h8_swap_ab,
@@ -1777,13 +1779,22 @@ class UnifiedDecodeKernel:
             )
             n_slices = int(t.d_nope // 64)
             n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
+            rope_acc_elems = 4 if t.v_has_rope else 0
+            q_stage_slices = int(L.q_sc_bytes)
+            q_stage_slice_bytes = int(t.hpb * PV_BF16_QP_STRIDE * 2)
+            reg_start = n_slices - 2
+            smem_start = reg_start - q_stage_slices
             warp_first_cand = warp_id * Int32(8)
 
             a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
             a_col = (lane >> Int32(4)) * Int32(8)
-            qp_a_base = qp_addr + (
-                a_row * Int32(PV_BF16_QP_STRIDE) + a_col
-            ) * Int32(2)
+            a_elem_off = (a_row * Int32(PV_BF16_QP_STRIDE) + a_col) * Int32(2)
+            qp_a_base = qp_addr + a_elem_off
+            if cutlass.const_expr(q_stage_slices > 0):
+                q_stage_addr = shared_ptr_to_u32(st.q_stage.data_ptr())
+            else:
+                q_stage_addr = Int32(0)
+            q_stage_a_base = q_stage_addr + a_elem_off
 
             lane_r = lane & Int32(7)
             lane_sub = (lane >> Int32(3)) & Int32(1)
@@ -1792,21 +1803,24 @@ class UnifiedDecodeKernel:
             )
             swz_base = lane_sub ^ lane_r
             b_ptr0 = b_row_base + swz_base * Int32(16)
-            b_ptr1 = b_row_base + (swz_base ^ Int32(2)) * Int32(16)
-            b_ptr2 = b_row_base + (swz_base ^ Int32(4)) * Int32(16)
-            b_ptr3 = b_row_base + (swz_base ^ Int32(6)) * Int32(16)
-
-            v_base = (
-                kv_slice_addr
-                + (lane_sub * Int32(8) + lane_r) * Int32(PV_BF16_SLICE_STRIDE)
-                + (warp_id ^ lane_r) * Int32(16)
-            )
 
             q_nope_frags = []
             q_rope_frags = []
             if cutlass.const_expr(not self.pv_bf16_2cta):
-                for seg in cutlass.range_constexpr(n_slices):
-                    if cutlass.const_expr(seg > 0):
+                for si in cutlass.range_constexpr(q_stage_slices):
+                    load_q_slice_bf16_pv(
+                        q_token,
+                        q_stage_addr + Int32(si * q_stage_slice_bytes),
+                        head_base,
+                        Int32((smem_start + si) * 64),
+                        tid,
+                        hpb=t.hpb,
+                        valid_hpb=self.valid_hpb,
+                        vector_q=self.pv_bf16_vec_q,
+                        qp_stride=PV_BF16_QP_STRIDE,
+                    )
+                for r_idx in cutlass.range_constexpr(2):
+                    if cutlass.const_expr(r_idx > 0):
                         cute.arch.barrier(
                             barrier_id=2, number_of_threads=self.math_threads
                         )
@@ -1814,7 +1828,7 @@ class UnifiedDecodeKernel:
                         q_token,
                         qp_addr,
                         head_base,
-                        Int32(seg * 64),
+                        Int32((reg_start + r_idx) * 64),
                         tid,
                         hpb=t.hpb,
                         valid_hpb=self.valid_hpb,
@@ -1857,12 +1871,12 @@ class UnifiedDecodeKernel:
                 )
 
             accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
-            accr_frag = cute.make_rmem_tensor(4, Float32)
+            accr_frag = cute.make_rmem_tensor(max(rope_acc_elems, 1), Float32)
             gmax_frag = cute.make_rmem_tensor(2, Float32)
             gsum_frag = cute.make_rmem_tensor(2, Float32)
             for k in cutlass.range_constexpr(n_acc_tiles * 4):
                 accn_frag[k] = Float32(0.0)
-            for k in cutlass.range_constexpr(4):
+            for k in cutlass.range_constexpr(rope_acc_elems):
                 accr_frag[k] = Float32(0.0)
             gmax_frag[0] = Float32(-1e30)
             gmax_frag[1] = Float32(-1e30)
@@ -1897,7 +1911,11 @@ class UnifiedDecodeKernel:
                     ]
                     for at in range(n_acc_tiles)
                 ]
-                acc_rope = [accr_frag[k] for k in range(4)]
+                acc_rope = (
+                    [accr_frag[k] for k in range(4)]
+                    if rope_acc_elems
+                    else [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                )
                 global_max = [gmax_frag[0], gmax_frag[1]]
                 global_sum = [gsum_frag[0], gsum_frag[1]]
 
@@ -1952,7 +1970,7 @@ class UnifiedDecodeKernel:
                         rope_off = (
                             _DSV4_PACKED_ROPE_OFFSET
                             if is_dsv4
-                            else t.kv_smem_stride
+                            else (t.d_nope + 16)
                         )
                         qk = s2_qk_rope_from_frags(
                             qk,
@@ -1998,7 +2016,7 @@ class UnifiedDecodeKernel:
                                 barrier_id=2, number_of_threads=self.math_threads
                             )
                             qk = s1_qk_pv_bf16_slice_from_qp(
-                                qk, qp_a_base, b_ptr0, b_ptr1, b_ptr2, b_ptr3
+                                qk, qp_a_base, b_ptr0
                             )
                         else:
                             decode_pv_bf16_slice_to_smem(
@@ -2014,14 +2032,19 @@ class UnifiedDecodeKernel:
                                 mask_invalid=True,
                             )
                             cute.arch.sync_warp()
-                            qk = s1_qk_pv_bf16_slice_from_frags(
-                                qk,
-                                q_nope_frags[seg],
-                                b_ptr0,
-                                b_ptr1,
-                                b_ptr2,
-                                b_ptr3,
-                            )
+                            if cutlass.const_expr(seg >= reg_start):
+                                qk = s1_qk_pv_bf16_slice_from_frags(
+                                    qk,
+                                    q_nope_frags[seg - reg_start],
+                                    b_ptr0,
+                                )
+                            else:
+                                qk = s1_qk_pv_bf16_slice_from_qp(
+                                    qk,
+                                    q_stage_a_base
+                                    + Int32((seg - smem_start) * q_stage_slice_bytes),
+                                    b_ptr0,
+                                )
                 else:
                     c0_qk = warp_first_cand + (lane & Int32(3)) * Int32(2)
                     for grp in cutlass.range_constexpr(4):
@@ -2071,9 +2094,6 @@ class UnifiedDecodeKernel:
                                     t_acc,
                                     qp_a_base,
                                     b_ptr0,
-                                    b_ptr1,
-                                    b_ptr2,
-                                    b_ptr3,
                                 )
                             else:
                                 decode_pv_bf16_slice_to_smem(
@@ -2089,14 +2109,32 @@ class UnifiedDecodeKernel:
                                     mask_invalid=self.zero_masked_v,
                                 )
                                 cute.arch.sync_warp()
-                                t_acc = s1_qk_pv_bf16_slice_from_frags(
-                                    t_acc,
-                                    q_nope_frags[seg],
-                                    b_ptr0,
-                                    b_ptr1,
-                                    b_ptr2,
-                                    b_ptr3,
-                                )
+                                if cutlass.const_expr(seg >= reg_start):
+                                    t_acc = s1_qk_pv_bf16_slice_from_frags(
+                                        t_acc,
+                                        q_nope_frags[seg - reg_start],
+                                        b_ptr0,
+                                    )
+                                elif cutlass.const_expr(seg >= smem_start):
+                                    t_acc = s1_qk_pv_bf16_slice_from_qp(
+                                        t_acc,
+                                        q_stage_a_base
+                                        + Int32(
+                                            (seg - smem_start) * q_stage_slice_bytes
+                                        ),
+                                        b_ptr0,
+                                    )
+                                else:
+                                    t_acc = s1_qk_pv_bf16_slice_from_gmem(
+                                        t_acc,
+                                        q_token,
+                                        head_base,
+                                        Int32(seg * 64),
+                                        lane,
+                                        b_ptr0,
+                                        valid_hpb=self.valid_hpb,
+                                        vector_q=self.pv_bf16_vec_q,
+                                    )
                         sc_at = kv_raw_b + Int32(t.d_nope + grp * 4)
                         ks0 = Float32(0.0)
                         ks1 = Float32(0.0)
@@ -2191,6 +2229,12 @@ class UnifiedDecodeKernel:
                 ]
 
                 # S5 + S6 (+ S6b): BF16 PV reusing the last QK slice first.
+                v_base = (
+                    kv_slice_addr
+                    + (((lane >> Int32(3)) & Int32(1)) * Int32(8) + (lane & Int32(7)))
+                    * Int32(PV_BF16_SLICE_STRIDE)
+                    + (warp_id ^ (lane & Int32(7))) * Int32(16)
+                )
                 if cutlass.const_expr(is_dsv4):
                     s5_fill_sm_p_bf16_pv(
                         w_pre,
@@ -2264,9 +2308,9 @@ class UnifiedDecodeKernel:
                         cute.arch.barrier(
                             barrier_id=3, number_of_threads=self.math_threads
                         )
-                        acc_nope[vc] = s6_pv_bf16_slice_from_p_frags(
+                        acc_nope[vc] = s6_pv_bf16_slice_from_qp(
                             acc_nope[vc],
-                            p_frags,
+                            qp_a_base,
                             v_base,
                             bi=t.bi,
                             slice_stride=PV_BF16_SLICE_STRIDE,
@@ -2307,10 +2351,9 @@ class UnifiedDecodeKernel:
                         cute.arch.barrier(
                             barrier_id=3, number_of_threads=self.math_threads
                         )
-                        p_frags = load_pv_p_frags_bf16(qp_a_base, bi=t.bi)
-                        acc_nope[2 * grp + 1] = s6_pv_bf16_slice_from_p_frags(
+                        acc_nope[2 * grp + 1] = s6_pv_bf16_slice_from_qp(
                             acc_nope[2 * grp + 1],
-                            p_frags,
+                            qp_a_base,
                             v_base,
                             bi=t.bi,
                             slice_stride=PV_BF16_SLICE_STRIDE,
@@ -2333,9 +2376,9 @@ class UnifiedDecodeKernel:
                         cute.arch.barrier(
                             barrier_id=3, number_of_threads=self.math_threads
                         )
-                        acc_nope[2 * grp] = s6_pv_bf16_slice_from_p_frags(
+                        acc_nope[2 * grp] = s6_pv_bf16_slice_from_qp(
                             acc_nope[2 * grp],
-                            p_frags,
+                            qp_a_base,
                             v_base,
                             bi=t.bi,
                             slice_stride=PV_BF16_SLICE_STRIDE,
@@ -2346,7 +2389,7 @@ class UnifiedDecodeKernel:
                     accn_frag[at * 4 + 1] = acc_nope[at][1]
                     accn_frag[at * 4 + 2] = acc_nope[at][2]
                     accn_frag[at * 4 + 3] = acc_nope[at][3]
-                for k in cutlass.range_constexpr(4):
+                for k in cutlass.range_constexpr(rope_acc_elems):
                     accr_frag[k] = acc_rope[k]
                 gmax_frag[0] = global_max[0]
                 gmax_frag[1] = global_max[1]
@@ -2372,7 +2415,7 @@ class UnifiedDecodeKernel:
                 ]
                 for at in range(n_acc_tiles)
             ]
-            fin_acc_rope = [accr_frag[k] for k in range(4)]
+            fin_acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
             fin_gmax = [gmax_frag[0], gmax_frag[1]]
             fin_gsum = [gsum_frag[0], gsum_frag[1]]
 

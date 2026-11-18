@@ -4046,15 +4046,102 @@ def s1_qk_pv_bf16_slice_from_frags(
     qk,
     q_slice_frags,
     b_ptr0: Int32,
-    b_ptr1: Int32,
-    b_ptr2: Int32,
-    b_ptr3: Int32,
 ):
     """Accumulate one 64-feature BF16 QK slice using register Q A-fragments."""
-    b_ptrs = (b_ptr0, b_ptr1, b_ptr2, b_ptr3)
     for sub in cutlass.range_constexpr(4):
         a0, a1, a2, a3 = q_slice_frags[sub]
-        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptrs[sub], 0)
+        b_ptr = b_ptr0 if cutlass.const_expr(sub == 0) else (b_ptr0 ^ Int32(sub * 32))
+        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptr, 0)
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+        )
+    return qk
+
+
+@dsl_user_op
+def _ld_global_nc_u32_pv(ptr_i64: Int64, *, loc=None, ip=None) -> Uint32:
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(ptr_i64).ir_value(loc=loc, ip=ip)],
+            "ld.global.nc.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def s1_qk_pv_bf16_slice_from_gmem(
+    qk,
+    q_token: cute.Tensor,
+    head_base: Int32,
+    col_offset: Int32,
+    lane: Int32,
+    b_ptr0: Int32,
+    *,
+    valid_hpb: cutlass.Constexpr = 16,
+    vector_q: cutlass.Constexpr = True,
+):
+    """Accumulate one 64-feature BF16 QK slice loading Q directly via coalesced L1 nc loads."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    h0 = head_base + gid
+    h1 = h0 + Int32(8)
+    r0_ok = True
+    if cutlass.const_expr(valid_hpb < 8):
+        r0_ok = gid < Int32(valid_hpb)
+    r1_ok = True
+    if cutlass.const_expr(valid_hpb < 16):
+        r1_ok = (gid + Int32(8)) < Int32(valid_hpb)
+    for sub in cutlass.range_constexpr(4):
+        c0 = col_offset + Int32(sub * 16) + tid * Int32(2)
+        c2 = c0 + Int32(8)
+        a0 = Uint32(0)
+        a1 = Uint32(0)
+        a2 = Uint32(0)
+        a3 = Uint32(0)
+        if r0_ok:
+            if cutlass.const_expr(vector_q):
+                a0 = _ld_global_nc_u32_pv(
+                    get_ptr_as_int64(q_token, cute.crd2idx((h0, c0), q_token.layout))
+                )
+                a2 = _ld_global_nc_u32_pv(
+                    get_ptr_as_int64(q_token, cute.crd2idx((h0, c2), q_token.layout))
+                )
+            else:
+                a0 = pack_f32x2_to_bfloat2(
+                    Float32(q_token[h0, c0]), Float32(q_token[h0, c0 + Int32(1)])
+                )
+                a2 = pack_f32x2_to_bfloat2(
+                    Float32(q_token[h0, c2]), Float32(q_token[h0, c2 + Int32(1)])
+                )
+        if cutlass.const_expr(valid_hpb > 8):
+            if r1_ok:
+                if cutlass.const_expr(vector_q):
+                    a1 = _ld_global_nc_u32_pv(
+                        get_ptr_as_int64(
+                            q_token, cute.crd2idx((h1, c0), q_token.layout)
+                        )
+                    )
+                    a3 = _ld_global_nc_u32_pv(
+                        get_ptr_as_int64(
+                            q_token, cute.crd2idx((h1, c2), q_token.layout)
+                        )
+                    )
+                else:
+                    a1 = pack_f32x2_to_bfloat2(
+                        Float32(q_token[h1, c0]), Float32(q_token[h1, c0 + Int32(1)])
+                    )
+                    a3 = pack_f32x2_to_bfloat2(
+                        Float32(q_token[h1, c2]), Float32(q_token[h1, c2 + Int32(1)])
+                    )
+        b_ptr = b_ptr0 if cutlass.const_expr(sub == 0) else (b_ptr0 ^ Int32(sub * 32))
+        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptr, 0)
         qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
             qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
         )
@@ -4066,15 +4153,12 @@ def s1_qk_pv_bf16_slice_from_qp(
     qk,
     qp_a_base: Int32,
     b_ptr0: Int32,
-    b_ptr1: Int32,
-    b_ptr2: Int32,
-    b_ptr3: Int32,
 ):
     """Accumulate one 64-feature BF16 QK slice loading Q from q_or_p SMEM."""
-    b_ptrs = (b_ptr0, b_ptr1, b_ptr2, b_ptr3)
     for sub in cutlass.range_constexpr(4):
         a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_disp(qp_a_base, sub * 32)
-        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptrs[sub], 0)
+        b_ptr = b_ptr0 if cutlass.const_expr(sub == 0) else (b_ptr0 ^ Int32(sub * 32))
+        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptr, 0)
         qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
             qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
         )
@@ -4173,6 +4257,33 @@ def s6_pv_bf16_slice_from_p_frags(
     x3 = Float32(0.0)
     for ks in cutlass.range_constexpr(bi // 16):
         a0, a1, a2, a3 = p_frags[ks]
+        b0, b1 = _ldmatrix_m8n8x2_trans_b16_disp(v_base, ks * (16 * slice_stride))
+        x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(
+            x0, x1, x2, x3, a0, a1, a2, a3, b0, b1
+        )
+    acc_tile[0] = acc_tile[0] + x0
+    acc_tile[1] = acc_tile[1] + x1
+    acc_tile[2] = acc_tile[2] + x2
+    acc_tile[3] = acc_tile[3] + x3
+    return acc_tile
+
+
+@cute.jit
+def s6_pv_bf16_slice_from_qp(
+    acc_tile,
+    qp_a_base: Int32,
+    v_base: Int32,
+    *,
+    bi: cutlass.Constexpr = 64,
+    slice_stride: cutlass.Constexpr = 128,
+):
+    """Accumulate one 64-dim V slice streaming P A-fragments per K-step to avoid holding 16 regs across slice decode."""
+    x0 = Float32(0.0)
+    x1 = Float32(0.0)
+    x2 = Float32(0.0)
+    x3 = Float32(0.0)
+    for ks in cutlass.range_constexpr(bi // 16):
+        a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_disp(qp_a_base, ks * 32)
         b0, b1 = _ldmatrix_m8n8x2_trans_b16_disp(v_base, ks * (16 * slice_stride))
         x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(
             x0, x1, x2, x3, a0, a1, a2, a3, b0, b1

@@ -354,7 +354,7 @@ class _Decode:
                 block_threads=self.block_threads,
                 compact_smem_bytes=self.compact_smem_bytes,
             )
-            use_compact = eff_sms > Int32(0) and rows > (eff_sms // Int32(self.ctas_per_row))
+            use_compact = eff_sms > Int32(0) and (rows * Int32(self.ctas_per_row)) > eff_sms
             for kernel in cutlass.range_constexpr(len(self.kernels)):
                 if cutlass.const_expr(self.has_extra):
                     width = self.width

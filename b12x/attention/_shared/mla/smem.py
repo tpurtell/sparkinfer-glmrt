@@ -692,11 +692,14 @@ def make_pv_bf16_smem_layout(
         raw_stride = PV_BF16_DSV4_RAW_STRIDE
         kv_sc_stride = 8
         kv_sc_buf_bytes = bi * kv_sc_stride
+        q_stage_slices = 0 if compact_2cta else 5
     elif traits.scale_format == ScaleFormat.ARBITRARY_FP32:
         if traits.d_rope > 0 and not compact_2cta:
             raw_stride = PV_BF16_GLM_RAW_STRIDE
+            q_stage_slices = 2
         else:
             raw_stride = PV_BF16_GLM_NOPE_RAW_STRIDE
+            q_stage_slices = 0 if compact_2cta else 6
         kv_sc_stride = 0
         kv_sc_buf_bytes = 0
     else:
@@ -718,6 +721,10 @@ def make_pv_bf16_smem_layout(
     qp_bytes = hpb * PV_BF16_QP_STRIDE * 2
     off = qp_off + qp_bytes
 
+    q_stage_off = _align_up(off, 128)
+    q_stage_bytes = q_stage_slices * qp_bytes
+    off = q_stage_off + q_stage_bytes
+
     reduce_off = _align_up(off, 16)
     reduce_warp_max_off = reduce_off
     reduce_warp_sum_off = reduce_off + _MATH_WARPS * hpb * 4
@@ -738,11 +745,11 @@ def make_pv_bf16_smem_layout(
         q_rope_off=0,
         q_rope_bytes=0,
         q_rope_stride=PV_BF16_QP_STRIDE,
-        q_fp8_off=qp_off,
-        q_fp8_bytes=qp_bytes,
+        q_fp8_off=q_stage_off if q_stage_bytes > 0 else qp_off,
+        q_fp8_bytes=q_stage_bytes if q_stage_bytes > 0 else qp_bytes,
         q_nope_stride=PV_BF16_QP_STRIDE,
         q_sc_off=0,
-        q_sc_bytes=0,
+        q_sc_bytes=q_stage_slices,
         q_sc_stride=0,
         kv_fp8_off=kv_raw_off,
         kv_fp8_buf_bytes=kv_raw_buf_bytes,
@@ -798,6 +805,18 @@ def get_pv_bf16_shared_storage_cls(
         if layout.kv_sc_buf_bytes > 0
         else {}
     )
+    q_stage_field = (
+        {
+            "q_stage": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.BFloat16, int(layout.q_fp8_bytes // 2)
+                ],
+                128,
+            ]
+        }
+        if layout.q_sc_bytes > 0
+        else {}
+    )
     PvBf16SharedStorage.__annotations__ = {
         "kv_raw": cute.struct.Align[
             cute.struct.MemRange[
@@ -814,6 +833,7 @@ def get_pv_bf16_shared_storage_cls(
             cute.struct.MemRange[cutlass.BFloat16, int(layout.sm_p_full_bytes // 2)],
             128,
         ],
+        **q_stage_field,
         "reduce": cute.struct.Align[
             cute.struct.MemRange[cutlass.Float32, int(layout.reduce_bytes // 4)],
             16,
@@ -839,6 +859,8 @@ def get_pv_bf16_shared_storage_cls(
         "token_idx": layout.token_idx_off,
         "mbar": layout.mbar_off,
     }
+    if layout.q_sc_bytes > 0:
+        expected_offsets["q_stage"] = layout.q_fp8_off
     if layout.kv_sc_buf_bytes > 0:
         expected_offsets["kv_sc"] = layout.kv_sc_off
     actual_offsets = dict(storage_cls._offsets)
