@@ -4,7 +4,8 @@
 Pass an engine package's tp6-rank0 directory as --baseline and, optionally,
 --candidate. Defaults cover every live row 1..64. The harness follows the
 shipping selector (m1 for one row, m80 otherwise; Kimi does not ship m16).
-The same full-width weights and route banks feed both arms. Timing includes
+Use --candidate-capacities to test additional decode buckets. Both arms share
+the same full-width weights and route banks. Timing includes
 native route pack, cooperative core and weighted sum, but no input copy/RDMA.
 
 No route trace is needed: each cell uses a seeded, randomly relabeled Zipf
@@ -95,6 +96,70 @@ def make_weights(torch):
         for p in ['fc2', 'gate', 'up']:
             scalar[f'tier{tier}_{p}_experts'] = count
     return ptr, scalar
+
+
+def decode_mcg(torch, payload, rows, columns):
+    """Vectorized checkpoint-layout K2 decoder, independent of AOT kernels.
+
+    Same window, mapping and lane permutation as decode_mcg_matrix in
+    benchmark_mixed_trellis.py, batched over tiles.
+    """
+    lane = torch.arange(32, device=payload.device)[:, None]
+    word = torch.arange(8, device=payload.device)[None, :]
+    end = (lane * 8 + word + 257) * 2
+    first, last = (end - 16) // 32, (end - 1) // 32
+    words = payload.reshape(rows // 16, columns // 16, 16).long() & 0xffffffff
+    merged = (words[..., first % 16] << 32) | words[..., last % 16]
+    window = (merged >> ((last + 1) * 32 - end)) & 0xffff
+    value = ((window * 0xcbac1fed) & 0x8fff8fff) ^ 0x3b603b60
+    low = (value & 0xffff).short().view(torch.float16)
+    high = (value >> 16).short().view(torch.float16)
+    row = (lane % 4) * 2 + (word % 4 // 2) * 8 + word % 2
+    col = 2 * (lane // 8 + 4 * (word >= 4)) + ((lane >> 2) & 1)
+    output = torch.empty((*words.shape[:2], 256), dtype=torch.float32, device=payload.device)
+    output[..., (row * 16 + col).flatten()] = (low + high).flatten(-2).float()
+    return output.reshape(rows // 16, columns // 16, 16, 16).transpose(1, 2).reshape(rows, columns)
+
+
+def f32_oracle(torch, weights, banks):
+    """Full-F32 ordinary K2/H128/Situ, decoding one expert at a time."""
+    ptr, _ = weights
+    x, ids, gates = (torch.cat(parts) for parts in zip(*banks))
+    h = torch.ones((1, 1), dtype=torch.float32, device=x.device)
+    for _ in range(7):
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    h /= math.sqrt(128)
+
+    def had(v):
+        return (v.reshape(-1, v.shape[-1] // 128, 128) @ h).reshape_as(v)
+
+    route_outputs = torch.empty((*ids.shape, HIDDEN), device=x.device, dtype=torch.float32)
+    by_expert = {}
+    for token, row in enumerate(ids.tolist()):
+        for slot, expert in enumerate(row):
+            by_expert.setdefault(expert, []).append((token, slot))
+    for expert, routes in sorted(by_expert.items()):
+        token, slot = torch.tensor(routes, device=x.device).unbind(1)
+        gate_svh, up_svh, down_suh = ptr['intermediate_rotations_ptr'][expert].float().split(WIDTH)
+        gate = decode_mcg(torch, ptr['t0_w13_ptr'][expert], HIDDEN, WIDTH)
+        up = decode_mcg(torch, ptr['t0_w13_ptr'][EXPERTS + expert], HIDDEN, WIDTH)
+        down = decode_mcg(torch, ptr['t0_w2_ptr'][expert], WIDTH, HIDDEN)
+        source = x[token].float()
+        g = had(had(source * ptr['gate_suh_ptr'][expert].float()) @ gate) * gate_svh
+        u = had(had(source * ptr['up_suh_ptr'][expert].float()) @ up) * up_svh
+        activated = (4 * torch.tanh(g / 4) * torch.sigmoid(g)) * (25 * torch.tanh(u / 25))
+        y = had(had(activated * down_suh) @ down) * ptr['svh_ptr'][expert].float()
+        route_outputs[token, slot] = y * gates[token, slot, None]
+    result = torch.zeros_like(route_outputs[:, 0])
+    for slot in range(TOPK):
+        result += route_outputs[:, slot]
+    return result.split([len(bank[0]) for bank in banks])
+
+
+def error_by_row(value, reference):
+    difference = value.double() - reference.double()
+    return list(map(list, zip(difference.abs().amax(1).tolist(),
+                              difference.square().mean(1).sqrt().tolist())))
 
 
 class Variant:
@@ -211,23 +276,42 @@ def exact(torch, actual, expected, context):
           f'max abs {(actual.float() - expected.float()).abs().max().item():.8g}')
 
 
-def verify(torch, name, variants, rows, data):
-    v = variants[1 if rows == 1 else 80]
+def choose_capacity(variants, rows):
+    return min(cap for cap in variants if rows <= cap)
+
+
+def verify(torch, name, variants, rows, data, *, capture):
+    v = variants[choose_capacity(variants, rows)]
     v.load(data, rows)
     v.poison_output()
-    v.capture(rows)
+    v.run(rows)
+    eager = v.output(rows).clone()
+    if capture:
+        v.capture(rows)
     v.poison_output()
     v.graphs[rows].replay()
     out = v.output(rows).clone()
+    exact(torch, out, eager, f'{name} m{rows} graph vs eager')
     check(bool(out.isfinite().all()) and bool(out.abs().sum(dtype=torch.float32) > 0),
           f'{name} m{rows}: nonfinite or all-zero graph output')
-    wide = variants[80]
-    wider_rows = min(80, max(rows + 1, rows * 2))
-    wide.load(data, wider_rows)
-    wide.poison_output()
-    wide.run(wider_rows)
-    exact(torch, wide.output(rows), out, f'{name} m{rows} vs m{wider_rows} prefix')
-    return out
+
+    # Check each row through m1 and every overlapping decode export. Full
+    # capacities test both ends; an additional check uses this exact live size.
+    mismatches = {}
+    for cap, other in variants.items():
+        for start in range(0, rows, cap):
+            count = min(rows - start, cap)
+            for live, offset in sorted({(count, 0), (cap, 0), (cap, cap - count)}):
+                first = (start - offset) % len(data[0])
+                arranged = tuple(t.roll(-first, 0) for t in data)
+                other.load(arranged, live)
+                other.poison_output()
+                other.run(live)
+                actual = other.output(live)[offset:offset + count]
+                bad = int((actual.view(torch.int16) != out[start:start + count].view(torch.int16)).sum())
+                if bad:
+                    mismatches[f'm{cap}/live{live}:{start}+{count}@{offset}'] = bad
+    return out, mismatches
 
 
 def elapsed(torch, graph, iterations):
@@ -254,50 +338,52 @@ def telemetry():
 
 def run(args, torch):
     check(torch.cuda.get_device_capability() == (12, 1), 'the production package requires SM121')
-    arms = {'baseline': args.baseline}
+    torch.set_float32_matmul_precision('highest')
+    arms = {'baseline': (args.baseline, [1, 80])}
     if args.candidate:
-        arms['candidate'] = args.candidate
+        arms['candidate'] = (args.candidate, sorted(set(args.candidate_capacities)))
     weights = make_weights(torch)
-    variants = {arm: {cap: Variant(torch, root / f'm{cap}', cap, weights) for cap in (1, 80)}
-                for arm, root in arms.items()}
+    variants = {arm: {cap: Variant(torch, root / f'm{cap}', cap, weights) for cap in capacities}
+                for arm, (root, capacities) in arms.items()}
     rows_list = sorted(set(args.rows))
+    probes = {(rows, bank): inputs(torch, rows, bank) for rows in rows_list for bank in ('oracle', 'timing')}
+    expected = dict(zip(probes, f32_oracle(torch, weights, [tuple(t[:rows] for t in data)
+                         for (rows, _), (data, _) in probes.items()])))
     try:
         cells = {}
         for rows in rows_list:
-            data, _ = inputs(torch, rows, 'oracle')
-            out = {arm: verify(torch, arm, by_cap, rows, data) for arm, by_cap in variants.items()}
-            if 'candidate' in out:
-                exact(torch, out['candidate'], out['baseline'], f'candidate vs baseline at m{rows}')
-            # Reuse the captured graphs with changed pointers' contents; timing
-            # uses the second, separately seeded bank after verifying it too.
-            data, touched = inputs(torch, rows, 'timing')
-            reference = None
-            for arm, by_cap in variants.items():
-                v = by_cap[1 if rows == 1 else 80]
-                v.load(data, rows)
-                v.poison_output()
-                v.run(rows)
-                eager = v.output(rows).clone()
-                v.poison_output()
-                v.graphs[rows].replay()
-                exact(torch, v.output(rows), eager, f'{arm} m{rows} changed-input graph vs eager')
-                check(bool(eager.isfinite().all() and eager.abs().sum(dtype=torch.float32) > 0),
-                      f'{arm} m{rows}: second bank is nonfinite or all-zero')
-                if reference is not None:
-                    exact(torch, v.output(rows), reference, f'candidate vs baseline at m{rows} second bank')
-                reference = eager
-            cells[rows] = dict(rows=rows, capacity=1 if rows == 1 else 80, distinct_experts=touched,
-                               routes=rows * TOPK, touched_weight_bytes=touched * WEIGHT_BYTES,
-                               one_read_us=touched * WEIGHT_BYTES / (PEAK_GBPS * 1000),
-                               samples={arm: [] for arm in arms})
-        print('Oracle passed: exact BF16 words, wider-prefix invariance, changed-input graph replay', flush=True)
+            touched = probes[rows, 'timing'][1]
+            cell = cells[rows] = dict(rows=rows, capacity=choose_capacity(variants['baseline'], rows),
+                    capacities={arm: choose_capacity(by_cap, rows) for arm, by_cap in variants.items()},
+                    distinct_experts=touched, routes=rows * TOPK, touched_weight_bytes=touched * WEIGHT_BYTES,
+                    one_read_us=touched * WEIGHT_BYTES / (PEAK_GBPS * 1000), samples={arm: [] for arm in arms},
+                    validation={})
+            for bank in ('oracle', 'timing'):
+                data, _ = probes[rows, bank]
+                reference = expected[rows, bank]
+                control_errors = None
+                control_out = None
+                checks = cell['validation'][bank] = {}
+                for arm, by_cap in variants.items():
+                    out, bad = verify(torch, arm, by_cap, rows, data, capture=bank == 'oracle')
+                    errors = error_by_row(out, reference)
+                    if arm == 'baseline':
+                        control_errors, control_out = errors, out
+                    worse = [i for i, (err, ctrl) in enumerate(zip(errors, control_errors))
+                             if not all(e <= c for e, c in zip(err, ctrl))]
+                    checks[arm] = dict(row_invariance_mismatches=bad, max_abs_rms_by_row=errors,
+                                       worse_rows=worse, bitwise_to_baseline=torch.equal(
+                                           out.view(torch.int16), control_out.view(torch.int16)))
+        qualified = {arm: all(not bank[arm]['row_invariance_mismatches'] and not bank[arm]['worse_rows']
+                             for cell in cells.values() for bank in cell['validation'].values()) for arm in arms}
+        print(f'Oracle qualification: {qualified}; per-row F32 error and cross-export invariance in JSON', flush=True)
         pre = telemetry()
         for block in range(args.blocks):
             for rows in rows_list[::1 if block % 2 == 0 else -1]:
-                data, _ = inputs(torch, rows, 'timing')
+                data, _ = probes[rows, 'timing']
                 order = list(arms)[::1 if (block + rows) % 2 == 0 else -1]
                 for arm in order:
-                    v = variants[arm][cells[rows]['capacity']]
+                    v = variants[arm][cells[rows]['capacities'][arm]]
                     v.load(data, rows)
                     graph = v.graphs[rows]
                     for _ in range(3):
@@ -317,7 +403,9 @@ def run(args, torch):
                     sms=torch.cuda.get_device_properties(0).multi_processor_count,
                     peak_gbps=PEAK_GBPS, bytes_per_expert=WEIGHT_BYTES,
                     routing='synthetic skew fitted to the #2462 mean touched counts',
-                    oracle='bitwise BF16 (two banks); wider batch prefix; changed-input replays',
+                    oracle='decoded MCG/full F32 Situ; per-row max abs and RMS <= baseline; '
+                           'bitwise across supplied capacities; exact graph/eager (two banks)',
+                    qualified=qualified,
                     iterations=args.iterations, blocks=args.blocks, thermal_before=pre, thermal_after=post,
                     packages={arm: {cap: {k: v.meta[k] for k in ('sparkinfer_revision', 'tile', 'blocks_per_sm',
                         'objects', 'decode_schedule') if k in v.meta} for cap, v in by_cap.items()}
@@ -332,6 +420,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--baseline', type=Path, required=True)
     p.add_argument('--candidate', type=Path)
+    p.add_argument('--candidate-capacities', type=int, nargs='+', default=[1, 80])
     p.add_argument('--rows', type=int, nargs='+', default=list(range(1, 65)))
     p.add_argument('--iterations', type=int, default=24)
     p.add_argument('--blocks', type=int, default=5)
@@ -340,6 +429,8 @@ def main():
     args = p.parse_args()
     if not all(1 <= rows <= 64 for rows in args.rows) or args.iterations < 1 or args.blocks < 2:
         p.error('rows must be in 1..64, iterations positive and blocks >=2')
+    if not ({1, 80} <= set(args.candidate_capacities) <= set(range(1, 81))):
+        p.error('candidate capacities must include 1 and 80 and fit the decode band')
     import torch
     result = run(args, torch)
     args.json.write_text(json.dumps(result, indent=2) + '\n')
@@ -347,6 +438,8 @@ def main():
         parts = [f'{arm}={r["us"]:.2f} us/{r["effective_gbps"]:.1f} GB/s' for arm, r in cell['results'].items()]
         print(f'm{cell["rows"]:02d}/{cell["capacity"]}: {cell["distinct_experts"]:3d} experts, '
               f'floor={cell["one_read_us"]:.2f} us; ' + '; '.join(parts), flush=True)
+    if not all(result['qualified'].values()):
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
