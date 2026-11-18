@@ -268,7 +268,7 @@ def test_exported_fp8_pack_scatter_zero_and_skipped_slots(tmp_path, rows, dtype)
 def test_exported_half_heads_match_whole_cache_and_attention(tmp_path, route, kind, kv_format):
     from dataclasses import replace
     require_b12x()
-    from b12x.integration.cuteafd import INKLING2_SMALL
+    from b12x.integration.cuteafd import INKLING2_SMALL, exportable_compilation
     from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot, record_bytes
     from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_kv_pack_aot
 
@@ -293,12 +293,14 @@ def test_exported_half_heads_match_whole_cache_and_attention(tmp_path, route, ki
         k, v = [tensor[:, k_start:k_end].contiguous() for tensor in (key, value)]
         slots = torch.arange(len(k), device="cuda", dtype=torch.int64)
         cache = torch.empty((len(k), record_bytes(g, kv_format)), device="cuda", dtype=torch.uint8)
-        pack = compile_inkling2_kv_pack_aot(heads=heads, kv_format=kv_format)
+        with exportable_compilation():
+            pack = compile_inkling2_kv_pack_aot(heads=heads, kv_format=kv_format)
         ExportedProgram(pack, tmp_path, f"head_pack_{index}").launch(k, v, slots, cache, scalars=(len(k),))
         local_q, local_rel, local_sinks = [tensor[:, q_window].contiguous() for tensor in (q, rel, sinks)]
         out = torch.empty_like(local_q)
         scratch = torch.empty(64 * 32 * g.heads * 516, dtype=torch.uint8, device="cuda")
-        prog = compile_inkling2_attention_aot(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
+        with exportable_compilation():
+            prog = compile_inkling2_attention_aot(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
         launch = ExportedProgram(prog, tmp_path, f"head_attention_{index}")
         if kind == "global":
             scalars = (rows, len(tables), len(tiles)) + ((8,) if route == "decode" else ())
