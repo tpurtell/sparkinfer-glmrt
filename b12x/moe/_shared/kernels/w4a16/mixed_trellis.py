@@ -53,6 +53,7 @@ from .kernel import (
     _cutlass_element_dtype,
     _fake_m_for_specialization,
     _trellis256_execution_lut,
+    _w4a16_small_m_splitk_enabled,
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
@@ -2527,6 +2528,7 @@ def compile_mixed_trellis(
     workspace_sms: int | None = None,
     ws_prerotate: bool | None = None,
     row_addresses: bool = False,
+    _kimi_tp6_override: bool | None = None,
 ) -> MixedTrellisCompileResult:
     if row_addresses and not 0 < int(size_m) <= 8192:
         raise ValueError("row-address WS capacity must be in 1..8192")
@@ -2658,6 +2660,49 @@ def compile_mixed_trellis(
                 compact_weights=compact_weights,
                 prerotate=ws_prerotate,
                 row_addresses=row_addresses,
+            )
+        use_kimi_tp6 = (
+            _kimi_tp6_override
+            if _kimi_tp6_override is not None
+            else (
+                (hidden_size, intermediate_size, top_k, route_num_experts)
+                == (3584, 512, 16, 896)
+                and str(activation).strip().lower() == "situ"
+                and swiglu_limit is None
+                and (tier0_bits, tier1_bits) == (2, 3)
+                and trellis_codebook == "mcg"
+                and rotation_input_dtype == "bf16"
+                and full_rotation_output_dtype == "bf16"
+                and int(size_m) in (1, 80)
+                and int(moe_block_size) == 8
+                and not grouped_m8_fc2
+                and force_blocks_per_sm in (None, 1)
+                and not direct_topk_routes
+                and not broadcast_suh
+                and not compact_weights
+                and paired_boundary is None
+                and not token_major_rotation
+                and not fused_input_rotation
+                and activations == "a16"
+                and input_format == "bf16"
+                and not row_addresses
+                and (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n)
+                == (64, 256, 64, 256)
+                and schedule == MixedTrellisDecodeSchedule(l2_evict_first_b=True)
+                and not _w4a16_small_m_splitk_enabled()
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(torch.cuda.current_device())
+                == (12, 1)
+            )
+        )
+        if use_kimi_tp6:
+            from .mixed_trellis_kimi import W4A16MixedTrellisKimiTP6
+
+            return W4A16MixedTrellisKimiTP6(
+                driver=make_kernel(total_experts, tier0_bits, **common),
+                tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
+                tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+                descriptor_bits=descriptor_bits,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
