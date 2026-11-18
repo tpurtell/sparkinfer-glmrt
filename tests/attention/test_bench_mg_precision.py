@@ -57,3 +57,16 @@ def test_decode_contract_and_accuracy_only(tmp_path):
 def test_wrong_format_arm_rejected():
     with pytest.raises(ValueError):
         arm_traits("dsv41", "fp8-qk")
+
+
+def test_decode_aot_has_fixed_production_cells_and_rows(tmp_path, monkeypatch):
+    monkeypatch.delenv("B12X_MLA_SM120_NUM_SPLITS", raising=False)
+    argv = ["--mode", "decode-aot", "--output", str(tmp_path / "decode.json")]
+    assert parse_args(argv).cells is None
+    assert parse_args(argv + ["--cells", "glm-h64,v4p-h128"]).cells == ["glm-h64", "v4p-h128"]
+    for flags in (["--rows", "1"], ["--cells", "v4p-h16"], ["--samples", "1"]):
+        with pytest.raises(SystemExit):
+            parse_args(argv + flags)
+    monkeypatch.setenv("B12X_MLA_SM120_NUM_SPLITS", "2")
+    with pytest.raises(SystemExit):
+        parse_args(argv)
