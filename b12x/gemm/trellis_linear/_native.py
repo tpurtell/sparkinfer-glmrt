@@ -757,6 +757,47 @@ def _dequant_k8_words_to_half2x4(
                  for i in range(4))
 
 
+@dsl_user_op
+def _head_mcg_four(lo: Uint32, hi: Uint32, bits: int, *, loc=None, ip=None):
+    """Four bitrate-strided MCG windows, in MMA order (highest first)."""
+    bits = int(bits)
+    asm = ["{ .reg .b32 w0,w1,w2,w3,a,b;"]
+    for i in range(4):
+        shift = bits * (3 - i)
+        if shift + 16 > 32:
+            asm.append(f"shf.r.wrap.b32 w{i}, $2, $3, {shift}; and.b32 w{i}, w{i}, 0xffff;")
+        else:
+            asm.append(f"bfe.u32 w{i}, $2, {shift}, 16;")
+        asm.extend((f"mul.lo.u32 w{i}, w{i}, {_K8_TRELLIS_MCG:#x};",
+                    f"lop3.b32 w{i}, w{i}, {_K8_TRELLIS_MASK:#x}, {_K8_TRELLIS_OR:#x}, 0x6a;"))
+    for i in range(2):
+        asm.extend((f"prmt.b32 a, w{2*i}, w{2*i+1}, 0x5410;",
+                    f"prmt.b32 b, w{2*i}, w{2*i+1}, 0x7632;",
+                    f"add.rn.f16x2 ${i}, a, b;"))
+    res = llvm.inline_asm(llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [lo.ir_value(loc=loc, ip=ip), hi.ir_value(loc=loc, ip=ip)],
+        "\n".join(asm + ["}"]), "=r,=r,r,r", has_side_effects=False,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(2))
+
+
+@cute.jit
+def _head_decode_n8(u0: Uint32, u1: Uint32, prev: Int32, shift: Int32, half: Int32,
+                    bits: cutlass.Constexpr):
+    if cutlass.const_expr(bits == 6):
+        lo, hi = _k6_align_shfl(u0, u1, prev, shift)
+        if half == Int32(0):
+            lo = (lo >> Uint32(24)) | (hi << Uint32(8))
+            hi = hi >> Uint32(24)
+    else:
+        preceding = _k8_shfl_prev_pure(u1, prev)
+        lo, hi = u1, u0
+        if half == Int32(0):
+            lo, hi = u0, preceding
+    b0, b1 = _head_mcg_four(lo, hi, bits)
+    return _f16x2_to_bf16x2(b0), _f16x2_to_bf16x2(b1)
+
+
 @cute.jit
 def _decode_k8_words_shfl(
     u0: Uint32, u1: Uint32, prev_lane: Int32,
@@ -1057,17 +1098,24 @@ class NativeTrellisLinear:
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if cutlass.const_expr(self.compact_head):
-            if rows > Int32(16) and rows <= Int32(64):
-                if rows <= Int32(32):
-                    self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 2)
-                elif rows <= Int32(48):
-                    self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 3)
-                else:
-                    self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 4)
-            elif cutlass.const_expr(self.bits == 8):
-                self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            if rows <= Int32(16):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 1)
+            elif rows <= Int32(32):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 2)
+            elif rows <= Int32(48):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 3)
+            elif rows <= Int32(64):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 4)
+            elif rows <= Int32(80):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 5)
+            elif rows <= Int32(96):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 6)
+            elif rows <= Int32(112):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 7)
+            elif rows <= Int32(128):
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 8)
             else:
-                self._decode_k6(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 9)
         elif cutlass.const_expr(self.bits == 8 and not self.e4m3):
             self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
         elif cutlass.const_expr(self.bits == 6):
@@ -4963,7 +5011,7 @@ class NativeTrellisLinear:
                           output: cute.Tensor, rows: Int32, rotation_id: Int32,
                           cta_limit: Int32, stream: cuda.CUstream, frags: cutlass.Constexpr):
         self.multiply_head_tile(inputs, payload, scales, output, rows, rotation_id, frags).launch(
-            grid=(min(Int32(self.n // 128), cta_limit), 1, 1), block=(256, 1, 1),
+            grid=(min(Int32(self.n // (64 if frags >= 4 else 128)), cta_limit), 1, 1), block=(256, 1, 1),
             min_blocks_per_mp=1, stream=stream)
 
     @cute.jit
@@ -4988,6 +5036,9 @@ class NativeTrellisLinear:
         tid = Int32(tid)
         warp, lane = tid >> Int32(5), tid & Int32(31)
         x = inputs[rotation_id]
+        # Above 48 rows each warp reconstructs only its own four values (N8).
+        # Half as many accumulator columns permit more CTAs to reside per SM.
+        n8 = 1 if frags >= 4 else 2
         stage_bytes = frags * 4096
         buf = cutlass_utils.SmemAllocator().allocate(self._k6_opt_storage(2 * stage_bytes // 4))
         sa = shared_ptr_to_u32(buf.smem.data_ptr())
@@ -4998,15 +5049,19 @@ class NativeTrellisLinear:
         lane_byte = lane * Int32(8)
         if cutlass.const_expr(self.bits == 6):
             lane_byte = ((lane >> Int32(1)) * Int32(3) + (lane & Int32(1))) * Int32(4)
-        w_lane = payload.iterator.toint() + (warp * Int32(32 * self.bits) + lane_byte).to(Int64)
+        n16 = warp if cutlass.const_expr(n8 == 2) else warp >> Int32(1)
+        w_lane = payload.iterator.toint() + (n16 * Int32(32 * self.bits) + lane_byte).to(Int64)
         policy = weight_stream_policy(Int32(1))
-        while tile < Int32(self.n // 128):
+        while tile < Int32(self.n // (64 * n8)):
             self._head_copy_a(sa, x, tid, rows, frags)
-            grand = cute.make_rmem_tensor((frags, 2, 4), Float32)
-            subtotal = cute.make_rmem_tensor((frags, 2, 4), Float32)
+            grand = cute.make_rmem_tensor((frags, n8, 4), Float32)
+            subtotal = cute.make_rmem_tensor((frags, n8, 4), Float32)
             grand.fill(Float32(0.0))
             subtotal.fill(Float32(0.0))
             w_tile = w_lane + tile.to(Int64) * Int64(self.k * 16 * self.bits)
+            if cutlass.const_expr(n8 == 1):
+                w_tile = (w_lane + (tile >> Int32(1)).to(Int64) * Int64(self.k * 16 * self.bits)
+                          + (tile & Int32(1)).to(Int64) * Int64(4 * 32 * self.bits))
             for kb in cutlass.range(self.k // 128, unroll=1):
                 w_base = w_tile + kb.to(Int64) * Int64(2048 * self.bits)
                 w = cute.make_rmem_tensor((8, 2), Uint32)
@@ -5022,10 +5077,13 @@ class NativeTrellisLinear:
                 if kb + Int32(1) < Int32(self.k // 128):
                     self._head_copy_a(sa + (stage ^ Int32(1)) * Int32(stage_bytes),
                                       x + (kb + Int32(1)).to(Int64) * Int64(256), tid, rows, frags)
-                acc = cute.make_rmem_tensor((frags, 2, 4), Float32)
+                acc = cute.make_rmem_tensor((frags, n8, 4), Float32)
                 acc.fill(Float32(0.0))
                 for k16 in cutlass.range_constexpr(8):
-                    if cutlass.const_expr(self.bits == 6):
+                    if cutlass.const_expr(n8 == 1):
+                        b0, b1 = _head_decode_n8(w[k16, 0], w[k16, 1], prev, shift, warp & Int32(1), self.bits)
+                        b2, b3 = Uint32(0), Uint32(0)
+                    elif cutlass.const_expr(self.bits == 6):
                         b0, b1, b2, b3 = _decode_k6_words_shfl(w[k16, 0], w[k16, 1], prev, shift,
                                                                False, False, True)
                     else:
@@ -5034,7 +5092,7 @@ class NativeTrellisLinear:
                     a = sa + stage * Int32(stage_bytes) + (a_lane ^ Int32(k16 * 32))
                     for m in cutlass.range_constexpr(frags):
                         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16_offset(a, m * 4096)
-                        for n in cutlass.range_constexpr(2):
+                        for n in cutlass.range_constexpr(n8):
                             u = b0 if cutlass.const_expr(n == 0) else b2
                             v = b1 if cutlass.const_expr(n == 0) else b3
                             d0, d1, d2, d3 = self.mma_ready(
@@ -5042,19 +5100,19 @@ class NativeTrellisLinear:
                                 a0, a1, a2, a3, u, v)
                             acc[m, n, 0], acc[m, n, 1], acc[m, n, 2], acc[m, n, 3] = d0, d1, d2, d3
                 scale = _side_value(scales.iterator.toint(), kb)
-                for i in cutlass.range_constexpr(frags * 8):
+                for i in cutlass.range_constexpr(frags * n8 * 4):
                     subtotal[i] = fma_rn_f32(acc[i], scale, subtotal[i])
                 if (kb & Int32(7)) == Int32(7) or kb == Int32(self.k // 128 - 1):
-                    for i in cutlass.range_constexpr(frags * 8):
+                    for i in cutlass.range_constexpr(frags * n8 * 4):
                         grand[i] = add_rn_f32(grand[i], subtotal[i])
                     subtotal.fill(Float32(0.0))
-            col = tile * Int32(128) + warp * Int32(16) + (lane & Int32(3)) * Int32(2)
+            col = tile * Int32(64 * n8) + warp * Int32(8 * n8) + (lane & Int32(3)) * Int32(2)
             for m in cutlass.range_constexpr(frags):
                 for half in cutlass.range_constexpr(2):
                     row = (lane >> Int32(2)) + Int32(16 * m + 8 * half)
                     if row < rows:
                         dst = output.iterator.toint() + (row * Int32(self.n) + col).to(Int64) * Int64(4)
-                        for n in cutlass.range_constexpr(2):
+                        for n in cutlass.range_constexpr(n8):
                             _st_global_cs_v2_f32_offset(dst, n * 32, grand[m, n, 2 * half], grand[m, n, 2 * half + 1])
             tile += step
 
