@@ -182,6 +182,7 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink):
 def run_decode_aot(args):
     """Compare the production launch ABI over full-width packed records."""
     import torch
+    from cuda.bindings import driver as cuda
     from b12x.attention._shared.mla.compressed_reference import (
         pack_compressed_sparse_mla_kv_cache_reference as pack_v4,
         unpack_compressed_sparse_mla_kv_cache_reference as unpack_v4,
@@ -270,21 +271,24 @@ def run_decode_aot(args):
             # GLM batches keep a recipe fixed, independently of live width. Cover
             # every exported plan bucket across the row curve; V4 has one m64 plan.
             plans = (None,) if v4 else tuple(cap for cap, _, _ in programs["fp8"].geometry["decode_buckets"])
+            stream = torch.cuda.Stream()
+            stream_handle = cuda.CUstream(stream.cuda_stream)
             for plan_rows in plans:
                 for rows in range(1, capacity + 1):
                     record = {"cell": cell, "kind": kind, "rows": rows, "plan_rows": plan_rows,
                               "unique_kv_bytes_per_row": (main_width + width) * record_bytes, "arms": {}}
                     scalars = (rows,) if v4 else (rows, plan_rows)
                     def execute(arm):
-                        programs[arm].launch(*inputs, outs[arm], scratch[arm], scalars=scalars)
+                        programs[arm].launch(*inputs, outs[arm], scratch[arm], scalars=scalars, stream=stream_handle)
                     graphs = {}
                     for arm in arms:
                         program = programs[arm]
                         splits = (program.geometry["num_splits"] if v4 else
                                   next(n for cap, n, _ in program.geometry["decode_buckets"] if cap >= plan_rows))
-                        for _ in range(args.warmup):
-                            execute(arm)
-                        torch.cuda.synchronize()
+                        with torch.cuda.stream(stream):
+                            for _ in range(args.warmup):
+                                execute(arm)
+                        stream.synchronize()
                         offset = (rows * heads * splits * 512 * (4 if family == "glmf" else 2) + 1023) // 1024 * 1024
                         split_lse = scratch[arm][offset:offset+rows*heads*splits*4].view(torch.float32).reshape(rows, heads, splits)
                         actual_lse = torch.logsumexp(split_lse * math.log(2), -1)
@@ -297,7 +301,8 @@ def run_decode_aot(args):
                         record["arms"][arm] = {"splits": splits, "output_rel_rms": float(delta.square().mean().sqrt() / ref[:rows].square().mean().sqrt()),
                                                "lse_rms": float(lse_delta.square().mean().sqrt()), "lse_max_abs": float(lse_delta.abs().max())}
                         graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(graph):
+                        torch.cuda.synchronize()
+                        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
                             execute(arm)
                         graph.replay()
                         graphs[arm] = graph
@@ -432,9 +437,10 @@ def main(argv=None):
                         "output_max_abs": float(delta.abs().max()), "lse_max_abs": float(ld.abs().max()),
                         "lse_rms": float(ld.square().mean().sqrt())}
                     if rows in args.timing_rows:
-                        for _ in range(args.warmup):
-                            execute(arm)
-                        torch.cuda.synchronize()
+                        with torch.cuda.stream(stream):
+                            for _ in range(args.warmup):
+                                execute(arm)
+                        stream.synchronize()
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
                             execute(arm)
