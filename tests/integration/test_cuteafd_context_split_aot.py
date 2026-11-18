@@ -235,14 +235,17 @@ def pack_glm(records, family):
 @pytest.mark.parametrize("family",["glm","glmf","flash","pro","ml4","ml4nope"])
 @pytest.mark.parametrize("rows",[1,8,64])
 @pytest.mark.parametrize("plan_sm_count",[170,188])
-def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
+@pytest.mark.parametrize("precision", ["fp8", "bf16"])
+def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count,precision):
     from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
     from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
     v4 = family in ("flash","pro")
     g = _geometry(family)
+    torch.manual_seed(2146)
+    torch.backends.cuda.matmul.allow_tf32 = False
     from b12x.integration.cuteafd.context_split import sparse_mla_partial_split_plan
     splits = sparse_mla_partial_split_plan(g,max_rows=64,head_count=g.heads//2,sm_count=plan_sm_count)
-    p = program("sparse_mla_partial",family,max_rows=64,head_begin=g.heads//2,head_count=g.heads//2,num_splits=splits)
+    p = program("sparse_mla_partial",family,max_rows=64,head_begin=g.heads//2,head_count=g.heads//2,num_splits=splits,precision=precision)
     k = (g.index_topk if v4 else getattr(g,"sparse_topk",g.index_topk))
     width = 512 if v4 else g.latent_dim
     q = torch.randn((rows,g.heads,width),device="cuda").bfloat16()*0.5
@@ -306,6 +309,26 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
         p.launch(q,main,ix,lengths,extra,ei,exlen,out,lse,scratch,scalars=(rows,))
         torch.cuda.synchronize()
         assert torch.equal(out,repeat_out) and torch.equal(lse,repeat_lse)
+        if precision == "bf16":
+            k_values = (torch.cat((main_values[ix.clamp_min(0).long()], extra_values[ei.clamp_min(0).long()]), 1)
+                        if v4 else values[ix.clamp_min(0).long()])
+            valid = torch.cat((ix >= 0, ei >= 0), 1) if v4 else ix >= 0
+            scores = torch.bmm(head_q.float(), k_values.transpose(1, 2)) * scale
+            expected_lse = scores.masked_fill(~valid[:, None], -torch.inf).logsumexp(-1)
+            torch.testing.assert_close(lse * 0.6931471805599453, expected_lse, rtol=0, atol=1e-4)
+            if rows == 8:
+                stream = torch.cuda.Stream()
+                graph = torch.cuda.CUDAGraph()
+                args = (q, main, ix, lengths, extra, ei, exlen, out, lse, scratch)
+                with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+                    p.launch(*args, scalars=(rows,))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out.view(torch.int16), repeat_out.view(torch.int16))
+                assert torch.equal(lse.view(torch.int32), repeat_lse.view(torch.int32))
+                p.launch(*args, scalars=(3,))
+                torch.cuda.synchronize()
+                assert torch.equal(out[:3].view(torch.int16), repeat_out[:3].view(torch.int16))
         if rank==1:
             assert (out[0]==0).all()
             assert torch.isneginf(lse[0]).all()
@@ -326,7 +349,10 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
             logits=torch.cat((logits,sink.double()[:,None]),1)
             vv=torch.cat((vv,torch.zeros((1,512),device="cuda",dtype=torch.float64)),0)
         expected=torch.softmax(logits,dim=1)@vv[:,:512]
-        if v4:
+        if precision == "bf16":
+            error = (combined[row].float() - expected.float()).square().mean().sqrt()
+            assert error < .008 * expected.float().square().mean().sqrt(), error
+        elif v4:
             # The existing V4 decode gate includes FP8 Q quantization error;
             # its dequantized-oracle contract is cosine > .998.
             cosine = torch.nn.functional.cosine_similarity(combined[row].float().flatten(), expected.float().flatten(), dim=0)
@@ -347,10 +373,10 @@ def test_partial_two_shards_fp64_and_full(family,rows,plan_sm_count):
         # The ML4 full program carries its family name: the GLM name and key would reuse a
         # GLM 5.3 program compiled at 256^-0.5 (the aliasing the partial key now refuses).
         from b12x.integration.cuteafd import mistral_large4 as ml4
-        full=ml4.compile_sparse_mla_aot(rope=family=="ml4",route="decode",max_rows=64)
+        full=ml4.compile_sparse_mla_aot(rope=family=="ml4",route="decode",max_rows=64,precision=precision)
     else:
-        full=(compile_dsv4_sparse_mla_aot(g,route="decode",max_rows=64,indexed_width=k)
-              if v4 else compile_glm_sparse_mla_aot(g,route="decode",max_rows=64))
+        full=(compile_dsv4_sparse_mla_aot(g,route="decode",max_rows=64,indexed_width=k,precision=precision)
+              if v4 else compile_glm_sparse_mla_aot(g,route="decode",max_rows=64,precision=precision))
     fo=torch.empty((rows,g.heads,512),device="cuda",dtype=torch.bfloat16)
     fs=torch.empty(full.scratch_bytes(rows)["scratch"],device="cuda",dtype=torch.uint8)
     if v4:
