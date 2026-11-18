@@ -19,7 +19,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64, Uint32
 
 from b12x.attention._shared.cute.ops import LOG2_E
 from ._common import GLM53, GLM53_FLASH, FLASH, Operand, Scalar, compile_program
@@ -440,6 +440,88 @@ class _PartialMerge:
                 m += cute.math.log2(d, fastmath=True)
             lse[Int64(row) * Int64(self.heads) + Int64(head)] = m
 
+
+class _PartialMergeBf16:
+    def __init__(self, heads: int, splits: int):
+        self.heads, self.splits = heads, splits
+
+    @cute.jit
+    def __call__(self, partial: cute.Tensor, partial_lse: cute.Tensor,
+                 out: cute.Pointer, lse: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        self.kernel(partial, partial_lse, out, lse).launch(
+            grid=(rows, self.heads, 2), block=(32, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, partial: cute.Tensor, partial_lse: cute.Tensor,
+               out: cute.Pointer, lse: cute.Pointer):
+        from b12x._lib.intrinsics import get_ptr_as_int64, ld_global_nc_v4_u32
+        from b12x.attention._shared.mla.decode_math import _u32_to_f32, store_v4_bf16_rn
+        row, head, group = cute.arch.block_idx()
+        tid = Int32(cute.arch.thread_idx()[0])
+        weights = cute.make_rmem_tensor((self.splits,), Float32)
+        m = Float32(float("-inf"))
+        for p in cutlass.range_constexpr((self.splits + 31) // 32):
+            lane_lse = Float32(float("-inf"))
+            idx = Int32(p * 32) + tid
+            if idx < Int32(self.splits):
+                lane_lse = Float32(partial_lse[row, head, idx])
+            for k in cutlass.range_constexpr(min(32, self.splits - p * 32)):
+                val = cute.arch.shuffle_sync(lane_lse, Int32(k))
+                weights[p * 32 + k] = val
+                m = cute.math.max(m, val)
+        d = Float32(0)
+        for s in cutlass.range_constexpr(self.splits):
+            w = Float32(0)
+            if weights[s] > Float32(float("-inf")):
+                w = cute.math.exp2(weights[s] - m, fastmath=True)
+            weights[s] = w
+            d += w
+        inv = Float32(0)
+        if d > Float32(0):
+            inv = cute.arch.rcp_approx(d)
+        for s in cutlass.range_constexpr(self.splits):
+            weights[s] *= inv
+        dim0 = Int32(group) * Int32(256) + tid * Int32(8)
+        src_base = get_ptr_as_int64(
+            partial,
+            (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(self.splits * 512) + Int64(dim0),
+        )
+        v0 = Float32(0)
+        v1 = Float32(0)
+        v2 = Float32(0)
+        v3 = Float32(0)
+        v4 = Float32(0)
+        v5 = Float32(0)
+        v6 = Float32(0)
+        v7 = Float32(0)
+        for s0 in cutlass.range_constexpr(0, self.splits, 4):
+            nb = min(4, self.splits - s0)
+            lds = []
+            for k in cutlass.range_constexpr(nb):
+                s = s0 + k
+                x0, x1, x2, x3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                if weights[s] > Float32(0):
+                    x0, x1, x2, x3 = ld_global_nc_v4_u32(src_base + Int64(s * 1024))
+                lds.append((x0, x1, x2, x3))
+            for k in cutlass.range_constexpr(nb):
+                w = weights[s0 + k]
+                if w > Float32(0):
+                    x0, x1, x2, x3 = lds[k]
+                    v0 += w * _u32_to_f32(x0 << Uint32(16))
+                    v1 += w * _u32_to_f32(x0 & Uint32(0xFFFF0000))
+                    v2 += w * _u32_to_f32(x1 << Uint32(16))
+                    v3 += w * _u32_to_f32(x1 & Uint32(0xFFFF0000))
+                    v4 += w * _u32_to_f32(x2 << Uint32(16))
+                    v5 += w * _u32_to_f32(x2 & Uint32(0xFFFF0000))
+                    v6 += w * _u32_to_f32(x3 << Uint32(16))
+                    v7 += w * _u32_to_f32(x3 & Uint32(0xFFFF0000))
+        dst_off = (Int64(row) * Int64(self.heads) + Int64(head)) * Int64(512) + Int64(dim0)
+        store_v4_bf16_rn(Int64((out + dst_off).toint()), v0, v1, v2, v3, v4, v5, v6, v7)
+        if Int32(group) == Int32(0) and tid == Int32(0):
+            if d > Float32(0):
+                m += cute.math.log2(d, fastmath=True)
+            lse[Int64(row) * Int64(self.heads) + Int64(head)] = m
+
 def sparse_mla_partial_split_plan(g=GLM53, *, max_rows: int, head_count: int, sm_count: int) -> int:
     """Load-time per-device numerics/launch choice; never a live-request policy."""
     from b12x.attention._shared.mla.kernel import plan_unified_decode_splits
@@ -469,9 +551,6 @@ class _Partial:
         self.extra_page_bytes = 37440 if self.v4 else 0
         self.scale = (512 ** -0.5) if self.v4 else g.softmax_scale
         traits = v4_traits() if self.v4 else _traits(g)
-        if precision == "bf16":
-            from b12x.attention._shared.mla.traits import with_bf16_attention
-            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
         hpb = traits.hpb
         if heads % hpb:
             raise ValueError(f"head_count must be divisible by {hpb}")
@@ -481,6 +560,59 @@ class _Partial:
             h_blocks=heads // hpb, forced_num_splits=num_splits,
             sm_count=torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
         n, s = heads, self.splits
+        self.decode_compact = None
+        self.bf16_tag = ()
+        if precision == "bf16":
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            if self.v4:
+                traits = replace(
+                    with_bf16_attention(traits),
+                    q_nope_stride=traits.d_nope + traits.d_rope + 8,
+                    packed_bf16_decode=True,
+                )
+            elif chunks >= 2:
+                traits = replace(
+                    with_bf16_attention(traits),
+                    glm_record_ring=True,
+                    q_nope_stride=traits.d_nope + 8 - (192 if traits.d_rope else 0),
+                )
+            else:
+                from b12x.attention._shared.mla.native_v41_aot import (
+                    query_pv_bf16_eff_sms,
+                    resolve_pv_bf16_compact_launch_attrs,
+                )
+                traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
+                full_layout = make_smem_layout(traits)
+                arm_2cta = replace(
+                    traits,
+                    glm_compact_2cta=True,
+                    q_nope_stride=(16 if traits.d_rope else traits.q_nope_stride - 192),
+                )
+                compact_layout = make_smem_layout(arm_2cta)
+                min_blk_c, carve_c = resolve_pv_bf16_compact_launch_attrs(
+                    block_threads=int(traits.block_threads),
+                    compact_smem_bytes=int(compact_layout.total_bytes),
+                    full_smem_bytes=int(full_layout.total_bytes),
+                )
+                if min_blk_c >= 2:
+                    self._query_eff_sms = query_pv_bf16_eff_sms
+                    self.block_threads = int(traits.block_threads)
+                    self.compact_smem_bytes = int(compact_layout.total_bytes)
+                    self.ctas_per_row = (n // hpb) * s
+                    self.cache_symbol = f"_pv_bf16_ctx_sms_q{self.qk}"
+                    self.bf16_tag = ("compact2cta", min_blk_c)
+                    self.decode_compact = UnifiedDecodeKernel(
+                        arm_2cta, compact_layout, self.page_rows, chunks,
+                        h_blocks=n // hpb, num_splits=s, num_heads=n, q_head_dim=self.qk,
+                        topk=self.topk, extra_topk=self.extra_topk,
+                        q_stride=(g.heads * self.qk, self.qk, 1), swa_indices_stride0=self.topk,
+                        extra_indices_stride0=self.extra_topk if self.v4 else self.topk,
+                        mid_out_stride=(n*s*512, s*512, 512, 1), mid_lse_stride=(n*s, s, 1),
+                        has_extra=False, pbs_extra=1,
+                        valid_hpb=hpb, head_block_offset=0, per_token_len=True,
+                        native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
+                        native_dsv41_fp8=False, vector_q=True, zero_masked_v=True,
+                        min_blocks_per_mp=min_blk_c, preferred_smem_carveout=carve_c)
         self.decode = UnifiedDecodeKernel(
             traits, make_smem_layout(traits), self.page_rows, chunks,
             h_blocks=n // hpb, num_splits=s, num_heads=n, q_head_dim=self.qk,
@@ -491,9 +623,9 @@ class _Partial:
             has_extra=self.v4, pbs_extra=64 if self.v4 else 1,
             valid_hpb=hpb, head_block_offset=0, per_token_len=True,
             native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
-            native_dsv41_fp8=False, vector_q=not (self.v4 and precision == "bf16"),
+            native_dsv41_fp8=False, vector_q=True,
             zero_masked_v=(not self.v4 and precision == "bf16"))
-        self.merge = _PartialMerge(n, s)
+        self.merge = _PartialMergeBf16(n, s) if precision == "bf16" else _PartialMerge(n, s)
 
     def scratch_bytes(self, rows):
         size = max(rows, 1) * self.heads * self.splits
@@ -524,6 +656,18 @@ class _Partial:
                 cute.make_tensor(extra_indices, cute.make_layout((m,self.extra_topk), stride=(self.extra_topk,1))),
                 cute.make_tensor(extra_lengths, cute.make_layout((m,))),
                 Int32(2), Int64(self.extra_page_bytes), rows, stream)
+        elif cutlass.const_expr(self.decode_compact is not None):
+            eff_sms = self._query_eff_sms(
+                self.cache_symbol,
+                block_threads=self.block_threads,
+                compact_smem_bytes=self.compact_smem_bytes,
+            )
+            if eff_sms > Int32(0) and (rows * Int32(self.ctas_per_row)) > (Int32(2) * eff_sms):
+                self.decode_compact.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
+                                                Int64(self.page_bytes), rows, stream)
+            else:
+                self.decode.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
+                                        Int64(self.page_bytes), rows, stream)
         else:
             self.decode.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
                                    Int64(self.page_bytes), rows, stream)
@@ -567,7 +711,7 @@ def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 
                                 head_begin, head_count, max_rows, launch.splits, launch.record_bytes,
                                 # The softmax scale is a geometry fact (GLM's 256^-0.5, Mistral Large 4's
                                 # 128^-0.5 at the same record): two scales are two programs.
-                                float(launch.scale)) + (("bf16",) if precision == "bf16" else ()),
+                                float(launch.scale)) + (("bf16", *launch.bf16_tag) if precision == "bf16" else ()),
                            geometry={"heads": g.heads, "head_begin": head_begin, "head_count": head_count,
                                      "record_bytes": launch.record_bytes, "num_splits": launch.splits,
                                      **({"attention_precision": "bf16"} if precision == "bf16" else {})},

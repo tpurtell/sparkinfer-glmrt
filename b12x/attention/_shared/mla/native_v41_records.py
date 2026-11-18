@@ -598,7 +598,7 @@ def s6_pv_dsv41_bf16_smem(
 
 @cute.jit
 def snapshot_v4_pv_fragments(base: Int32, warp: Int32, lane: Int32):
-    """Snapshot the 8x4 B fragments per lane before returning the slab to IO."""
+    """Snapshot the 8x4 transposed BF16 V fragments per lane before releasing the slab."""
     r = lane & Int32(7)
     addr = base + ((((lane >> Int32(3)) & Int32(1)) * Int32(8) + r) * Int32(1024)
                    + (warp ^ r) * Int32(16))
@@ -607,20 +607,27 @@ def snapshot_v4_pv_fragments(base: Int32, warp: Int32, lane: Int32):
 
 
 @cute.jit
-def apply_v4_pv_fragments(acc_nope, acc_rope, values, sm_p: Int32, lane: Int32, *,
-                          sm_p_stride: cutlass.Constexpr):
+def apply_v4_pv(acc_nope, acc_rope, values, sm_p: Int32, warp: Int32, lane: Int32, *,
+                sm_p_stride: cutlass.Constexpr, kv_base=None):
     p_row = lane & Int32(15)
     p_base = sm_p + (p_row * Int32(sm_p_stride) + (lane >> Int32(4)) * Int32(8)) * Int32(2)
+    if cutlass.const_expr(values is None):
+        r = lane & Int32(7)
+        v_addr = kv_base + ((((lane >> Int32(3)) & Int32(1)) * Int32(8) + r) * Int32(1024)
+                            + (warp ^ r) * Int32(16))
     weights = [_ldmatrix_m8n8x4_b16_offset(p_base, ks * 32) for ks in range(4)]
     for vc in cutlass.range_constexpr(8):
-        # Preserve the reference accumulation tree: NoPE adds a 4-MMA tile,
-        # whereas RoPE accumulates the 4 MMAs directly into the running value.
+        # Match 1c2ae8c3 rounding tree: NoPE sums 4 MMAs from 0 then adds into
+        # acc_nope[vc]; RoPE accumulates the 4 MMAs directly into acc_rope.
         x0, x1, x2, x3 = Float32(0), Float32(0), Float32(0), Float32(0)
         if cutlass.const_expr(vc == 7):
             x0, x1, x2, x3 = acc_rope[0], acc_rope[1], acc_rope[2], acc_rope[3]
         for ks in cutlass.range_constexpr(4):
             a, b, c, d = weights[ks]
-            e, f = values[vc * 4 + ks]
+            if cutlass.const_expr(values is None):
+                e, f = _ldmatrix_m8n8x2_trans_b16_offset(v_addr, ks * 16384 + vc * 128)
+            else:
+                e, f = values[vc * 4 + ks]
             x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(x0, x1, x2, x3, a, b, c, d, e, f)
         if cutlass.const_expr(vc == 7):
             acc_rope[0], acc_rope[1], acc_rope[2], acc_rope[3] = x0, x1, x2, x3

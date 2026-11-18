@@ -434,6 +434,121 @@ def _host_query_device_attrs(dev: Int32, *, loc=None, ip=None):
     return (Int32(ok), *vals)
 
 
+@dsl_user_op
+def _host_load_cached_eff_sms(global_name: str, *, loc=None, ip=None):
+    mod = _find_builtin_module()
+    _ensure_host_threshold_decls(mod, global_name, loc=loc)
+    ptr_ty = ir.Type.parse("!llvm.ptr")
+    i32 = T.i32()
+    one = Int32(1).ir_value(loc=loc, ip=ip)
+    zero = Int32(0).ir_value(loc=loc, ip=ip)
+    thirty_two = Int32(32).ir_value(loc=loc, ip=ip)
+    neg_one = Int32(-1).ir_value(loc=loc, ip=ip)
+
+    dev_ptr = llvm.alloca(ptr_ty, one, i32, alignment=4, loc=loc, ip=ip)
+    llvm.store(neg_one, dev_ptr, loc=loc, ip=ip)
+    err = llvm.call(i32, [dev_ptr], [], [], callee="_cudaGetDevice", loc=loc, ip=ip)
+    dev = llvm.load(i32, dev_ptr, loc=loc, ip=ip)
+
+    err_ok = arith.cmpi(arith.CmpIPredicate.eq, err, zero, loc=loc, ip=ip)
+    dev_ge0 = arith.cmpi(arith.CmpIPredicate.sge, dev, zero, loc=loc, ip=ip)
+    dev_lt32 = arith.cmpi(arith.CmpIPredicate.slt, dev, thirty_two, loc=loc, ip=ip)
+    valid = arith.andi(err_ok, arith.andi(dev_ge0, dev_lt32, loc=loc, ip=ip), loc=loc, ip=ip)
+
+    safe_idx = arith.select(valid, dev, zero, loc=loc, ip=ip)
+    base_ptr = llvm.AddressOfOp(ptr_ty, global_name, loc=loc, ip=ip).result
+    slot_ptr = llvm.getelementptr(
+        ptr_ty,
+        base_ptr,
+        [safe_idx],
+        [-2147483648],
+        i32,
+        llvm.GEPNoWrapFlags.inbounds,
+        loc=loc,
+        ip=ip,
+    )
+    loaded = llvm.load(
+        i32,
+        slot_ptr,
+        alignment=4,
+        ordering=llvm.AtomicOrdering.monotonic,
+        loc=loc,
+        ip=ip,
+    )
+    out_sms = arith.select(valid, loaded, neg_one, loc=loc, ip=ip)
+    out_dev = arith.select(valid, dev, neg_one, loc=loc, ip=ip)
+    return Int32(out_dev), Int32(out_sms)
+
+
+@cute.jit
+def query_pv_bf16_eff_sms(
+    cache_symbol: cutlass.Constexpr,
+    *,
+    block_threads: cutlass.Constexpr,
+    compact_smem_bytes: cutlass.Constexpr,
+) -> Int32:
+    """Return runtime MultiProcessorCount when 2 compact CTAs/SM fit, else -1."""
+    dev, eff_sms = _host_load_cached_eff_sms(cache_symbol)
+    if eff_sms == Int32(0) and dev >= Int32(0):
+        (
+            ok,
+            num_sms,
+            smem_mp,
+            smem_optin,
+            rsv_smem,
+            regs_mp,
+            regs_blk,
+            thr_mp,
+            blk_mp,
+            warp_sz,
+        ) = _host_query_device_attrs(dev)
+        eff_sms = Int32(-1)
+        if ok != Int32(0) and num_sms > Int32(0) and warp_sz > Int32(0):
+            warps = (Int32(block_threads) + warp_sz - Int32(1)) // warp_sz
+            cta_smem_2 = Int32(compact_smem_bytes) + rsv_smem
+            reg_budget_2 = ((regs_mp // (Int32(2) * warps)) // warp_sz) & Int32(-8)
+            if (
+                Int32(compact_smem_bytes) <= smem_optin
+                and Int32(2) * cta_smem_2 <= smem_mp
+                and Int32(2 * block_threads) <= thr_mp
+                and blk_mp >= Int32(2)
+                and reg_budget_2 > Int32(0)
+                and (reg_budget_2 * warps * warp_sz) <= regs_blk
+            ):
+                eff_sms = num_sms
+        _host_store_cached_threshold(cache_symbol, dev, eff_sms)
+    return eff_sms
+
+
+def resolve_pv_bf16_compact_launch_attrs(
+    *,
+    block_threads: int,
+    compact_smem_bytes: int,
+    full_smem_bytes: int,
+    device: int | None = None,
+) -> tuple[int, int | None]:
+    """Return (min_blocks_per_mp, preferred_smem_carveout) for compact 2-CTA/SM BF16 decode."""
+    limits = query_sm_occupancy_limits(device)
+    if limits is None:
+        min_blocks_per_mp = 2
+    else:
+        cand_compact, cand_min_blocks = resolve_native_v41_cta_placement(
+            block_threads=block_threads,
+            compact_smem_bytes=compact_smem_bytes,
+            full_smem_bytes=full_smem_bytes,
+            limits=limits,
+        )
+        min_blocks_per_mp = 2 if (cand_compact and cand_min_blocks >= 2) else 1
+    carveout = (
+        None
+        if min_blocks_per_mp <= 1
+        or compact_smem_bytes <= 49152
+        or _can_query_cutlass_max_smem_per_mp()
+        else int(cuda.CUshared_carveout.CU_SHAREDMEM_CARVEOUT_MAX_SHARED)
+    )
+    return min_blocks_per_mp, carveout
+
+
 class NativeV41Attention:
     def __init__(
         self,

@@ -203,12 +203,11 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     d_rope = traits.d_rope
     num_scales = traits.num_scales
     n_v_chunks = traits.n_v_chunks
-    # BF16 split decode widens each row in place, after its last raw read.
     kv_smem_stride = traits.kv_smem_stride
     if traits.pv_bf16 and traits.scale_format == ScaleFormat.UE8M0_BYTE:
         kv_smem_stride = 2 * (traits.d_nope + (d_rope if traits.packed_bf16_decode else 0))
     q_nope_stride = traits.q_nope_stride
-    bufs = 1 if traits.pv_bf16 and not traits.glm_record_ring else _KV_BUF_COUNT
+    bufs = 1 if (traits.pv_bf16 and not traits.glm_record_ring) else _KV_BUF_COUNT
 
     off = 0
 
@@ -220,9 +219,15 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # GLM_NEXT recipe has d_rope==0, so reserve one unused padded row while all
     # RoPE math and IO remain const-expr-elided by d_rope.
     q_rope_stride = (
-        d_rope + (8 if traits.has_extra_cache else 0) if d_rope else 8
+        d_rope + (8 if (traits.has_extra_cache or traits.pv_bf16) else 0)
+        if d_rope
+        else 8
     )
-    q_rope_bytes = hpb * q_rope_stride * 2
+    q_rope_bytes = (
+        16
+        if (traits.packed_bf16_decode or (traits.pv_bf16 and d_rope == 0))
+        else hpb * q_rope_stride * 2
+    )
     off = q_rope_off + q_rope_bytes  # FlashInfer packs Q regions back-to-back
 
     # V4.1's fast arm normalizes its gathered mixed source rows in place to
@@ -234,13 +239,17 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
         if not traits.pv_bf16 and (traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3)
         else 2
     )
-    q_fp8_bytes = hpb * q_nope_stride * q_element_bytes
+    q_fp8_bytes = (
+        16
+        if (traits.glm_compact_2cta and d_rope > 0)
+        else hpb * q_nope_stride * q_element_bytes
+    )
     off = q_fp8_off + q_fp8_bytes
 
     # --- Q per-head scales: FP32 power-of-2 (converted to UE8M0 sfa at use). ---
     q_sc_off = off
     q_sc_stride = num_scales
-    q_sc_bytes = 16 if traits.glm_record_ring else hpb * num_scales * 4
+    q_sc_bytes = 16 if traits.pv_bf16 else hpb * num_scales * 4
     off = q_sc_off + q_sc_bytes
 
     # 128B-align the start of the (large) KV region for clean vectorized stores.
@@ -277,7 +286,11 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- Double-buffered KV rope (bf16) linear entry*D_ROPE + d. ---
     kv_rope_off = off
     kv_rope_stride = d_rope if d_rope else 1
-    kv_rope_buf_bytes = 16 if traits.packed_bf16_decode else bi * kv_rope_stride * 2
+    kv_rope_buf_bytes = (
+        16
+        if (traits.packed_bf16_decode or (traits.pv_bf16 and d_rope == 0))
+        else bi * kv_rope_stride * 2
+    )
     off = kv_rope_off + kv_rope_buf_bytes * bufs
 
     # --- P6 mbarrier pair placeholder (16B aligned; reserved, unused in P5). ---
@@ -296,20 +309,24 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- per-vc per-head output scale (fp32), N_V_CHUNKS rows of HPB. ---
     w_head_sc_off = off
     w_head_sc_stride = hpb
-    w_head_sc_bytes = 16 if traits.glm_record_ring else n_v_chunks * hpb * 4
+    w_head_sc_bytes = 16 if traits.pv_bf16 else n_v_chunks * hpb * 4
     off = w_head_sc_off + w_head_sc_bytes
 
     # --- re-quantized-P staging for XV MMA: HPB x (BI + 16), double-buffered. ---
     w_fp8_off = off
     w_fp8_stride = bi + _W_FP8_PAD
-    w_fp8_buf_bytes = 16 if traits.glm_record_ring else hpb * w_fp8_stride
+    w_fp8_buf_bytes = 16 if traits.pv_bf16 else hpb * w_fp8_stride
     # GLM_NEXT has no RoPE stage and sits well under the carveout, so it can
     # afford separate HIGH and LOW W buffers per V-group parity: the two-pass
     # PV then stages both passes behind one barrier per V group.
     w_fp8_bufs = (
-        2 * _W_FP8_BUF_COUNT
-        if traits.model_type == ModelType.GLM_NEXT
-        else _W_FP8_BUF_COUNT
+        1
+        if traits.pv_bf16
+        else (
+            2 * _W_FP8_BUF_COUNT
+            if traits.model_type == ModelType.GLM_NEXT
+            else _W_FP8_BUF_COUNT
+        )
     )
     off = w_fp8_off + w_fp8_buf_bytes * w_fp8_bufs
 
@@ -318,13 +335,13 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     off = _align_up(off, 16)
     token_idx_off = off
     token_idx_buf_bytes = bi * 4
-    token_idx_bufs = _TOKEN_IDX_BUF_COUNT
+    token_idx_bufs = bufs if traits.pv_bf16 else _TOKEN_IDX_BUF_COUNT
     off = token_idx_off + token_idx_buf_bytes * token_idx_bufs
 
     # --- static sm_p_full (bf16), 128B-aligned for the S6b ldmatrix.x4 read. ---
     off = _align_up(off, 128)
     sm_p_full_off = off
-    sm_p_full_stride = bi + (8 if traits.has_extra_cache else 0)
+    sm_p_full_stride = bi + (8 if (traits.has_extra_cache or traits.pv_bf16) else 0)
     sm_p_full_bytes = hpb * sm_p_full_stride * 2
     off = sm_p_full_off + sm_p_full_bytes
 
@@ -335,7 +352,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     w_head_sc2_off = off
     w_head_sc2_bytes = (
         n_v_chunks * hpb * 4 + 8 * sm_p_full_stride * 2
-        if has_kv_footer
+        if (has_kv_footer and not traits.pv_bf16)
         else 0
     )
     off = w_head_sc2_off + w_head_sc2_bytes
