@@ -3672,3 +3672,684 @@ def s1_qk_nope_bf16_mg2(
                         qk1[0], qk1[1], qk1[2], qk1[3], a10, a11, a12, a13, b0, b1
                     )
     return qk0, qk1
+
+
+# =============================================================================
+# BF16-tier (traits.pv_bf16) swizzled-slice decode + ldmatrix QK/PV helpers
+# =============================================================================
+@dsl_user_op
+def _ldmatrix_m8n8x4_b16_disp(smem_addr: Int32, offset: int, *, loc=None, ip=None):
+    disp = f" + {int(offset)}" if int(offset) else ""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        f"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{$0, $1, $2, $3}}, [$4{disp}];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [2], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _ldmatrix_m8n8x2_b16_disp(smem_addr: Int32, offset: int, *, loc=None, ip=None):
+    disp = f" + {int(offset)}" if int(offset) else ""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        f"ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{$0, $1}}, [$2{disp}];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _ldmatrix_m8n8x2_trans_b16_disp(smem_addr: Int32, offset: int, *, loc=None, ip=None):
+    disp = f" + {int(offset)}" if int(offset) else ""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        f"ldmatrix.sync.aligned.trans.m8n8.x2.shared.b16 {{$0, $1}}, [$2{disp}];",
+        "=r,=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _e4m3x8_to_bf16x2x4_sm120(w0: Uint32, w1: Uint32, *, loc=None, ip=None):
+    """Exact widening of 8 E4M3 bytes into four bf16x2 words (zero rounding)."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(w0).ir_value(loc=loc, ip=ip),
+            Uint32(w1).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 q0, q1, q2, q3;
+            .reg .b32 o0, o1, o2, o3;
+            mov.b32 {q0, q1}, $4;
+            mov.b32 {q2, q3}, $5;
+            cvt.rn.bf16x2.e4m3x2 o0, q0;
+            cvt.rn.bf16x2.e4m3x2 o1, q1;
+            cvt.rn.bf16x2.e4m3x2 o2, q2;
+            cvt.rn.bf16x2.e4m3x2 o3, q3;
+            mov.b32 $0, o0;
+            mov.b32 $1, o1;
+            mov.b32 $2, o2;
+            mov.b32 $3, o3;
+        }
+        """,
+        "=r,=r,=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [2], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _ue8m0x8_e4m3_to_bf16x2x4_sm120(
+    w0: Uint32, w1: Uint32, scale: Uint32, *, loc=None, ip=None
+):
+    """Exact decode of 8 E4M3 bytes x 1 UE8M0 scale byte into four bf16x2 words."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+        [
+            Uint32(w0).ir_value(loc=loc, ip=ip),
+            Uint32(w1).ir_value(loc=loc, ip=ip),
+            Uint32(scale).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 q0, q1, q2, q3, sf;
+            .reg .b32 v0, v1, v2, v3, factors, sf_pair, o0, o1, o2, o3;
+            mov.b32 {q0, q1}, $4;
+            mov.b32 {q2, q3}, $5;
+            shl.b32 sf_pair, $6, 8;
+            or.b32 sf_pair, $6, sf_pair;
+            cvt.u16.u32 sf, sf_pair;
+            cvt.rn.bf16x2.ue8m0x2 factors, sf;
+            cvt.rn.bf16x2.e4m3x2 v0, q0;
+            cvt.rn.bf16x2.e4m3x2 v1, q1;
+            cvt.rn.bf16x2.e4m3x2 v2, q2;
+            cvt.rn.bf16x2.e4m3x2 v3, q3;
+            mul.bf16x2 o0, v0, factors;
+            mul.bf16x2 o1, v1, factors;
+            mul.bf16x2 o2, v2, factors;
+            mul.bf16x2 o3, v3, factors;
+            mov.b32 $0, o0;
+            mov.b32 $1, o1;
+            mov.b32 $2, o2;
+            mov.b32 $3, o3;
+        }
+        """,
+        "=r,=r,=r,=r,r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [2], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [3], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _st_shared_v2_u32_pv(smem_addr: Int32, v0: Uint32, v1: Uint32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(v0).ir_value(loc=loc, ip=ip),
+            Uint32(v1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.v2.b32 [$0], {$1, $2};",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_shared_bf16x2_pv(addr: Int32, x0: Float32, x1: Float32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Float32(x0).ir_value(loc=loc, ip=ip),
+            Float32(x1).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 tmp; cvt.rn.bf16x2.f32 tmp, $2, $1; st.shared.b32 [$0], tmp; }",
+        "r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_global_f32x2_pv(ptr_i64: Int64, x0: Float32, x1: Float32, *, loc=None, ip=None):
+    llvm.inline_asm(
+        None,
+        [
+            Int64(ptr_i64).ir_value(loc=loc, ip=ip),
+            Float32(x0).ir_value(loc=loc, ip=ip),
+            Float32(x1).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v2.f32 [$0], {$1, $2};",
+        "l,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def load_q_slice_bf16_pv(
+    q_token: cute.Tensor,
+    qp_base_addr: Int32,
+    head_base: Int32,
+    col_offset: Int32,
+    tid: Int32,
+    *,
+    hpb: cutlass.Constexpr = 16,
+    valid_hpb: cutlass.Constexpr = 16,
+    vector_q: cutlass.Constexpr = True,
+    qp_stride: cutlass.Constexpr = 72,
+):
+    """Stage one [16, 64] BF16 query feature slice into padded q_or_p shared memory."""
+    h = tid >> Int32(4)
+    t_col = tid & Int32(15)
+    d = col_offset + t_col * Int32(4)
+    w0 = Uint32(0)
+    w1 = Uint32(0)
+    if cutlass.const_expr(valid_hpb >= hpb):
+        if cutlass.const_expr(vector_q):
+            q_off = cute.crd2idx((head_base + h, d), q_token.layout)
+            w0, w1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
+        else:
+            v0 = Float32(q_token[head_base + h, d])
+            v1 = Float32(q_token[head_base + h, d + Int32(1)])
+            v2 = Float32(q_token[head_base + h, d + Int32(2)])
+            v3 = Float32(q_token[head_base + h, d + Int32(3)])
+            w0 = pack_f32x2_to_bfloat2(v0, v1)
+            w1 = pack_f32x2_to_bfloat2(v2, v3)
+    else:
+        if h < Int32(valid_hpb):
+            if cutlass.const_expr(vector_q):
+                q_off = cute.crd2idx((head_base + h, d), q_token.layout)
+                w0, w1 = ld_global_nc_v2_u32(get_ptr_as_int64(q_token, q_off))
+            else:
+                v0 = Float32(q_token[head_base + h, d])
+                v1 = Float32(q_token[head_base + h, d + Int32(1)])
+                v2 = Float32(q_token[head_base + h, d + Int32(2)])
+                v3 = Float32(q_token[head_base + h, d + Int32(3)])
+                w0 = pack_f32x2_to_bfloat2(v0, v1)
+                w1 = pack_f32x2_to_bfloat2(v2, v3)
+    _st_shared_v2_u32_pv(
+        qp_base_addr + h * Int32(qp_stride * 2) + t_col * Int32(8),
+        w0,
+        w1,
+    )
+
+
+@cute.jit
+def decode_pv_bf16_slice_to_smem(
+    kv_raw_addr: Int32,
+    kv_sc_addr: Int32,
+    kv_slice_addr: Int32,
+    tok_buf_view: cute.Tensor,
+    slice_idx: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    raw_stride: cutlass.Constexpr,
+    slice_stride: cutlass.Constexpr = 128,
+    ue8m0_scales: cutlass.Constexpr = False,
+    mask_invalid: cutlass.Constexpr = True,
+):
+    """Bank-conflict-free decode of one 64-dim slice across 64 staged KV rows into swizzled BF16 SMEM."""
+    if cutlass.const_expr((raw_stride // 16) % 2 == 1):
+        entry = warp_id * Int32(8) + (lane & Int32(7))
+        g = lane >> Int32(3)
+    else:
+        entry = warp_id * Int32(8) + (lane >> Int32(2))
+        g = lane & Int32(3)
+    raw_row = kv_raw_addr + entry * Int32(raw_stride)
+    swz = entry & Int32(7)
+    row_dst = kv_slice_addr + entry * Int32(slice_stride)
+    dst0 = row_dst + ((g * Int32(2)) ^ swz) * Int32(16)
+    dst1 = row_dst + ((g * Int32(2) + Int32(1)) ^ swz) * Int32(16)
+    if cutlass.const_expr(mask_invalid):
+        if tok_buf_view[entry] >= Int32(0):
+            w00, w01, w10, w11 = ld_shared_v4_u32(
+                raw_row + slice_idx * Int32(64) + g * Int32(16)
+            )
+            if cutlass.const_expr(ue8m0_scales):
+                sc = ld_shared_u8_offset(kv_sc_addr + entry * Int32(8) + slice_idx, 0)
+                d00, d01, d02, d03 = _ue8m0x8_e4m3_to_bf16x2x4_sm120(w00, w01, sc)
+                d10, d11, d12, d13 = _ue8m0x8_e4m3_to_bf16x2x4_sm120(w10, w11, sc)
+            else:
+                d00, d01, d02, d03 = _e4m3x8_to_bf16x2x4_sm120(w00, w01)
+                d10, d11, d12, d13 = _e4m3x8_to_bf16x2x4_sm120(w10, w11)
+            st_shared_v4_u32(dst0, d00, d01, d02, d03)
+            st_shared_v4_u32(dst1, d10, d11, d12, d13)
+        else:
+            z = Uint32(0)
+            st_shared_v4_u32(dst0, z, z, z, z)
+            st_shared_v4_u32(dst1, z, z, z, z)
+    else:
+        w00, w01, w10, w11 = ld_shared_v4_u32(
+            raw_row + slice_idx * Int32(64) + g * Int32(16)
+        )
+        d00, d01, d02, d03 = _e4m3x8_to_bf16x2x4_sm120(w00, w01)
+        d10, d11, d12, d13 = _e4m3x8_to_bf16x2x4_sm120(w10, w11)
+        st_shared_v4_u32(dst0, d00, d01, d02, d03)
+        st_shared_v4_u32(dst1, d10, d11, d12, d13)
+
+
+@cute.jit
+def s2_qk_rope_from_frags(
+    qk,
+    qr_frags,
+    kv_rope_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    kv_rope_stride_bytes: cutlass.Constexpr,
+):
+    """Accumulate D_ROPE=64 BF16 QK-RoPE using preloaded register Q-RoPE A-fragments."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    entry = warp_first_cand + gid
+    row_base = kv_rope_base_addr + entry * Int32(kv_rope_stride_bytes) + tid * Int32(4)
+    for ks in cutlass.range_constexpr(4):
+        a0, a1, a2, a3 = qr_frags[ks]
+        b0 = ld_shared_u32(row_base + Int32(ks * 32))
+        b1 = ld_shared_u32(row_base + Int32(ks * 32 + 16))
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+        )
+    return qk
+
+
+@cute.jit
+def s2_qk_rope_from_qp(
+    qk,
+    qp_a_base: Int32,
+    kv_rope_base_addr: Int32,
+    warp_first_cand: Int32,
+    lane: Int32,
+    *,
+    kv_rope_stride_bytes: cutlass.Constexpr,
+):
+    """Accumulate D_ROPE=64 BF16 QK-RoPE loading Q-RoPE from q_or_p SMEM."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    entry = warp_first_cand + gid
+    row_base = kv_rope_base_addr + entry * Int32(kv_rope_stride_bytes) + tid * Int32(4)
+    for ks in cutlass.range_constexpr(4):
+        a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_disp(qp_a_base, ks * 32)
+        b0 = ld_shared_u32(row_base + Int32(ks * 32))
+        b1 = ld_shared_u32(row_base + Int32(ks * 32 + 16))
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+        )
+    return qk
+
+
+@cute.jit
+def s1_qk_pv_bf16_slice_from_frags(
+    qk,
+    q_slice_frags,
+    b_ptr0: Int32,
+    b_ptr1: Int32,
+    b_ptr2: Int32,
+    b_ptr3: Int32,
+):
+    """Accumulate one 64-feature BF16 QK slice using register Q A-fragments."""
+    b_ptrs = (b_ptr0, b_ptr1, b_ptr2, b_ptr3)
+    for sub in cutlass.range_constexpr(4):
+        a0, a1, a2, a3 = q_slice_frags[sub]
+        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptrs[sub], 0)
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+        )
+    return qk
+
+
+@cute.jit
+def s1_qk_pv_bf16_slice_from_qp(
+    qk,
+    qp_a_base: Int32,
+    b_ptr0: Int32,
+    b_ptr1: Int32,
+    b_ptr2: Int32,
+    b_ptr3: Int32,
+):
+    """Accumulate one 64-feature BF16 QK slice loading Q from q_or_p SMEM."""
+    b_ptrs = (b_ptr0, b_ptr1, b_ptr2, b_ptr3)
+    for sub in cutlass.range_constexpr(4):
+        a0, a1, a2, a3 = _ldmatrix_m8n8x4_b16_disp(qp_a_base, sub * 32)
+        b0, b1 = _ldmatrix_m8n8x2_b16_disp(b_ptrs[sub], 0)
+        qk[0], qk[1], qk[2], qk[3] = mma_m16n8k16_f32_bf16(
+            qk[0], qk[1], qk[2], qk[3], a0, a1, a2, a3, b0, b1
+        )
+    return qk
+
+
+@cute.jit
+def s5_fill_sm_p_bf16_pv(
+    w_pre,
+    sm_p_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    sm_p_stride: cutlass.Constexpr = 72,
+):
+    """Store packed bf16x2 softmax weights to sm_p."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    c0 = warp_id * Int32(8) + tid * Int32(2)
+    _st_shared_bf16x2_pv(
+        sm_p_addr + (gid * Int32(sm_p_stride) + c0) * Int32(2),
+        w_pre[0],
+        w_pre[1],
+    )
+    _st_shared_bf16x2_pv(
+        sm_p_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + c0) * Int32(2),
+        w_pre[2],
+        w_pre[3],
+    )
+
+
+@cute.jit
+def s5_fill_sm_p_bf16_glm_pv(
+    w_pre,
+    sm_p_addr: Int32,
+    kv_raw_addr: Int32,
+    tok_buf_view: cute.Tensor,
+    grp_idx: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    raw_stride: cutlass.Constexpr,
+    scale_offset: cutlass.Constexpr = 512,
+    sm_p_stride: cutlass.Constexpr = 72,
+    mask_invalid: cutlass.Constexpr = True,
+):
+    """Fold inline FP32 group scale into BF16 softmax weights for exact-BF16(E4M3) PV."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    c0 = warp_id * Int32(8) + tid * Int32(2)
+    c1 = c0 + Int32(1)
+    sc_base = kv_raw_addr + Int32(scale_offset) + grp_idx * Int32(4)
+    ks0 = Float32(0.0)
+    ks1 = Float32(0.0)
+    if cutlass.const_expr(mask_invalid):
+        if tok_buf_view[c0] >= Int32(0):
+            ks0 = ld_shared_f32(sc_base + c0 * Int32(raw_stride))
+        if tok_buf_view[c1] >= Int32(0):
+            ks1 = ld_shared_f32(sc_base + c1 * Int32(raw_stride))
+    else:
+        ks0 = ld_shared_f32(sc_base + c0 * Int32(raw_stride))
+        ks1 = ld_shared_f32(sc_base + c1 * Int32(raw_stride))
+    _st_shared_bf16x2_pv(
+        sm_p_addr + (gid * Int32(sm_p_stride) + c0) * Int32(2),
+        w_pre[0] * ks0,
+        w_pre[1] * ks1,
+    )
+    _st_shared_bf16x2_pv(
+        sm_p_addr + ((gid + Int32(8)) * Int32(sm_p_stride) + c0) * Int32(2),
+        w_pre[2] * ks0,
+        w_pre[3] * ks1,
+    )
+
+
+@cute.jit
+def load_pv_p_frags_bf16(qp_a_base: Int32, *, bi: cutlass.Constexpr = 64):
+    return [
+        _ldmatrix_m8n8x4_b16_disp(qp_a_base, ks * 32)
+        for ks in range(bi // 16)
+    ]
+
+
+@cute.jit
+def s6_pv_bf16_slice_from_p_frags(
+    acc_tile,
+    p_frags,
+    v_base: Int32,
+    *,
+    bi: cutlass.Constexpr = 64,
+    slice_stride: cutlass.Constexpr = 128,
+):
+    """Accumulate one 64-dim V slice into acc_tile[0..3] via ldmatrix.trans.x2."""
+    x0 = Float32(0.0)
+    x1 = Float32(0.0)
+    x2 = Float32(0.0)
+    x3 = Float32(0.0)
+    for ks in cutlass.range_constexpr(bi // 16):
+        a0, a1, a2, a3 = p_frags[ks]
+        b0, b1 = _ldmatrix_m8n8x2_trans_b16_disp(v_base, ks * (16 * slice_stride))
+        x0, x1, x2, x3 = mma_m16n8k16_f32_bf16(
+            x0, x1, x2, x3, a0, a1, a2, a3, b0, b1
+        )
+    acc_tile[0] = acc_tile[0] + x0
+    acc_tile[1] = acc_tile[1] + x1
+    acc_tile[2] = acc_tile[2] + x2
+    acc_tile[3] = acc_tile[3] + x3
+    return acc_tile
+
+
+@cute.jit
+def s6b_xv_rope_from_p_frags(
+    acc_rope,
+    p_frags,
+    kv_rope_base_addr: Int32,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    bi: cutlass.Constexpr = 64,
+    d_rope: cutlass.Constexpr = 64,
+    n_warps: cutlass.Constexpr = 8,
+    kv_rope_stride_bytes: cutlass.Constexpr = 576,
+):
+    """Accumulate P . V_rope reusing register p_frags and paired u32 BF16 loads."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+    entry_parity = gid & Int32(1)
+    pair_selector = Int32(0x5410)
+    if entry_parity != Int32(0):
+        pair_selector = Int32(0x3276)
+    col_even_bytes = (warp_id * Int32(d_rope // n_warps) + (gid & ~Int32(1))) * Int32(2)
+    base_addr = kv_rope_base_addr + col_even_bytes
+    for ks in cutlass.range_constexpr(bi // 16):
+        a0, a1, a2, a3 = p_frags[ks]
+        ent0 = Int32(ks * 16) + tid * Int32(2)
+        pair0 = ld_shared_u32(
+            base_addr + (ent0 + entry_parity) * Int32(kv_rope_stride_bytes)
+        )
+        pair8 = ld_shared_u32(
+            base_addr + (ent0 + Int32(8) + entry_parity) * Int32(kv_rope_stride_bytes)
+        )
+        peer0 = cute.arch.shuffle_sync_bfly(pair0, offset=4)
+        peer8 = cute.arch.shuffle_sync_bfly(pair8, offset=4)
+        b0 = byte_perm(pair0, peer0, pair_selector)
+        b1 = byte_perm(pair8, peer8, pair_selector)
+        acc_rope[0], acc_rope[1], acc_rope[2], acc_rope[3] = mma_m16n8k16_f32_bf16(
+            acc_rope[0], acc_rope[1], acc_rope[2], acc_rope[3], a0, a1, a2, a3, b0, b1
+        )
+    return acc_rope
+
+
+@cute.jit
+def s7_epilogue_pv_bf16(
+    acc_nope,
+    acc_rope,
+    global_max,
+    global_sum,
+    out_o: cute.Tensor,
+    out_lse: cute.Tensor,
+    warp_id: Int32,
+    lane: Int32,
+    *,
+    n_slices: cutlass.Constexpr,
+    d_nope: cutlass.Constexpr,
+    valid_hpb: cutlass.Constexpr = 16,
+    v_has_rope: cutlass.Constexpr = False,
+    single_split_partial_bf16: cutlass.Constexpr = None,
+):
+    """Normalized partial/direct epilogue with vectorized bf16x2 and f32x2 stores."""
+    gid = lane >> Int32(2)
+    tid = lane & Int32(3)
+
+    inv_g0 = Float32(0.0)
+    inv_g1 = Float32(0.0)
+    if global_sum[0] > Float32(0.0):
+        inv_g0 = Float32(1.0) / global_sum[0]
+    if global_sum[1] > Float32(0.0):
+        inv_g1 = Float32(1.0) / global_sum[1]
+
+    _ot = out_o.element_type
+    row0_ok = True
+    if cutlass.const_expr(valid_hpb < 8):
+        row0_ok = gid < Int32(valid_hpb)
+    row1_ok = True
+    if cutlass.const_expr(valid_hpb < 16):
+        row1_ok = (gid + Int32(8)) < Int32(valid_hpb)
+
+    for at in cutlass.range_constexpr(n_slices):
+        d0 = Int32(at * 64) + warp_id * Int32(8) + tid * Int32(2)
+        if cutlass.const_expr(single_split_partial_bf16 is not None):
+            v0 = Float32(0.0)
+            v1 = Float32(0.0)
+            v2 = Float32(0.0)
+            v3 = Float32(0.0)
+            if global_sum[0] > Float32(0.0):
+                v0 = _single_split_value(acc_nope[at][0], inv_g0, partial_bf16=single_split_partial_bf16)
+                v1 = _single_split_value(acc_nope[at][1], inv_g0, partial_bf16=single_split_partial_bf16)
+            if global_sum[1] > Float32(0.0):
+                v2 = _single_split_value(acc_nope[at][2], inv_g1, partial_bf16=single_split_partial_bf16)
+                v3 = _single_split_value(acc_nope[at][3], inv_g1, partial_bf16=single_split_partial_bf16)
+            if row0_ok:
+                store_bf16x2(get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)), v0, v1)
+            if cutlass.const_expr(valid_hpb > 8):
+                if row1_ok:
+                    store_bf16x2(get_ptr_as_int64(out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)), v2, v3)
+        elif cutlass.const_expr(_ot == cutlass.BFloat16):
+            if row0_ok:
+                store_bf16x2(
+                    get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
+                    acc_nope[at][0] * inv_g0,
+                    acc_nope[at][1] * inv_g0,
+                )
+            if cutlass.const_expr(valid_hpb > 8):
+                if row1_ok:
+                    store_bf16x2(
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)),
+                        acc_nope[at][2] * inv_g1,
+                        acc_nope[at][3] * inv_g1,
+                    )
+        elif cutlass.const_expr(_ot == Float32):
+            if row0_ok:
+                _st_global_f32x2_pv(
+                    get_ptr_as_int64(out_o, cute.crd2idx((gid, d0), out_o.layout)),
+                    acc_nope[at][0] * inv_g0,
+                    acc_nope[at][1] * inv_g0,
+                )
+            if cutlass.const_expr(valid_hpb > 8):
+                if row1_ok:
+                    _st_global_f32x2_pv(
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid + Int32(8), d0), out_o.layout)),
+                        acc_nope[at][2] * inv_g1,
+                        acc_nope[at][3] * inv_g1,
+                    )
+        else:
+            if row0_ok:
+                out_o[gid, d0] = (acc_nope[at][0] * inv_g0).to(_ot)
+                out_o[gid, d0 + Int32(1)] = (acc_nope[at][1] * inv_g0).to(_ot)
+            if cutlass.const_expr(valid_hpb > 8):
+                if row1_ok:
+                    out_o[gid + Int32(8), d0] = (acc_nope[at][2] * inv_g1).to(_ot)
+                    out_o[gid + Int32(8), d0 + Int32(1)] = (acc_nope[at][3] * inv_g1).to(_ot)
+
+    if cutlass.const_expr(v_has_rope):
+        rd0 = Int32(d_nope) + warp_id * Int32(8) + tid * Int32(2)
+        if cutlass.const_expr(_ot == cutlass.BFloat16):
+            if row0_ok:
+                store_bf16x2(
+                    get_ptr_as_int64(out_o, cute.crd2idx((gid, rd0), out_o.layout)),
+                    acc_rope[0] * inv_g0,
+                    acc_rope[1] * inv_g0,
+                )
+            if cutlass.const_expr(valid_hpb > 8):
+                if row1_ok:
+                    store_bf16x2(
+                        get_ptr_as_int64(out_o, cute.crd2idx((gid + Int32(8), rd0), out_o.layout)),
+                        acc_rope[2] * inv_g1,
+                        acc_rope[3] * inv_g1,
+                    )
+        else:
+            if row0_ok:
+                out_o[gid, rd0] = (acc_rope[0] * inv_g0).to(_ot)
+                out_o[gid, rd0 + Int32(1)] = (acc_rope[1] * inv_g0).to(_ot)
+            if cutlass.const_expr(valid_hpb > 8):
+                if row1_ok:
+                    out_o[gid + Int32(8), rd0] = (acc_rope[2] * inv_g1).to(_ot)
+                    out_o[gid + Int32(8), rd0 + Int32(1)] = (acc_rope[3] * inv_g1).to(_ot)
+
+    if warp_id == Int32(0) and tid == Int32(0):
+        lse0 = Float32(_NEG_INF)
+        lse1 = Float32(_NEG_INF)
+        if global_sum[0] > Float32(0.0):
+            lse0 = _log2_approx_ftz_f32(global_sum[0]) + global_max[0]
+        if global_sum[1] > Float32(0.0):
+            lse1 = _log2_approx_ftz_f32(global_sum[1]) + global_max[1]
+        if row0_ok:
+            out_lse[gid] = lse0
+        if cutlass.const_expr(valid_hpb > 8):
+            if row1_ok:
+                out_lse[gid + Int32(8)] = lse1

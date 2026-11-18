@@ -198,6 +198,9 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
         for GLM the XV-rope stage is dead-code-eliminated but K-rope still reads
         kv_rope, and Q-rope is always present)
     """
+    if traits.pv_bf16:
+        return make_pv_bf16_smem_layout(traits, compact_2cta=False)
+
     bi = traits.bi
     hpb = traits.hpb
     d_rope = traits.d_rope
@@ -402,6 +405,8 @@ def get_unified_shared_storage_cls(traits: UnifiedMLATraits):
     CUTLASS DSL 4.6's typed-allocation size and offsets remain byte-identical to
     :func:`make_smem_layout`.
     """
+    if traits.pv_bf16:
+        return get_pv_bf16_shared_storage_cls(traits, compact_2cta=False)
     layout = make_smem_layout(traits)
 
     class SharedStorage:
@@ -661,6 +666,196 @@ def get_native_v41_compact_shared_storage_cls(traits: UnifiedMLATraits):
     return storage_cls
 
 
+PV_BF16_SLICE_STRIDE = 128
+PV_BF16_QP_STRIDE = 72
+PV_BF16_DSV4_RAW_STRIDE = 576
+PV_BF16_GLM_RAW_STRIDE = 656
+PV_BF16_GLM_NOPE_RAW_STRIDE = 528
+
+
+def make_pv_bf16_smem_layout(
+    traits: UnifiedMLATraits, *, compact_2cta: bool = False
+) -> SmemLayout:
+    """SMEM layout for BF16-tier decode (``traits.pv_bf16``):
+    - ``compact_2cta=False`` (1 CTA/SM, ``n_buf=2``): double-buffered packed raw KV
+      stage + reusable [64, 64] swizzled BF16 slice (8,192B) + [16, 72] BF16 q/p stage.
+    - ``compact_2cta=True`` (2 CTAs/SM, ``n_buf=1``, <= 49,280B): single-buffered raw KV
+      stage + reusable [64, 64] swizzled BF16 slice + [16, 72] BF16 q/p stage.
+    """
+    if not traits.pv_bf16:
+        raise ValueError("make_pv_bf16_smem_layout requires traits.pv_bf16=True")
+    bi = traits.bi
+    hpb = traits.hpb
+    bufs = 1 if compact_2cta else 2
+
+    if traits.scale_format == ScaleFormat.UE8M0_BYTE:
+        raw_stride = PV_BF16_DSV4_RAW_STRIDE
+        kv_sc_stride = 8
+        kv_sc_buf_bytes = bi * kv_sc_stride
+    elif traits.scale_format == ScaleFormat.ARBITRARY_FP32:
+        if traits.d_rope > 0 and not compact_2cta:
+            raw_stride = PV_BF16_GLM_RAW_STRIDE
+        else:
+            raw_stride = PV_BF16_GLM_NOPE_RAW_STRIDE
+        kv_sc_stride = 0
+        kv_sc_buf_bytes = 0
+    else:
+        raise ValueError(f"unsupported scale_format={traits.scale_format!r} for pv_bf16")
+
+    off = 0
+    kv_raw_off = off
+    kv_raw_buf_bytes = bi * raw_stride
+    off = kv_raw_off + kv_raw_buf_bytes * bufs
+
+    kv_sc_off = off
+    off = kv_sc_off + kv_sc_buf_bytes * bufs
+
+    kv_slice_off = _align_up(off, 128)
+    kv_slice_bytes = bi * PV_BF16_SLICE_STRIDE
+    off = kv_slice_off + kv_slice_bytes
+
+    qp_off = _align_up(off, 128)
+    qp_bytes = hpb * PV_BF16_QP_STRIDE * 2
+    off = qp_off + qp_bytes
+
+    reduce_off = _align_up(off, 16)
+    reduce_warp_max_off = reduce_off
+    reduce_warp_sum_off = reduce_off + _MATH_WARPS * hpb * 4
+    reduce_bytes = 2 * _MATH_WARPS * hpb * 4
+    off = reduce_off + reduce_bytes
+
+    token_idx_off = _align_up(off, 16)
+    token_idx_buf_bytes = bi * 4
+    off = token_idx_off + token_idx_buf_bytes * bufs
+
+    mbar_off = _align_up(off, 16)
+    mbar_bytes = 2 * bufs * 8
+    off = mbar_off + mbar_bytes
+
+    total_bytes = _align_up(off, 128)
+
+    return SmemLayout(
+        q_rope_off=0,
+        q_rope_bytes=0,
+        q_rope_stride=PV_BF16_QP_STRIDE,
+        q_fp8_off=qp_off,
+        q_fp8_bytes=qp_bytes,
+        q_nope_stride=PV_BF16_QP_STRIDE,
+        q_sc_off=0,
+        q_sc_bytes=0,
+        q_sc_stride=0,
+        kv_fp8_off=kv_raw_off,
+        kv_fp8_buf_bytes=kv_raw_buf_bytes,
+        kv_smem_stride=raw_stride,
+        kv_sc_off=kv_sc_off,
+        kv_sc_buf_bytes=kv_sc_buf_bytes,
+        kv_sc_stride=kv_sc_stride,
+        kv_rope_off=kv_slice_off,
+        kv_rope_buf_bytes=kv_slice_bytes,
+        kv_rope_stride=PV_BF16_SLICE_STRIDE // 2,
+        kv_bufs=bufs,
+        mbar_off=mbar_off,
+        mbar_bytes=mbar_bytes,
+        reduce_off=reduce_off,
+        reduce_bytes=reduce_bytes,
+        reduce_warp_max_off=reduce_warp_max_off,
+        reduce_warp_sum_off=reduce_warp_sum_off,
+        w_head_sc_off=0,
+        w_head_sc_bytes=0,
+        w_head_sc_stride=0,
+        w_fp8_off=kv_slice_off,
+        w_fp8_buf_bytes=kv_slice_bytes,
+        w_fp8_stride=PV_BF16_SLICE_STRIDE,
+        w_fp8_bufs=1,
+        token_idx_off=token_idx_off,
+        token_idx_buf_bytes=token_idx_buf_bytes,
+        token_idx_bufs=bufs,
+        sm_p_full_off=qp_off,
+        sm_p_full_bytes=qp_bytes,
+        sm_p_full_stride=PV_BF16_QP_STRIDE,
+        w_head_sc2_off=0,
+        w_head_sc2_bytes=0,
+        total_bytes=total_bytes,
+    )
+
+
+def get_pv_bf16_shared_storage_cls(
+    traits: UnifiedMLATraits, *, compact_2cta: bool = False
+):
+    """Typed SharedStorage matching make_pv_bf16_smem_layout."""
+    layout = make_pv_bf16_smem_layout(traits, compact_2cta=compact_2cta)
+
+    class PvBf16SharedStorage:
+        pass
+
+    kv_sc_field = (
+        {
+            "kv_sc": cute.struct.MemRange[
+                cutlass.Uint8,
+                int(layout.kv_sc_buf_bytes * layout.kv_bufs),
+            ]
+        }
+        if layout.kv_sc_buf_bytes > 0
+        else {}
+    )
+    PvBf16SharedStorage.__annotations__ = {
+        "kv_raw": cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Uint8, int(layout.kv_fp8_buf_bytes * layout.kv_bufs)
+            ],
+            128,
+        ],
+        **kv_sc_field,
+        "kv_bf16_slice": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint8, int(layout.w_fp8_buf_bytes)],
+            128,
+        ],
+        "q_or_p": cute.struct.Align[
+            cute.struct.MemRange[cutlass.BFloat16, int(layout.sm_p_full_bytes // 2)],
+            128,
+        ],
+        "reduce": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Float32, int(layout.reduce_bytes // 4)],
+            16,
+        ],
+        "token_idx": cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Int32,
+                int(layout.token_idx_buf_bytes * layout.token_idx_bufs // 4),
+            ],
+            16,
+        ],
+        "mbar": cute.struct.Align[
+            cute.struct.MemRange[cutlass.Uint64, int(layout.mbar_bytes // 8)],
+            16,
+        ],
+    }
+    storage_cls = cute.struct(PvBf16SharedStorage)
+    expected_offsets = {
+        "kv_raw": layout.kv_fp8_off,
+        "kv_bf16_slice": layout.w_fp8_off,
+        "q_or_p": layout.sm_p_full_off,
+        "reduce": layout.reduce_off,
+        "token_idx": layout.token_idx_off,
+        "mbar": layout.mbar_off,
+    }
+    if layout.kv_sc_buf_bytes > 0:
+        expected_offsets["kv_sc"] = layout.kv_sc_off
+    actual_offsets = dict(storage_cls._offsets)
+    if actual_offsets != expected_offsets:
+        raise ValueError(
+            "pv_bf16 SharedStorage offsets diverge from SmemLayout: "
+            f"typed={actual_offsets}, logical={expected_offsets}"
+        )
+    typed_bytes = int(storage_cls.size_in_bytes())
+    if typed_bytes != layout.total_bytes:
+        raise ValueError(
+            "pv_bf16 SharedStorage size diverges from SmemLayout: "
+            f"typed={typed_bytes}, logical={layout.total_bytes}"
+        )
+    return storage_cls
+
+
 # ---------------------------------------------------------------------------
 # Module-level size + stride assertions for BOTH validated models. These run at
 # import time (pure Python) and guard against a layout change blowing the SM120
@@ -747,6 +942,20 @@ def _run_module_asserts() -> None:
     assert 80 * 1024 <= glm_next <= SM120_SMEM_CARVEOUT_BYTES, (
         f"GLM_NEXT smem {glm_next}B outside the expected band"
     )
+    from .traits import make_unified_traits, with_bf16_attention
+
+    for mt, sf in (
+        (ModelType.DSV4, ScaleFormat.UE8M0_BYTE),
+        (ModelType.GLM_NSA, ScaleFormat.ARBITRARY_FP32),
+        (ModelType.GLM_NEXT, ScaleFormat.ARBITRARY_FP32),
+    ):
+        pv_t = with_bf16_attention(make_unified_traits(mt, ComputeMode.BF16, sf))
+        full_l = make_pv_bf16_smem_layout(pv_t, compact_2cta=False)
+        comp_l = make_pv_bf16_smem_layout(pv_t, compact_2cta=True)
+        get_pv_bf16_shared_storage_cls(pv_t, compact_2cta=False)
+        get_pv_bf16_shared_storage_cls(pv_t, compact_2cta=True)
+        assert full_l.total_bytes < SM120_SMEM_CARVEOUT_BYTES
+        assert comp_l.total_bytes <= 50176
 
 
 _run_module_asserts()

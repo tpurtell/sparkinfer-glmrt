@@ -246,13 +246,18 @@ class _Decode:
             )
         self.plan = plan
         self.splits = int(plan.num_splits)
+        self.is_bf16 = precision == "bf16"
         traits = plan.traits
-        if precision == "bf16":
+        if self.is_bf16:
+            from b12x.attention._shared.mla.native_v41_aot import (
+                query_pv_bf16_eff_sms,
+                resolve_pv_bf16_compact_launch_attrs,
+            )
+            from b12x.attention._shared.mla.smem import make_pv_bf16_smem_layout
             from b12x.attention._shared.mla.traits import with_bf16_attention
             traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
             plan = replace(plan, traits=traits, native_dsv4_h8=False, native_dsv4_h16=False,
-                           hpb=16, h_blocks_full=self.heads // 16, rem_heads=self.heads % 16,
-                           vector_q=False)
+                           hpb=16, h_blocks_full=self.heads // 16, rem_heads=self.heads % 16)
             self.plan = plan
         native_h8 = plan.native_dsv4_h8
         if native_h8:
@@ -287,11 +292,40 @@ class _Decode:
             )
             for h_blocks, valid_hpb, offset in grids
         ]
+        self.kernels_compact = []
+        if self.is_bf16:
+            compact_layout = make_pv_bf16_smem_layout(traits, compact_2cta=True)
+            min_blk_c, carve_c = resolve_pv_bf16_compact_launch_attrs(
+                block_threads=int(traits.block_threads),
+                compact_smem_bytes=int(compact_layout.total_bytes),
+                full_smem_bytes=int(layout.total_bytes),
+            )
+            self.block_threads = int(traits.block_threads)
+            self.compact_smem_bytes = int(compact_layout.total_bytes)
+            self.ctas_per_row = max(1, sum(hb for hb, _, _ in grids) * s)
+            self.cache_symbol = "_pv_bf16_dsv4_sms"
+            self._query_eff_sms = query_pv_bf16_eff_sms
+            self.kernels_compact = [
+                UnifiedDecodeKernel(
+                    traits, compact_layout, _SWA_PAGE, int(plan.chunks_per_split), h_blocks=h_blocks,
+                    num_splits=s, num_heads=n, q_head_dim=_HEAD, topk=_SWA_WIDTH,
+                    extra_topk=self.width, q_stride=(n * _HEAD, _HEAD, 1),
+                    swa_indices_stride0=_SWA_WIDTH,
+                    extra_indices_stride0=self.width if self.has_extra else _SWA_WIDTH,
+                    mid_out_stride=(n * s * _HEAD, s * _HEAD, _HEAD, 1), mid_lse_stride=(n * s, s, 1),
+                    has_extra=self.has_extra, pbs_extra=self.page_rows, valid_hpb=valid_hpb,
+                    head_block_offset=offset, per_token_len=True, native_glm_h8=False,
+                    native_dsv4_h8=False, native_dsv4_h16=False,
+                    native_dsv41_fp8=False, vector_q=plan.vector_q,
+                    pv_bf16_2cta=True, min_blocks_per_mp=min_blk_c, preferred_smem_carveout=carve_c,
+                )
+                for h_blocks, valid_hpb, offset in grids
+            ]
         self.merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=s)
         self.key = ("decode", s, int(plan.chunks_per_split), plan.native_dsv4_h8,
                     plan.native_dsv4_h16, plan.vector_q, tuple(grids), self.page_rows)
-        if precision == "bf16":
-            self.key += ("bf16",)
+        if self.is_bf16:
+            self.key += ("bf16", "dual_2cta", min_blk_c)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, swa_cache: cute.Pointer, swa_indices: cute.Pointer,
@@ -314,6 +348,48 @@ class _Decode:
         idx = cute.make_tensor(swa_indices, cute.make_layout((m, _SWA_WIDTH), stride=(_SWA_WIDTH, 1)))
         lens = cute.make_tensor(swa_lengths, cute.make_layout((m,)))
         scale = Float32(float(_HEAD ** -0.5) * LOG2_E)
+        if cutlass.const_expr(self.is_bf16):
+            eff_sms = self._query_eff_sms(
+                self.cache_symbol,
+                block_threads=self.block_threads,
+                compact_smem_bytes=self.compact_smem_bytes,
+            )
+            use_compact = eff_sms > Int32(0) and rows > (eff_sms // Int32(self.ctas_per_row))
+            for kernel in cutlass.range_constexpr(len(self.kernels)):
+                if cutlass.const_expr(self.has_extra):
+                    width = self.width
+                    ext_kv = cute.make_tensor(indexed_cache, cute.make_layout((1,)))
+                    ext_idx = cute.make_tensor(indexed_indices, cute.make_layout((m, width), stride=(width, 1)))
+                    ext_lens = cute.make_tensor(indexed_lengths, cute.make_layout((m,)))
+                    if use_compact:
+                        self.kernels_compact[kernel].call_extra_pertok(
+                            qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
+                            Int64(_SWA_PAGE_BYTES), ext_kv, ext_idx, ext_lens,
+                            Int32(self.num_main_chunks), Int64(self.extra_stride), rows, stream,
+                        )
+                    else:
+                        self.kernels[kernel].call_extra_pertok(
+                            qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
+                            Int64(_SWA_PAGE_BYTES), ext_kv, ext_idx, ext_lens,
+                            Int32(self.num_main_chunks), Int64(self.extra_stride), rows, stream,
+                        )
+                else:
+                    if use_compact:
+                        self.kernels_compact[kernel].call_pertok(
+                            qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
+                            Int64(_SWA_PAGE_BYTES), rows, stream,
+                        )
+                    else:
+                        self.kernels[kernel].call_pertok(
+                            qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
+                            Int64(_SWA_PAGE_BYTES), rows, stream,
+                        )
+            self.merge(
+                partials, partial_lse, lens, cute.make_tensor(attn_sink, cute.make_layout((n,))),
+                cute.make_tensor(out, cute.make_layout((m, n, _HEAD), stride=(n * _HEAD, _HEAD, 1))),
+                stream,
+            )
+            return
         for kernel in cutlass.range_constexpr(len(self.kernels)):
             if cutlass.const_expr(self.has_extra):
                 width = self.width
