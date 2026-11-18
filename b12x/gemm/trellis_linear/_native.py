@@ -129,6 +129,24 @@ def _uses_parallel_k128(g):
             ((7168, 3072, 1), (3072, 7168, 2), (7168, 3584, 1)))
 
 
+def _k6_selective_routes(g):
+    # Only TP2 geometries that won the paired Kimi screen. Keep the existing
+    # route at every other geometry, including the compact vocabulary heads.
+    if (g["bits"] != 6 or g.get("groups", 1) != 1 or g.get("input_dtype") != "bf16"
+            or g["codebook"] not in ("mcg", "mul1")):
+        return "", False
+    shape = (g["input_features"], g["output_features"], g["sharded_side"])
+    gate_up = shape == (7168, 3072, 1)
+    if shape in ((7168, 1536, 1), (7168, 640, 1)) or (
+            g["codebook"] == "mcg" and shape in ((7168, 3072, 1), (7168, 3584, 1))):
+        return "fused_narrow", gate_up
+    if shape == (3072, 7168, 2):
+        return "folded_three", False
+    if shape == (1536, 18432, 1):
+        return "wide_one", False
+    return "", gate_up
+
+
 def decode_rows(g):
     measured = DECODE_ROWS_BY_SHAPE.get((g["bits"], g["output_features"], g["input_features"]))
     if (measured is not None and g.get("groups", 1) == 1 and g["codebook"] == "mcg"
@@ -165,7 +183,8 @@ def decode_route_thresholds(g):
         if ((k, n, g["sharded_side"]) == (4608, 201088, 1) and
                 g["codebook"] == "mcg" and g.get("input_dtype") == "bf16"):
             edges.append(56)
-        if narrow and _K6_NARROW_ROWS < edge:
+        low_route, wide_verify = _k6_selective_routes(g)
+        if (narrow or low_route or wide_verify) and _K6_NARROW_ROWS < edge:
             edges.append(_K6_NARROW_ROWS)
     elif bits == 8 and g["codebook"] != "e4m3":
         narrow = (splits == 1) or (n <= 2048 and splits <= 8) or (splits in (2, 4) and n <= 8192)
@@ -971,6 +990,7 @@ class NativeTrellisLinear:
         self.input_bf16 = g.get("input_dtype", "f16") == "bf16"
         self.decode_rows = decode_rows(g)
         self.parallel_k128 = _uses_parallel_k128(g)
+        self.k6_low_route, self.k6_wide_verify = _k6_selective_routes(g)
         self.compact_head = (self.k == 4608 and self.n == 201088 and self.bits in (6, 8)
                              and self.input_bf16 and g["codebook"] == "mcg"
                              and g["sharded_side"] == 1 and g.get("groups", 1) == 1)
@@ -5634,9 +5654,56 @@ class NativeTrellisLinear:
                 block=(128, 1, 1), stream=stream)
 
     @cute.jit
+    def _launch_k6_wide_one(self, inputs: cute.Tensor, payload: cute.Tensor,
+                            scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                            rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        tiles = Int32(self.n // 128 * self.splits)
+        self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 1, 8).launch(
+            grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+            min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        self.reduce(partial, output, rows).launch(
+            grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+            block=(128, 1, 1), stream=stream)
+
+    @cute.jit
     def _decode_k6(self, inputs: cute.Tensor, payload: cute.Tensor,
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        if cutlass.const_expr(bool(self.k6_low_route) or self.k6_wide_verify):
+            if rows <= Int32(_K6_NARROW_ROWS):
+                if cutlass.const_expr(self.k6_low_route == "fused_narrow"):
+                    self.multiply_k6_opt_narrow(
+                        inputs, payload, scales, partial, output, rows, rotation_id, 1, True, 2
+                    ).launch(grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
+                             block=(64 * self.splits, 1, 1),
+                             min_blocks_per_mp=1 if self.n <= 2560 else 2, stream=stream)
+                elif cutlass.const_expr(self.k6_low_route == "folded_three"):
+                    self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id,
+                                        cta_limit, stream, 1, True, 2, 1, True, 2)
+                elif cutlass.const_expr(self.k6_low_route == "wide_one"):
+                    self._launch_k6_wide_one(inputs, payload, scales, partial, output, rows, rotation_id,
+                                             cta_limit, stream)
+                else:
+                    self._decode_k6_astra(inputs, payload, scales, partial, output, rows, rotation_id,
+                                          cta_limit, stream)
+            elif cutlass.const_expr(self.k6_wide_verify):
+                if rows <= Int32(16):
+                    self._launch_k6_wide_one(inputs, payload, scales, partial, output, rows, rotation_id,
+                                             cta_limit, stream)
+                else:
+                    self._decode_k6_astra(inputs, payload, scales, partial, output, rows, rotation_id,
+                                          cta_limit, stream)
+            else:
+                self._decode_k6_astra(inputs, payload, scales, partial, output, rows, rotation_id,
+                                      cta_limit, stream)
+        else:
+            self._decode_k6_astra(inputs, payload, scales, partial, output, rows, rotation_id,
+                                  cta_limit, stream)
+
+    @cute.jit
+    def _decode_k6_astra(self, inputs: cute.Tensor, payload: cute.Tensor,
+                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(self.decode_rows):
             if cutlass.const_expr(self.parallel_k128):
                 self._launch_parallel_k128(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
