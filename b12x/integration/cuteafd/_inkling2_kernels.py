@@ -93,8 +93,8 @@ class InklingGqaAttention(MimoGqaAttention):
         self.kv_format = kv_format
         if kv_format not in ("bf16", "fp8") or (kv_format == "fp8" and not paged):
             raise ValueError("Inkling FP8 records are global only")
-        self.record_bytes = 2112 if kv_format == "fp8" else 4096
-        self.scale_offset = 2048 if kv_format == "fp8" else 0
+        self.record_bytes = self.record + self.kv_heads * 8 if kv_format == "fp8" else self.record * 2
+        self.scale_offset = self.record if kv_format == "fp8" else 0
         self.extent = int(extent)
         if self.extent <= 0:
             raise ValueError("the relative bias extent must be positive")
@@ -230,7 +230,7 @@ class InklingGqaAttention(MimoGqaAttention):
             lo, hi = cutlass.Uint32(0), cutlass.Uint32(0)
             scale = Float32(1.0)
             if base >= Int64(0):
-                plane = 8 if value else 0
+                plane = self.kv_heads if value else 0
                 lo, hi = ld_global_v2_u32(base + (Int64(plane)+Int64(kv_head))*Int64(128)+Int64(dim))
                 scale = _ld_f32(base+Int64(self.scale_offset)+(Int64(plane)+Int64(kv_head))*Int64(4))
             w0, w1, w2, w3 = _e4m3x8_scaled_bf16(lo, hi, scale)

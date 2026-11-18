@@ -261,3 +261,60 @@ def test_exported_fp8_pack_scatter_zero_and_skipped_slots(tmp_path, rows, dtype)
     ExportedProgram(program, tmp_path, "scatter").launch(k,v,slots,cache,scalars=(rows,))
     torch.cuda.synchronize()
     assert torch.equal(cache, expected)
+
+
+@pytest.mark.parametrize("route", ["decode", "prefill"])
+@pytest.mark.parametrize("kind,kv_format", [("local", "bf16"), ("global", "bf16"), ("global", "fp8")])
+def test_exported_half_heads_match_whole_cache_and_attention(tmp_path, route, kind, kv_format):
+    from dataclasses import replace
+    require_b12x()
+    from b12x.integration.cuteafd import INKLING2_SMALL
+    from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot, record_bytes
+    from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_kv_pack_aot
+
+    torch.manual_seed(803)
+    rows, capacity = 17, 64 if route == "decode" else 4096
+    # Cross a global page boundary and cross the sliding ring's modulus.
+    context = 1152
+    positions = torch.arange(1081, 1081 + rows, device="cuda", dtype=torch.int64)
+    tables = torch.arange(context // 64, device="cuda", dtype=torch.int32)
+    first = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    tiles = torch.arange(0, rows, 1 if route == "decode" else 10, device="cuda", dtype=torch.int32)
+    q = torch.randn(rows, 48, 128, device="cuda").bfloat16()
+    rel = torch.randn(rows, 48, 1024, device="cuda").bfloat16()
+    sinks = torch.rand(rows, 48, device="cuda", dtype=torch.float32)
+    key = torch.randn(context if kind == "global" else 1088 + rows, 8, 128, device="cuda")
+    value = torch.randn_like(key)
+    outputs, caches = [], []
+    for index, (k_start, k_end) in enumerate(((0, 8), (0, 4), (4, 8))):
+        heads = k_end - k_start
+        g = replace(INKLING2_SMALL, heads=heads * 6, kv_heads=heads)
+        q_window = slice(k_start * 6, k_end * 6)
+        k, v = [tensor[:, k_start:k_end].contiguous() for tensor in (key, value)]
+        slots = torch.arange(len(k), device="cuda", dtype=torch.int64)
+        cache = torch.empty((len(k), record_bytes(g, kv_format)), device="cuda", dtype=torch.uint8)
+        pack = compile_inkling2_kv_pack_aot(heads=heads, kv_format=kv_format)
+        ExportedProgram(pack, tmp_path, f"head-pack-{index}").launch(k, v, slots, cache, scalars=(len(k),))
+        local_q, local_rel, local_sinks = [tensor[:, q_window].contiguous() for tensor in (q, rel, sinks)]
+        out = torch.empty_like(local_q)
+        scratch = torch.empty(64 * 32 * g.heads * 516, dtype=torch.uint8, device="cuda")
+        prog = compile_inkling2_attention_aot(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
+        launch = ExportedProgram(prog, tmp_path, f"head-attention-{index}")
+        if kind == "global":
+            scalars = (rows, len(tables), len(tiles)) + ((8,) if route == "decode" else ())
+            launch.launch(local_q, cache, positions, tables, first, first, tiles, local_rel, local_sinks, out, scratch, scalars=scalars)
+        else:
+            # Cache positions before 1081 are read from the ring; live positions
+            # come from the step records, then commit back into that same ring.
+            ring, step = cache[:1088], cache[1088:]
+            launch.launch(local_q, step, ring, positions, positions % 1088, first, tiles, local_rel,
+                          local_sinks, out, scratch, scalars=(rows, len(tiles)))
+        outputs.append(out)
+        caches.append(cache)
+    torch.cuda.synchronize()
+    assert torch.equal(outputs[0], torch.cat(outputs[1:], dim=1))
+    # Records are K and V planes; FP8 appends a scale plane for each.
+    planes = (1024, 1024, 32, 32) if kv_format == "fp8" else (2048, 2048)
+    whole = caches[0].split(planes, dim=1)
+    halves = [cache.split(tuple(width // 2 for width in planes), dim=1) for cache in caches[1:]]
+    assert all(torch.equal(full, torch.cat(pair, dim=1)) for full, pair in zip(whole, zip(*halves)))
