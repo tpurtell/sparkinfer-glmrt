@@ -205,7 +205,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     n_v_chunks = traits.n_v_chunks
     kv_smem_stride = traits.kv_smem_stride
     q_nope_stride = traits.q_nope_stride
-    bufs = _KV_BUF_COUNT
+    bufs = 1 if traits.pv_bf16 else _KV_BUF_COUNT
 
     off = 0
 
@@ -228,7 +228,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     q_fp8_off = off
     q_element_bytes = (
         1
-        if traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3
+        if not traits.pv_bf16 and (traits.fp8_internal or traits.scale_format != ScaleFormat.NVFP4_E4M3)
         else 2
     )
     q_fp8_bytes = hpb * q_nope_stride * q_element_bytes

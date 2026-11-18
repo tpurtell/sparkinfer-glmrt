@@ -71,6 +71,7 @@ from .decode_math import (
     s0_quantize_q_to_smem,
     s0_normalize_dsv41_kv_to_fp8,
     s1_qk_nope_block_scaled,
+    s1_qk_nope_bf16_mg2,
     s6_xv_nope,
     s6_xv_nope_nvfp4_bf16,
     st_shared_f32,
@@ -789,122 +790,6 @@ def preload_q_rope_regs_mg(
         a32,
         a33,
     )
-
-
-@cute.jit
-def s1_qk_nope_bf16_mg2(
-    qk0,
-    qk1,
-    q_nope_bf16_g0_addr: Int32,
-    q_nope_bf16_g1_addr: Int32,
-    kv_fp8_base_addr: Int32,
-    kv_sc_base_addr: Int32,
-    warp_first_cand: Int32,
-    lane: Int32,
-    *,
-    num_scales: cutlass.Constexpr,  # 7
-    quant_tile: cutlass.Constexpr,  # 64
-    q_nope_bf16_stride: cutlass.Constexpr,  # D_NOPE + 8
-    kv_smem_stride: cutlass.Constexpr,  # 448 (BF16 layout)
-    scale_bytes_per_token: cutlass.Constexpr,  # 8
-    n_hg: cutlass.Constexpr = 2,
-    inline_fp32_scale_offset: cutlass.Constexpr = 0,
-):
-    """S1 (BF16): fused QK-NoPE bf16 m16n8k16 MMA with per-thread inline
-    FP8->BF16 K dequant.
-
-    ``inline_fp32_scale_offset`` (nonzero): the per-(token,blk) scale is the
-    record's inline FP32 group scale at that staged-row offset. An arbitrary
-    FP32 scale times E4M3 does not fit BF16, so K enters the MMA as its exact
-    BF16 widening and each scale group's partial is scaled in FP32 afterwards:
-    QK then carries no K rounding at all.
-
-    Byte-for-byte mirror of FlashInfer prefill_kernel.cuh:883-932. The K B
-    operand (b0/b1) and the per-(token,blk) UE8M0 scale depend only on the
-    candidate token, NOT on the head group, so the dequant runs ONCE per K-step
-    and feeds both groups' bf16 MMAs. NUM_SCALES blk x QUANT_TILE/16 ks = 7*4=28
-    bf16 m16n8k16 MMAs per group. NO block-scaled FP8 MMA. When ``n_hg==1`` the
-    group-1 ldmatrix+MMA const_expr-elides (single-group MG, heads==16).
-    """
-    gid = lane >> Int32(2)
-    tid = lane & Int32(3)
-    # ldmatrix A (Q bf16 16x16): row/col -- ldmatrix_load_A_bf16.
-    a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
-    a_col = (lane >> Int32(4)) * Int32(8)
-    # The K row this lane group reads for the dequant B operand.
-    kv_gid_row = warp_first_cand + gid
-    kv_lane_base = (
-        kv_fp8_base_addr + kv_gid_row * Int32(kv_smem_stride) + tid * Int32(2)
-    )
-    kv_sc_row_base = kv_sc_base_addr + kv_gid_row * Int32(scale_bytes_per_token)
-
-    for blk in cutlass.range_constexpr(num_scales):
-        if cutlass.const_expr(inline_fp32_scale_offset):
-            t0 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-            t1 = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-            for ks in cutlass.range_constexpr(quant_tile // 16):
-                ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
-                b0 = e4m3_pair_to_bf16x2_sm120(
-                    ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
-                )
-                b1 = e4m3_pair_to_bf16x2_sm120(
-                    ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
-                )
-                a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
-                a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
-                    _smem_byte(q_nope_bf16_g0_addr, a_byte)
-                )
-                t0[0], t0[1], t0[2], t0[3] = mma_m16n8k16_f32_bf16(
-                    t0[0], t0[1], t0[2], t0[3], a00, a01, a02, a03, b0, b1
-                )
-                if cutlass.const_expr(n_hg == 2):
-                    a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
-                        _smem_byte(q_nope_bf16_g1_addr, a_byte)
-                    )
-                    t1[0], t1[1], t1[2], t1[3] = mma_m16n8k16_f32_bf16(
-                        t1[0], t1[1], t1[2], t1[3], a10, a11, a12, a13, b0, b1
-                    )
-            # Fragment columns are this lane's two candidates.
-            c0 = warp_first_cand + tid * Int32(2)
-            scale_at = kv_fp8_base_addr + Int32(inline_fp32_scale_offset + blk * 4)
-            ks0 = ld_shared_f32(scale_at + c0 * Int32(kv_smem_stride))
-            ks1 = ld_shared_f32(scale_at + (c0 + Int32(1)) * Int32(kv_smem_stride))
-            qk0[0] = qk0[0] + t0[0] * ks0
-            qk0[1] = qk0[1] + t0[1] * ks1
-            qk0[2] = qk0[2] + t0[2] * ks0
-            qk0[3] = qk0[3] + t0[3] * ks1
-            if cutlass.const_expr(n_hg == 2):
-                qk1[0] = qk1[0] + t1[0] * ks0
-                qk1[1] = qk1[1] + t1[1] * ks1
-                qk1[2] = qk1[2] + t1[2] * ks0
-                qk1[3] = qk1[3] + t1[3] * ks1
-        else:
-            # DSV4 UE8M0_BYTE: per-(token,blk) fp32 scale from the K footer scale buf.
-            scale_f = _ue8m0_zext_byte_to_fp32(ld_shared_u8_offset(kv_sc_row_base, blk))
-            for ks in cutlass.range_constexpr(quant_tile // 16):
-                ko = Int32(blk) * Int32(quant_tile) + Int32(ks) * Int32(16)
-                # K dequant B operand: two e4m3 byte-pairs (u16) -> bf16x2 b0/b1.
-                # _ld_u16_zext handles the 2-byte (non-4-aligned) offsets safely.
-                p0 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16)
-                p1 = ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
-                b0, b1 = dequant_kv_e4m3_pair_to_bf16x2(p0, p1, scale_f)
-                # Group 0 A operand + MMA.
-                a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
-                a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
-                    _smem_byte(q_nope_bf16_g0_addr, a_byte)
-                )
-                qk0[0], qk0[1], qk0[2], qk0[3] = mma_m16n8k16_f32_bf16(
-                    qk0[0], qk0[1], qk0[2], qk0[3], a00, a01, a02, a03, b0, b1
-                )
-                # Group 1 A operand + MMA (same b0/b1). Elided when n_hg==1.
-                if cutlass.const_expr(n_hg == 2):
-                    a10, a11, a12, a13 = ldmatrix_m8n8x4_b16(
-                        _smem_byte(q_nope_bf16_g1_addr, a_byte)
-                    )
-                    qk1[0], qk1[1], qk1[2], qk1[3] = mma_m16n8k16_f32_bf16(
-                        qk1[0], qk1[1], qk1[2], qk1[3], a10, a11, a12, a13, b0, b1
-                    )
-    return qk0, qk1
 
 
 @cute.jit
@@ -2231,9 +2116,9 @@ class UnifiedPrefillMGKernel:
                 "records always zero a masked candidate's V)"
             )
         inline_fp32 = int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
-        if bool(traits.pv_bf16) != (
-            inline_fp32 and int(traits.compute_mode) == int(ComputeMode.BF16)
-        ):
+        if ((inline_fp32 and int(traits.compute_mode) == int(ComputeMode.BF16) and not traits.pv_bf16)
+                or (traits.pv_bf16 and (int(traits.compute_mode) != int(ComputeMode.BF16)
+                    or int(traits.scale_format) not in (int(ScaleFormat.ARBITRARY_FP32), int(ScaleFormat.UE8M0_BYTE))))):
             raise ValueError(
                 "inline-FP32-scale MG prefill is FP8 QK/PV or BF16 QK/PV "
                 "(traits.with_bf16_attention); got "
@@ -2543,7 +2428,7 @@ class UnifiedPrefillMGKernel:
         # Inline-FP32-scale FP8 records with BF16 attention: exact K into the
         # BF16 QK MMA with its group scale on the FP32 partial, and V
         # dequantized in registers for the BF16 P.V MMA.
-        glm_bf16 = cutlass.const_expr(t.pv_bf16)
+        glm_bf16 = cutlass.const_expr(t.pv_bf16 and t.scale_format == ScaleFormat.ARBITRARY_FP32)
         dsv41_fp8_pv = cutlass.const_expr(
             t.model_type == ModelType.DSV41 and t.fp8_internal
         )
@@ -3770,36 +3655,66 @@ class UnifiedPrefillMGKernel:
                             valid_hpb=t.hpb,
                         )
                 else:
-                    acc0, acc1 = s6_xv_nope_mg_dsv4(
-                        w_pre0,
-                        w_pre1,
-                        acc0,
-                        acc1,
-                        kv_fp8_b,
-                        kv_sc_b,
-                        w_head_sc_view_all,
-                        w_fp8_addr,
-                        warp_id,
-                        lane,
-                        tid,
-                        index_base_ptr,
-                        split_cand_end - split_cand_start,
-                        n_v_chunks=t.n_v_chunks,
-                        v_chunk=t.quant_tile,
-                        hpb=t.hpb,
-                        bi=t.bi,
-                        kv_smem_stride=L.kv_smem_stride,
-                        w_fp8_stride=t.bi + 16,
-                        w_fp8_group_stride=L.w_fp8_group_bytes,
-                        w_fp8_parity_stride=L.w_fp8_parity_bytes,
-                        n_warps=8,
-                        scale_bytes_per_token=8,
-                        nt_per_warp_xv=t.nt_per_warp_xv,
-                        num_threads=self.math_threads,
-                        barrier_id=3,
-                        n_hg=n_hg,
-                        row_xor=cutlass.const_expr(row_xor),
-                    )
+                    if cutlass.const_expr(t.pv_bf16):
+                        # Masked records are copied from slot zero; clear their V
+                        # before BF16 PV so zero probability cannot propagate NaN.
+                        tile_length = split_cand_end - split_cand_start
+                        for part in cutlass.range_constexpr(
+                            (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                        ):
+                            entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                            if entry < Int32(t.bi):
+                                index = Int32(-1)
+                                if entry < tile_length:
+                                    index = _ld_global_index_i32(index_base_ptr, entry)
+                                if index < Int32(0):
+                                    for chunk in cutlass.range_constexpr(t.d_nope // 16):
+                                        offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                        st_shared_u32(kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset, Uint32(0))
+                        s5_fill_sm_p_full_mg2_nvfp4(
+                            w_pre0, w_pre1, w_fp8_addr, warp_id, lane,
+                            bi=t.bi, hpb=t.hpb, sm_p_stride=L.sm_p_full_stride,
+                            num_threads=self.math_threads, barrier_id=3, n_hg=n_hg,
+                        )
+                        acc0 = s6_xv_nope_nvfp4_bf16(
+                            acc0, w_fp8_addr, kv_fp8_b, warp_id, lane, latent_scale,
+                            n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
+                            kv_smem_stride=L.kv_smem_stride, n_warps=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            sm_p_stride=L.sm_p_full_stride, ue8m0_scales=True,
+                            kv_sc_base_addr=kv_sc_b,
+                        )
+                    else:
+                        acc0, acc1 = s6_xv_nope_mg_dsv4(
+                            w_pre0,
+                            w_pre1,
+                            acc0,
+                            acc1,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            w_head_sc_view_all,
+                            w_fp8_addr,
+                            warp_id,
+                            lane,
+                            tid,
+                            index_base_ptr,
+                            split_cand_end - split_cand_start,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            hpb=t.hpb,
+                            bi=t.bi,
+                            kv_smem_stride=L.kv_smem_stride,
+                            w_fp8_stride=t.bi + 16,
+                            w_fp8_group_stride=L.w_fp8_group_bytes,
+                            w_fp8_parity_stride=L.w_fp8_parity_bytes,
+                            n_warps=8,
+                            scale_bytes_per_token=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                            n_hg=n_hg,
+                            row_xor=cutlass.const_expr(row_xor),
+                        )
                     # XV-RoPE: per-tile section switch mirrors the QK-rope above (the
                     # cute.Tensor cannot be re-bound in a dynamic if). const_expr(not
                     # has_extra) elides the dual arm -> a single MAIN call,

@@ -122,10 +122,10 @@ def _prepared_query(geometry: DSV4Geometry, mode: str, max_rows: int, width: int
 class _Prefill:
     """Single-pass MG route (``mode="extend"``), mirroring run_unified_prefill."""
 
-    def __init__(self, geometry: DSV4Geometry, width: int, page_rows: int):
+    def __init__(self, geometry: DSV4Geometry, width: int, page_rows: int, precision="fp8"):
         from b12x.attention._shared.mla.prefill import _mg_head_partitions
         from b12x.attention._shared.mla.prefill_mg import UnifiedPrefillMGKernel
-        from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg
+        from b12x.attention._shared.mla.smem_mg import make_smem_layout_mg, max_mg_head_groups
         from b12x.attention._shared.mla.traits import ComputeMode, make_unified_traits
 
         self.heads = geometry.heads
@@ -139,12 +139,15 @@ class _Prefill:
             fp8_rope=bool(base.fp8_rope), latent_scale_per_token=bool(base.latent_scale_per_token),
         )
         traits = replace(traits, fp8_internal=False)
+        if precision == "bf16":
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            traits = with_bf16_attention(traits)
         num_main_tiles = (_SWA_WIDTH + _CAND - 1) // _CAND
         num_tiles = num_main_tiles + ((self.width + _CAND - 1) // _CAND if self.has_extra else 0)
         self.page_rows = int(page_rows) if self.has_extra else 1
         self.extra_stride = _indexed_page_bytes(page_rows) if self.has_extra else 0
         self.kernels = []
-        for mg_n_hg, active_heads, head_offset in _mg_head_partitions(self.heads, 16):
+        for mg_n_hg, active_heads, head_offset in _mg_head_partitions(self.heads, 16, max_mg_head_groups(traits)):
             layout = make_smem_layout_mg(traits, int(mg_n_hg))
             heads_per_cta = int(layout.heads_per_cta)
             if active_heads % heads_per_cta == 0:
@@ -165,6 +168,8 @@ class _Prefill:
                 valid_hpb=valid_hpb, pack_hilo_rows=False,
             ))
         self.key = ("prefill", len(self.kernels), num_tiles, self.page_rows)
+        if precision == "bf16":
+            self.key += ("bf16",)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, swa_cache: cute.Pointer, swa_indices: cute.Pointer,
@@ -204,7 +209,7 @@ class _Decode:
     """Split-KV decode + sink merge (``mode="decode"`` on SM120)."""
 
     def __init__(self, geometry: DSV4Geometry, max_rows: int, width: int, page_rows: int,
-                 sm_count: int | None = None):
+                 sm_count: int | None = None, precision="fp8"):
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         from b12x.attention._shared.mla.kernel import (
@@ -242,6 +247,13 @@ class _Decode:
         self.plan = plan
         self.splits = int(plan.num_splits)
         traits = plan.traits
+        if precision == "bf16":
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
+            plan = replace(plan, traits=traits, native_dsv4_h8=False, native_dsv4_h16=False,
+                           hpb=16, h_blocks_full=self.heads // 16, rem_heads=self.heads % 16,
+                           vector_q=False)
+            self.plan = plan
         native_h8 = plan.native_dsv4_h8
         if native_h8:
             traits = replace(traits, nt_per_warp_xv=int(traits.nt_per_warp_xv) * 2,
@@ -278,6 +290,8 @@ class _Decode:
         self.merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=s)
         self.key = ("decode", s, int(plan.chunks_per_split), plan.native_dsv4_h8,
                     plan.native_dsv4_h16, plan.vector_q, tuple(grids), self.page_rows)
+        if precision == "bf16":
+            self.key += ("bf16",)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, swa_cache: cute.Pointer, swa_indices: cute.Pointer,
@@ -325,7 +339,8 @@ class _Decode:
 
 def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = "prefill",
                                 max_rows: int = 1, indexed_width: int = 0,
-                                indexed_page_rows: int = 64, sm_count: int | None = None):
+                                indexed_page_rows: int = 64, sm_count: int | None = None,
+                                precision: str = "fp8"):
     """Compressed sparse MLA with sink; see the module docstring for the ABI.
 
     ``indexed_width`` 0 compiles the window-only program (compress ratio 0
@@ -333,6 +348,8 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
     ``indexed_page_rows=64``; C128 layers ``indexed_page_rows=2`` and a width
     that is a multiple of 64 covering the longest compressed prefix.
     """
+    if precision not in ("bf16", "fp8"):
+        raise ValueError("precision must be 'bf16' or 'fp8'")
     if sm_count is not None and (type(sm_count) is not int or sm_count <= 0):
         raise ValueError("sm_count must be a positive integer")
     width = int(indexed_width)
@@ -340,11 +357,12 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
         raise ValueError("indexed_width must be zero or a positive multiple of 64")
     if width and indexed_page_rows not in (2, 64):
         raise ValueError("indexed_page_rows must be 64 (C4) or 2 (C128)")
+    precision_args = {"precision": "bf16"} if precision == "bf16" else {}
     if route == "prefill":
-        launch = _Prefill(geometry, width, indexed_page_rows)
+        launch = _Prefill(geometry, width, indexed_page_rows, **precision_args)
         splits = 0
     elif route == "decode":
-        launch = _Decode(geometry, int(max_rows), width, indexed_page_rows, sm_count)
+        launch = _Decode(geometry, int(max_rows), width, indexed_page_rows, sm_count, **precision_args)
         splits = launch.splits
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
@@ -367,7 +385,8 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
         key=(n, width, int(indexed_page_rows) if width else 0, launch.key),
         geometry={"heads": n, "route": route, "max_rows": int(max_rows), "indexed_width": width,
                   "indexed_page_rows": int(indexed_page_rows) if width else 0,
-                  "indexed_page_bytes": pb, "num_splits": splits},
+                  "indexed_page_bytes": pb, "num_splits": splits,
+                  **({"attention_precision": "bf16"} if precision == "bf16" else {})},
         scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(
             route=route, heads=n, rows=rows, num_splits=splits)},
         doc=__doc__,
