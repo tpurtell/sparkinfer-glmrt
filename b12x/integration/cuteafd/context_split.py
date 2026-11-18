@@ -479,7 +479,24 @@ class _Partial:
         _, self.splits, chunks = plan_unified_decode_splits(
             topk=width, max_chunks=(width + 63) // 64, num_tokens=max_rows,
             h_blocks=heads // hpb, forced_num_splits=num_splits,
-            sm_count=torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
+            sm_count=(None if num_splits is not None else
+                      torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count))
+        # In the ML4 RoPE three-chunk recipe, at least one split per rank
+        # is typically empty and active splits can fill the next record tile.
+        medium_rope = (precision == "bf16" and not self.v4 and traits.d_rope == 64
+                       and g.qk_head_dim == 128 and chunks == 3)
+        if precision == "bf16":
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            # Same producers as full decode, using this shard's frozen split
+            # length. The local slot indices, split boundaries and merge stay local.
+            ring = medium_rope or (not self.v4 and chunks >= (4 if traits.d_rope else 3))
+            q_stride = traits.d_nope + 8
+            if self.v4:
+                q_stride += traits.d_rope
+            elif ring and traits.d_rope:
+                q_stride -= 192
+            traits = replace(with_bf16_attention(traits), q_nope_stride=q_stride,
+                             packed_bf16_decode=self.v4, glm_record_ring=ring)
         n, s = heads, self.splits
         self.decode = UnifiedDecodeKernel(
             traits, make_smem_layout(traits), self.page_rows, chunks,
@@ -491,8 +508,9 @@ class _Partial:
             has_extra=self.v4, pbs_extra=64 if self.v4 else 1,
             valid_hpb=hpb, head_block_offset=0, per_token_len=True,
             native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
-            native_dsv41_fp8=False, vector_q=not (self.v4 and precision == "bf16"),
-            zero_masked_v=(not self.v4 and precision == "bf16"))
+            native_dsv41_fp8=False, vector_q=True,
+            zero_masked_v=(not self.v4 and precision == "bf16"),
+            skip_empty_context_split=medium_rope)
         self.merge = _PartialMerge(n, s)
 
     def scratch_bytes(self, rows):
