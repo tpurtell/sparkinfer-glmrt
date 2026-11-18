@@ -423,6 +423,37 @@ def aggregate(cells):
     return output
 
 
+def score(input_path, output_path):
+    report = read_json(input_path)
+    if not report["completed"]:
+        raise ValueError("incomplete measurement report")
+    scores = {}
+    for arm in report["metadata"]["sources"]:
+        if arm == "baseline":
+            continue
+        cohorts = defaultdict(lambda: {"timing_cells": 0, "oracle_cells": 0, "errors": [],
+                                       "regressions": [], "ratios": []})
+        for cell in report["cells"]:
+            cohort = cohorts[(cell["family"], cell["params"]["bits"], cell["shipping"])]
+            for rows, result in cell["oracle"][arm].items():
+                cohort["oracle_cells"] += 1
+                if not result["row_invariant"] or result["worse_max_outputs"] or result["worse_rms_outputs"]:
+                    cohort["errors"].append(dict(program=cell["program"], rows=int(rows), **result))
+            for rows, arms in cell["rows"].items():
+                cohort["timing_cells"] += 1
+                result = arms[arm]
+                cohort["ratios"].append(result["baseline_over_arm"])
+                # A noisy/one-sided measurement is a diagnostic, not a hard
+                # gate; preserve the paired range for borderline control runs.
+                if result["paired_max"] < 1.0:
+                    cohort["regressions"].append(dict(program=cell["program"], rows=int(rows), **result))
+        scores[arm] = [dict(family=f, bits=b, shipping=s, speedup_median=statistics.median(c["ratios"]),
+                            speedup_min=min(c["ratios"]), speedup_max=max(c["ratios"]),
+                            **{k: v for k, v in c.items() if k != "ratios"})
+                       for (f, b, s), c in cohorts.items()]
+    write_json(output_path, dict(scores=scores, aggregate=report["aggregate"]))
+
+
 def table(input_path, output_path):
     report = read_json(input_path)
     if not report["completed"]:
@@ -491,7 +522,7 @@ def run(args, catalog, arms, bundles):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=("catalog", "compile", "check", "run", "table"))
+    p.add_argument("command", choices=("catalog", "compile", "check", "run", "table", "score"))
     p.add_argument("--catalog", type=Path)
     p.add_argument("--manifest", type=Path)
     p.add_argument("--bundle", type=Path)
@@ -505,10 +536,10 @@ def main():
     p.add_argument("--dram-gbs", type=float, default=1792.)
     p.add_argument("--only", help="restrict to program names containing this string (pilot only)")
     args = p.parse_args()
-    if args.command == "table":
+    if args.command in ("score", "table"):
         if not args.input or not args.output:
-            p.error("table requires --input and --output")
-        table(args.input, args.output)
+            p.error(f"{args.command} requires --input and --output")
+        (table if args.command == "table" else score)(args.input, args.output)
         return
     if not args.catalog:
         p.error("--catalog is required")
