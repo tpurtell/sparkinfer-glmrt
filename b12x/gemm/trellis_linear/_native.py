@@ -118,6 +118,17 @@ DECODE_ROWS_BY_SHAPE = {
 }
 
 
+_K6_VERIFY_WIDE1 = {(3584, 7168, 1), (7168, 1536, 1)}  # K, N, storage side
+
+
+def _uses_parallel_k128(g):
+    # Standalone Kimi shared projections and the similarly underfilled latent down.
+    return (g.get("groups", 1) == 1 and g["bits"] in (6, 8)
+            and g["codebook"] in ("mcg", "mul1") and g.get("input_dtype") == "bf16"
+            and (g["input_features"], g["output_features"], g["sharded_side"]) in
+            ((7168, 3072, 1), (3072, 7168, 2), (7168, 3584, 1)))
+
+
 def decode_rows(g):
     measured = DECODE_ROWS_BY_SHAPE.get((g["bits"], g["output_features"], g["input_features"]))
     if (measured is not None and g.get("groups", 1) == 1 and g["codebook"] == "mcg"
@@ -148,6 +159,9 @@ def decode_route_thresholds(g):
                 narrow = splits in (2, 4, 8)
         edge = decode_rows(g)
         edges = [edge, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS]
+        if (g["codebook"] == "mcg" and g.get("input_dtype") == "bf16" and
+                (k, n, g["sharded_side"]) in _K6_VERIFY_WIDE1):
+            narrow = True
         if narrow and _K6_NARROW_ROWS < edge:
             edges.append(_K6_NARROW_ROWS)
     elif bits == 8 and g["codebook"] != "e4m3":
@@ -912,6 +926,9 @@ class NativeTrellisLinear:
         self.mul1 = g["codebook"] == "mul1"
         self.input_bf16 = g.get("input_dtype", "f16") == "bf16"
         self.decode_rows = decode_rows(g)
+        self.parallel_k128 = _uses_parallel_k128(g)
+        self.verify_wide1 = (self.input_bf16 and g["codebook"] == "mcg" and
+                             (self.k, self.n, g["sharded_side"]) in _K6_VERIFY_WIDE1)
         # High-rate windows need more live registers than the frozen K2--K4 path.
         self.min_blocks_per_mp = 2 if self.bits >= 5 else self.CTAS_PER_SM
         self.input_units = g["sharded_side"] == 2
@@ -4856,7 +4873,9 @@ class NativeTrellisLinear:
                    rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         r_blocks = Int32(self.n // 512) if cutlass.const_expr(self.n % 512 == 0) else Int32(self.n // 128)
         if rows <= Int32(self.decode_rows):
-            if cutlass.const_expr(self.splits == 1):
+            if cutlass.const_expr(self.parallel_k128):
+                self._launch_parallel_k128(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            elif cutlass.const_expr(self.splits == 1):
                 self._launch_k8_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 4, 1, True, 2)
             elif cutlass.const_expr(self.n <= 2048 and self.splits <= 8):
                 self._launch_k8_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
@@ -4923,6 +4942,27 @@ class NativeTrellisLinear:
             self.reduce_gemini(partial, output, rows).launch(
                 grid=(min(rows * r_blocks, cta_limit), 1, 1), block=(128, 1, 1), stream=stream)
 
+
+    @cute.jit
+    def _launch_parallel_k128(self, inputs: cute.Tensor, payload: cute.Tensor,
+                              scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                              rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        # One N16 tile owns its complete reduction. Four warps per split expose
+        # independent K128 accumulators, rather than issuing 8 K128s in series.
+        # Use the complete MMA fragment even at M1: this is one existing row
+        # bucket and the resulting kernel also handles the verification tail.
+        tiles = Int32(self.n // 16)
+        warps = self.splits * 4
+        if cutlass.const_expr(self.bits == 6):
+            self.multiply_k6_opt_16(inputs, payload, scales, partial, output, rows, rotation_id,
+                                    1, True, 4).launch(grid=(min(tiles, cta_limit), 1, 1),
+                                                       block=(32 * warps, 1, 1),
+                                                       min_blocks_per_mp=1, stream=stream)
+        else:
+            self.multiply_k8_opt_16(inputs, payload, scales, partial, output, rows, rotation_id,
+                                    1, True, 4).launch(grid=(min(tiles, cta_limit), 1, 1),
+                                                       block=(32 * warps, 1, 1),
+                                                       min_blocks_per_mp=1, stream=stream)
 
     def _k6_opt_storage(self, num_f32: int):
         class Storage:
@@ -5393,7 +5433,26 @@ class NativeTrellisLinear:
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(self.decode_rows):
-            if cutlass.const_expr((self.k & (self.k - 1)) != 0 and
+            if cutlass.const_expr(self.parallel_k128):
+                self._launch_parallel_k128(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            elif cutlass.const_expr(self.verify_wide1):
+                if rows > Int32(_K6_NARROW_ROWS):
+                    # The 2-fragment kernel presumes at least 16 live rows.
+                    # One fragment gives M9-16 the wide N tile with safe tails.
+                    tiles = Int32(self.n // 128 * self.splits)
+                    self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 1, 8).launch(
+                        grid=(min(tiles, cta_limit), 1, 1), block=(128, 1, 1),
+                        min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+                    self.reduce(partial, output, rows).launch(
+                        grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+                        block=(128, 1, 1), stream=stream)
+                elif cutlass.const_expr(self.n == 1536):
+                    self.multiply_k6_folded(inputs, payload, scales, partial, output, rows, rotation_id).launch(
+                        grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
+                        block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
+                else:
+                    self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
+            elif cutlass.const_expr((self.k & (self.k - 1)) != 0 and
                                   ((2 < self.splits <= 6 and self.n <= 4096) or
                                    (2 < self.splits <= 8 and self.n <= 1536))):
                 self.multiply_k6_folded(inputs, payload, scales, partial, output, rows, rotation_id).launch(
