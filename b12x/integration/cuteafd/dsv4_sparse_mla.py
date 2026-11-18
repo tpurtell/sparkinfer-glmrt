@@ -167,7 +167,9 @@ class _Prefill:
                 row_xor=self.has_extra and self.page_rows == 2, head_offset=head_offset,
                 valid_hpb=valid_hpb, pack_hilo_rows=False,
             ))
-        self.key = ("prefill", len(self.kernels), num_tiles, self.page_rows, precision)
+        self.key = ("prefill", len(self.kernels), num_tiles, self.page_rows)
+        if precision == "bf16":
+            self.key += ("bf16",)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, swa_cache: cute.Pointer, swa_indices: cute.Pointer,
@@ -287,7 +289,9 @@ class _Decode:
         ]
         self.merge = SparseMLASplitDecodeSinkMergeKernel(static_num_chunks=s)
         self.key = ("decode", s, int(plan.chunks_per_split), plan.native_dsv4_h8,
-                    plan.native_dsv4_h16, plan.vector_q, tuple(grids), self.page_rows, precision)
+                    plan.native_dsv4_h16, plan.vector_q, tuple(grids), self.page_rows)
+        if precision == "bf16":
+            self.key += ("bf16",)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, swa_cache: cute.Pointer, swa_indices: cute.Pointer,
@@ -353,11 +357,12 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
         raise ValueError("indexed_width must be zero or a positive multiple of 64")
     if width and indexed_page_rows not in (2, 64):
         raise ValueError("indexed_page_rows must be 64 (C4) or 2 (C128)")
+    precision_args = {"precision": "bf16"} if precision == "bf16" else {}
     if route == "prefill":
-        launch = _Prefill(geometry, width, indexed_page_rows, precision)
+        launch = _Prefill(geometry, width, indexed_page_rows, **precision_args)
         splits = 0
     elif route == "decode":
-        launch = _Decode(geometry, int(max_rows), width, indexed_page_rows, sm_count, precision)
+        launch = _Decode(geometry, int(max_rows), width, indexed_page_rows, sm_count, **precision_args)
         splits = launch.splits
     else:
         raise ValueError("route must be 'prefill' or 'decode'")
@@ -380,7 +385,8 @@ def compile_dsv4_sparse_mla_aot(geometry: DSV4Geometry = FLASH, *, route: str = 
         key=(n, width, int(indexed_page_rows) if width else 0, launch.key),
         geometry={"heads": n, "route": route, "max_rows": int(max_rows), "indexed_width": width,
                   "indexed_page_rows": int(indexed_page_rows) if width else 0,
-                  "indexed_page_bytes": pb, "num_splits": splits, "attention_precision": precision},
+                  "indexed_page_bytes": pb, "num_splits": splits,
+                  **({"attention_precision": "bf16"} if precision == "bf16" else {})},
         scratch={"scratch": lambda rows: sparse_mla_scratch_bytes(
             route=route, heads=n, rows=rows, num_splits=splits)},
         doc=__doc__,

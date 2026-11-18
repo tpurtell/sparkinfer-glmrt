@@ -28,8 +28,7 @@ def test_bf16_attention_beats_fp8_on_identical_records(family, route):
     if family == "v4":
         raw = torch.randn(context, 512, device="cuda").bfloat16()
         cache = pack_compressed_sparse_mla_kv_cache_reference(raw[:, :448], raw[:, 448:], page_size=256)
-        nope, rope = unpack_compressed_sparse_mla_kv_cache_reference(cache, page_size=256)
-        keys = torch.cat((nope, rope), -1).float()
+        keys, values = unpack_compressed_sparse_mla_kv_cache_reference(cache, page_size=256)
         qdim, topk, scale = 512, 128, 512 ** -.5
         geometry = replace(FLASH, heads=heads)
     else:
@@ -52,7 +51,7 @@ def test_bf16_attention_beats_fp8_on_identical_records(family, route):
     if family == "v4":
         sink = torch.zeros(heads, device="cuda")
         denominator = torch.logsumexp(torch.cat((scores, sink[None, :, None].expand(rows, -1, -1)), -1), -1)
-        expected = torch.bmm(torch.exp(scores - denominator[:, :, None]), k)
+        expected = torch.bmm(torch.exp(scores - denominator[:, :, None]), values[selected.long()])
     else:
         expected = torch.bmm(scores.softmax(-1), k[:, :, :512])
     errors = {}
@@ -64,7 +63,7 @@ def test_bf16_attention_beats_fp8_on_identical_records(family, route):
         output = torch.empty((rows, heads, 512), device="cuda", dtype=torch.bfloat16)
         scratch = torch.empty(program.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
         if family == "v4":
-            program.launch(query, cache, indices, lengths, cache, indices, lengths,
+            program.launch(query, cache, indices, lengths, None, None, None,
                            sink, output, scratch, scalars=(rows,))
         else:
             program.launch(query, cache, indices, lengths, output, scratch,
