@@ -44,7 +44,9 @@ from .decode_math import (
     s1_qk_nope_block_scaled,
     s1_qk_nope_bf16_mg2,
     expand_v4_tile,
-    s6_xv_nope_nvfp4_bf16,
+    snapshot_glm_pv,
+    snapshot_glm_scales,
+    apply_glm_pv,
     stage_decode_q_bf16_vec,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
@@ -548,7 +550,8 @@ class UnifiedDecodeKernel:
             and not self.native_h16
             and int(traits.d_rope) == 0
         )
-        self.vector_decode_bf16 = bool(vector_q and traits.pv_bf16 and traits.scale_format == ScaleFormat.UE8M0_BYTE)
+        self.glm_bf16 = bool(traits.pv_bf16 and traits.scale_format == ScaleFormat.ARBITRARY_FP32)
+        self.vector_decode_bf16 = bool(vector_q and traits.pv_bf16)
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
         # A masked candidate stages record slot 0 (the producer copies row 0
         # for a negative index), and S6 multiplies its zero weight by that
@@ -2262,6 +2265,13 @@ class UnifiedDecodeKernel:
                         if tid == Int32(0):
                             cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
 
+                    elif cutlass.const_expr(self.glm_bf16):
+                        v_codes = snapshot_glm_pv(kv_fp8_b, warp_id, lane, stride=staged_kv_stride)
+                        v_scales = snapshot_glm_scales(kv_fp8_b, warp_id, lane, stride=staged_kv_stride)
+                        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                        if tid == Int32(0):
+                            cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+
                     p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
                     p, wr0, wr1 = s4_online_softmax(
                         qk,
@@ -2304,14 +2314,9 @@ class UnifiedDecodeKernel:
                                 acc_nope, acc_rope, v_fragments, sm_p_full_addr, lane,
                                 sm_p_stride=L.sm_p_full_stride,
                             )
-                        elif cutlass.const_expr(t.pv_bf16 and t.scale_format == ScaleFormat.ARBITRARY_FP32):
-                            acc_nope = s6_xv_nope_nvfp4_bf16(
-                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane, latent_scale,
-                                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
-                                kv_smem_stride=staged_kv_stride, n_warps=8,
-                                nt_per_warp_xv=t.nt_per_warp_xv, sm_p_stride=L.sm_p_full_stride,
-                                inline_fp32_scale_offset=t.d_nope, kv_sc_base_addr=kv_sc_b,
-                            )
+                        elif cutlass.const_expr(self.glm_bf16):
+                            acc_nope = apply_glm_pv(acc_nope, v_codes, v_scales, sm_p_full_addr,
+                                                    lane, pstride=L.sm_p_full_stride)
                         else:
                             acc_nope = s6_pv_dsv41_bf16_smem(
                                 acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane,
@@ -2392,7 +2397,7 @@ class UnifiedDecodeKernel:
                 gsum_frag[0] = global_sum[0]
                 gsum_frag[1] = global_sum[1]
 
-                if cutlass.const_expr(not t.packed_bf16_decode):
+                if cutlass.const_expr(not t.packed_bf16_decode and not self.glm_bf16):
                     cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
                     if tid == Int32(0):
                         cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
@@ -2472,6 +2477,7 @@ class UnifiedDecodeKernel:
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 single_split_partial_bf16=self.single_split_partial_bf16,
+                contiguous_glm_warp=self.glm_bf16,
                 rope_tiles_per_warp=(
                     2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
                 ),

@@ -73,6 +73,7 @@ from b12x._lib.intrinsics import (
     ld_global_nc_v4_u32,
     ld_shared_v2_u32,
     ld_shared_v4_u32,
+    ldmatrix_m16n16x1_trans_b8,
     ld_shared_f32,
     ld_shared_u8_offset,
     ld_shared_u32,
@@ -584,6 +585,50 @@ def stage_decode_q_bf16_vec(q_token: cute.Tensor, q_base: Int32, rope_base: Int3
                     dst = rope_base + (h * Int32(rope_stride) + d - Int32(d_nope)) * Int32(2)
             st_shared_v4_u32(dst, a, b, c, e)
     cute.arch.barrier(barrier_id=2, number_of_threads=threads)
+
+
+@cute.jit
+def snapshot_glm_pv(base: Int32, warp: Int32, lane: Int32, *, stride: cutlass.Constexpr):
+    # One warp owns 64 adjacent output dims (half of a scale group). Permute
+    # the address lanes so trans.b8 delivers the two K pairs of each B fragment.
+    l = lane & Int32(15)
+    r = (l & Int32(1)) | ((l & Int32(12)) >> Int32(1)) | ((l & Int32(2)) << Int32(2))
+    dst = base + r * Int32(stride) + warp * Int32(64)
+    return [ldmatrix_m16n16x1_trans_b8(dst + Int32(ks * 16 * stride + nt * 16))
+            for ks in range(4) for nt in range(4)]
+
+
+@cute.jit
+def snapshot_glm_scales(base: Int32, warp: Int32, lane: Int32, *, stride: cutlass.Constexpr):
+    # Each lane loads just two scales. The four-way tid cohort broadcasts
+    # scales for k=2*tid + {0,1,8,9} during PV, avoiding 4x redundant loads.
+    addr = base + lane * Int32(stride) + Int32(512) + (warp >> Int32(1)) * Int32(4)
+    return ld_shared_f32(addr), ld_shared_f32(addr + Int32(32 * stride))
+
+
+@cute.jit
+def apply_glm_pv(acc, raw, scales, pbuf: Int32, lane: Int32, *, pstride: cutlass.Constexpr):
+    pbase = pbuf + ((lane & Int32(15)) * Int32(pstride) + (lane >> Int32(4)) * Int32(8)) * Int32(2)
+    tmp = [[Float32(0.0) for _ in range(4)] for _ in range(8)]
+    for ks in cutlass.range_constexpr(4):
+        a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(pbase + Int32(ks * 32))
+        src = (lane & Int32(3)) * Int32(2) + Int32((ks % 2) * 16)
+        s0 = cute.arch.shuffle_sync(scales[ks // 2], src)
+        s1 = cute.arch.shuffle_sync(scales[ks // 2], src + Int32(1))
+        s8 = cute.arch.shuffle_sync(scales[ks // 2], src + Int32(8))
+        s9 = cute.arch.shuffle_sync(scales[ks // 2], src + Int32(9))
+        for nt in cutlass.range_constexpr(8):
+            code = raw[ks * 4 + nt // 2][nt % 2]
+            lo, hi = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(code))
+            lo8, hi8 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(code >> Uint32(16)))
+            b0 = pack_f32x2_to_bfloat2(lo * s0, hi * s1)
+            b1 = pack_f32x2_to_bfloat2(lo8 * s8, hi8 * s9)
+            tmp[nt][0], tmp[nt][1], tmp[nt][2], tmp[nt][3] = mma_m16n8k16_f32_bf16(
+                tmp[nt][0], tmp[nt][1], tmp[nt][2], tmp[nt][3], a0, a1, a2, a3, b0, b1)
+    for nt in cutlass.range_constexpr(8):
+        for v in cutlass.range_constexpr(4):
+            acc[nt][v] = acc[nt][v] + tmp[nt][v]
+    return acc
 
 
 @cute.jit
@@ -3196,6 +3241,7 @@ def s7_epilogue(
     coalesced_output: cutlass.Constexpr = False,
     single_split_partial_bf16: cutlass.Constexpr = None,
     natural_lse: cutlass.Constexpr = False,
+    contiguous_glm_warp: cutlass.Constexpr = False,
 ):
     """S7: normalized O + base-2 LSE epilogue. ``epilogue_mode`` (const_expr)
     selects the destination + normalizer convention; the (gid, d0) output-write
@@ -3274,6 +3320,8 @@ def s7_epilogue(
                 + (Int32(nt) * Int32(n_warps) + warp_id) * Int32(8)
                 + tid * Int32(2)
             )
+            if cutlass.const_expr(contiguous_glm_warp):
+                d0 = warp_id * Int32(64) + Int32(at * 8) + tid * Int32(2)
             if cutlass.const_expr(coalesced_output):
                 st_shared_bf16_from_f32(
                     staging_base_addr + (gid * Int32(d_v) + d0) * Int32(2),
