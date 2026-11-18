@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Uint32
+from cutlass import Float32, Int32, Int64, Uint16, Uint32
 
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -516,6 +516,75 @@ def s0_quantize_q_to_smem(
         )
         idx += Int32(num_threads)
     cute.arch.barrier(**bar_kw)
+
+
+@dsl_user_op
+def _scale_e4m3_pair_bf16(code: Uint32, factor: Uint32, *, loc=None, ip=None):
+    return Uint32(llvm.inline_asm(
+        T.i32(), [Uint32(code).ir_value(loc=loc, ip=ip), Uint32(factor).ir_value(loc=loc, ip=ip)],
+        "{ .reg .b16 q; .reg .b32 t; cvt.u16.u32 q,$1; cvt.rn.bf16x2.e4m3x2 t,q; mul.bf16x2 $0,t,$2; }",
+        "=r,r,r", has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
+@cute.jit
+def expand_decode_v_tile(base: Int32, sc_base: Int32, warp: Int32, lane: Int32, *,
+                         d_nope: cutlass.Constexpr, row_stride: cutlass.Constexpr,
+                         inline_fp32: cutlass.Constexpr):
+    """Widen each raw row in place. One warp owns its 8 QK candidates."""
+    for ri in cutlass.range(8, unroll=1):
+        row = warp * Int32(8) + Int32(ri)
+        ptr = base + row * Int32(row_stride)
+        # Read both halves before expanding over the raw record. GLM's
+        # group scales at +512 must also survive until these loads.
+        groups = []
+        for half in cutlass.range_constexpr(2):
+            vec = lane + Int32(half * 32)
+            lo, hi = ld_shared_v2_u32(ptr + vec * Int32(8))
+            if cutlass.const_expr(inline_fp32):
+                scale = ld_shared_f32(ptr + Int32(d_nope) + (vec >> Int32(4)) * Int32(4))
+                a, b = dequant_kv_e4m3_pair_to_bf16x2(Uint16(lo), Uint16(lo >> Uint32(16)), scale)
+                c, d = dequant_kv_e4m3_pair_to_bf16x2(Uint16(hi), Uint16(hi >> Uint32(16)), scale)
+            else:
+                # Match the source path's exponent-bit expansion, including zero.
+                exp = ld_shared_u8_offset(sc_base + row * Int32(8) + (vec >> Int32(3)), 0)
+                sf = (exp << Uint32(7)) | (exp << Uint32(23))
+                a = _scale_e4m3_pair_bf16(lo, sf)
+                b = _scale_e4m3_pair_bf16(lo >> Uint32(16), sf)
+                c = _scale_e4m3_pair_bf16(hi, sf)
+                d = _scale_e4m3_pair_bf16(hi >> Uint32(16), sf)
+            groups.append((a, b, c, d))
+        cute.arch.sync_warp()
+        for half in cutlass.range_constexpr(2):
+            vec = lane + Int32(half * 32)
+            if vec < Int32(d_nope // 8):
+                a, b, c, d = groups[half]
+                st_shared_v4_u32(ptr + (vec ^ (row & Int32(7))) * Int32(16), a, b, c, d)
+
+
+@cute.jit
+def stage_decode_q_bf16_vec(q_token: cute.Tensor, q_base: Int32, rope_base: Int32,
+                            head_base: Int32, tid: Int32, *, d_nope: cutlass.Constexpr,
+                            d_rope: cutlass.Constexpr, hpb: cutlass.Constexpr,
+                            valid_hpb: cutlass.Constexpr, q_stride: cutlass.Constexpr,
+                            rope_stride: cutlass.Constexpr, threads: cutlass.Constexpr):
+    vectors = (d_nope + d_rope) // 8
+    for part in cutlass.range_constexpr((hpb * vectors + threads - 1) // threads):
+        idx = tid + Int32(part * threads)
+        if idx < Int32(hpb * vectors):
+            h = idx // Int32(vectors)
+            d = (idx % Int32(vectors)) * Int32(8)
+            a, b, c, e = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+            if h < Int32(valid_hpb):
+                offset = cute.crd2idx((head_base + h, d), q_token.layout)
+                a, b, c, e = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, offset))
+            dst = q_base + (h * Int32(q_stride) + d) * Int32(2)
+            if cutlass.const_expr(d_rope):
+                if d >= Int32(d_nope):
+                    dst = rope_base + (h * Int32(rope_stride) + d - Int32(d_nope)) * Int32(2)
+            st_shared_v4_u32(dst, a, b, c, e)
+    cute.arch.barrier(barrier_id=2, number_of_threads=threads)
 
 
 @cute.jit

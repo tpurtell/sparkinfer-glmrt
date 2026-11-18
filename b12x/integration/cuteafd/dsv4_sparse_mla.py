@@ -252,7 +252,7 @@ class _Decode:
             traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
             plan = replace(plan, traits=traits, native_dsv4_h8=False, native_dsv4_h16=False,
                            hpb=16, h_blocks_full=self.heads // 16, rem_heads=self.heads % 16,
-                           vector_q=False)
+                           vector_q=True)
             self.plan = plan
         native_h8 = plan.native_dsv4_h8
         if native_h8:

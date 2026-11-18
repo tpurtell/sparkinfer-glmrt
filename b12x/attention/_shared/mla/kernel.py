@@ -43,7 +43,8 @@ from .decode_math import (
     s0_quantize_q_vec,
     s1_qk_nope_block_scaled,
     s1_qk_nope_bf16_mg2,
-    s6_xv_nope_nvfp4_bf16,
+    expand_decode_v_tile,
+    stage_decode_q_bf16_vec,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
     s2_qk_rope_bf16,
@@ -544,6 +545,7 @@ class UnifiedDecodeKernel:
             and not self.native_h16
             and int(traits.d_rope) == 0
         )
+        self.vector_decode_bf16 = bool(vector_q and traits.pv_bf16)
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
         # A masked candidate stages record slot 0 (the producer copies row 0
         # for a negative index), and S6 multiplies its zero weight by that
@@ -1321,6 +1323,8 @@ class UnifiedDecodeKernel:
             staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
+        if cutlass.const_expr(t.pv_bf16):
+            staged_kv_stride = L.kv_smem_stride
         kv_fp8_buf = Int32(t.bi * staged_kv_stride)
         kv_rope_buf = Int32(L.kv_rope_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
@@ -1427,6 +1431,13 @@ class UnifiedDecodeKernel:
                     num_threads=self.math_threads,
                     barrier_id=2,
                     hpb_local=self.vector_q_hpb,
+                )
+        elif cutlass.const_expr(self.vector_decode_bf16):
+            if not is_io:
+                stage_decode_q_bf16_vec(
+                    q_token, q_fp8_addr, q_rope_addr, head_base, tid, d_nope=t.d_nope,
+                    d_rope=t.d_rope, hpb=t.hpb, valid_hpb=self.valid_hpb, q_stride=t.q_nope_stride,
+                    rope_stride=L.q_rope_stride, threads=self.math_threads,
                 )
         elif cutlass.const_expr(self.vector_q_bf16):
             if not is_io:
@@ -1825,7 +1836,7 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            if cutlass.const_expr(self.vector_q or self.vector_q_bf16):
+            if cutlass.const_expr(self.vector_q or self.vector_q_bf16 or self.vector_decode_bf16):
                 pass
             elif cutlass.const_expr(
                 t.pv_bf16 or (t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8)
@@ -2140,7 +2151,15 @@ class UnifiedDecodeKernel:
                             packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
                         )
                 else:
-                    if cutlass.const_expr(t.pv_bf16):
+                    if cutlass.const_expr(t.pv_bf16 and t.scale_format == ScaleFormat.UE8M0_BYTE):
+                        expand_decode_v_tile(kv_fp8_b, kv_sc_b, warp_id, lane, d_nope=t.d_nope,
+                                             row_stride=staged_kv_stride, inline_fp32=False)
+                        cute.arch.sync_warp()
+                        qk = s1_qk_dsv41_bf16_smem(
+                            qk, q_fp8_addr, kv_fp8_b, warp_first_cand, lane, d_nope=t.d_nope,
+                            q_nope_bf16_stride=t.q_nope_stride, kv_bf16_stride=staged_kv_stride,
+                        )
+                    elif cutlass.const_expr(t.pv_bf16):
                         qk, _unused = s1_qk_nope_bf16_mg2(
                             qk, [Float32(0.0)] * 4, q_fp8_addr, q_fp8_addr,
                             kv_fp8_b, kv_sc_b, warp_first_cand, lane,
@@ -2189,6 +2208,13 @@ class UnifiedDecodeKernel:
                             else t.d_rope * 2
                         ),
                     )
+
+                    if cutlass.const_expr(t.pv_bf16 and t.scale_format == ScaleFormat.ARBITRARY_FP32):
+                        # QK (including any inline RoPE) is the last raw reader.
+                        # Each warp owns exactly the 8 rows it is about to widen.
+                        cute.arch.sync_warp()
+                        expand_decode_v_tile(kv_fp8_b, kv_sc_b, warp_id, lane, d_nope=t.d_nope,
+                                             row_stride=staged_kv_stride, inline_fp32=True)
 
                     # Per-chunk section dispatch for the S3 mask: compare the
                     # candidate's offset within its main/extra section.
@@ -2263,24 +2289,11 @@ class UnifiedDecodeKernel:
                             sm_p_stride=L.sm_p_full_stride,
                         )
                         cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                        if cutlass.const_expr(t.pv_bf16):
-                            acc_nope = s6_xv_nope_nvfp4_bf16(
-                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane, latent_scale,
-                                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
-                                kv_smem_stride=staged_kv_stride, n_warps=8,
-                                nt_per_warp_xv=t.nt_per_warp_xv,
-                                sm_p_stride=L.sm_p_full_stride,
-                                inline_fp32_scale_offset=(
-                                    t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
-                                ue8m0_scales=t.scale_format == ScaleFormat.UE8M0_BYTE,
-                                kv_sc_base_addr=kv_sc_b,
-                            )
-                        else:
-                            acc_nope = s6_pv_dsv41_bf16_smem(
-                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane,
-                                n_v_chunks=t.n_v_chunks, bi=t.bi,
-                                sm_p_stride=L.sm_p_full_stride, kv_bf16_stride=staged_kv_stride,
-                            )
+                        acc_nope = s6_pv_dsv41_bf16_smem(
+                            acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane,
+                            n_v_chunks=n_acc_tiles, bi=t.bi,
+                            sm_p_stride=L.sm_p_full_stride, kv_bf16_stride=staged_kv_stride,
+                        )
                     else:
                         s5_fill_sm_p_full(
                             w_pre,

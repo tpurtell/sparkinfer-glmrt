@@ -203,7 +203,8 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     d_rope = traits.d_rope
     num_scales = traits.num_scales
     n_v_chunks = traits.n_v_chunks
-    kv_smem_stride = traits.kv_smem_stride
+    # BF16 split decode widens each row in place, after its last raw read.
+    kv_smem_stride = 2 * traits.d_nope if traits.pv_bf16 else traits.kv_smem_stride
     q_nope_stride = traits.q_nope_stride
     bufs = 1 if traits.pv_bf16 else _KV_BUF_COUNT
 
