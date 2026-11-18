@@ -104,16 +104,15 @@ class W4A16MixedTrellisK2Slab(W4A16MixedTrellisKernel):
         warp = tid >> Int32(5)
         a_row = lane & Int32(7)
         word = lane >> Int32(1)
-        slab = Int32(0)
-        while slab < Int32(gemm.size_k // 256):
-            bank = base + (slab & Int32(1)) * Int32(self.BANK_BYTES)
+        for slab in cutlass.range_constexpr(gemm.size_k // 256):
+            bank = base + Int32((slab & 1) * self.BANK_BYTES)
             # Publish this slab and retire all readers of the other bank
             # before its reuse. Its refill then overlaps this slab's MMAs.
             cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
-            if slab + Int32(1) < Int32(gemm.size_k // 256):
-                self._fetch(base + ((slab + Int32(1)) & Int32(1)) * Int32(self.BANK_BYTES),
-                            b_src, a_src, slab + Int32(1), tid, n16 * 64, policy)
+            if cutlass.const_expr(slab + 1 < gemm.size_k // 256):
+                self._fetch(base + Int32(((slab + 1) & 1) * self.BANK_BYTES),
+                            b_src, a_src, Int32(slab + 1), tid, n16 * 64, policy)
             for kt in cutlass.range_constexpr(4):
                 for kk in cutlass.range_constexpr(2):
                     k16 = Int32(4 * kt + kk) + (warp >> Int32(2)) * Int32(2)
@@ -132,7 +131,6 @@ class W4A16MixedTrellisK2Slab(W4A16MixedTrellisKernel):
                         frag[0, 0], frag[0, 1], frag[1, 0], frag[1, 1] = (
                             packed_dequant_trellis_to_half2x4(win, win >> Uint32(8), 2))
                         gemm._mma_accumulate_m8(acc, jj, a, frag)
-            slab += Int32(1)
         cute.arch.sync_threads()
         gemm._fold_cta_partials_m8(acc, smem_base, tid)
         gemm._store_tile_m8(acc, c_flat, smem_base, tid, output_n_tile, valid, scale)
