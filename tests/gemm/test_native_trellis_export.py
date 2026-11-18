@@ -5,6 +5,7 @@ constant. TRELLIS_EXPORT_DIR retains objects for exact-byte and spill auditing.
 """
 import multiprocessing
 import os
+import platform
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,29 @@ def offline_compiler():
     sms = int(os.environ.get("TRELLIS_EXPORT_SMS", "188"))
     _initialize_worker(0, (12, 0), "trellis-export", "trellis-export", sms,
                        101376, 102400, multiprocessing.Array("i", [0, 0]))
+
+
+def test_standalone_aot_export_has_portable_host_target(tmp_path, monkeypatch):
+    from cutlass.base_dsl.compiler import HostTarget
+    from b12x.integration.cuteafd import exportable_compilation
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+
+    # Restore the shared DSL class afterward for tests with other targets.
+    for name in ("triple", "cpu", "features", "_b12x_aot_host_target"):
+        monkeypatch.setattr(HostTarget, name, getattr(HostTarget, name, None), raising=False)
+    explicit = HostTarget("llvm -mtriple=aarch64-unknown-linux-gnu -mcpu=neoverse-n1")
+    with exportable_compilation():
+        program = compile_trellis_linear_aot(input_features=7168, output_features=6144,
+            bits=6, codebook="mcg", max_rows=16)
+    program.export_to_c(str(tmp_path), "portable", "portable")
+    target = program.compiled.host_target
+    triple, cpu = {
+        "x86_64": ("x86_64-unknown-linux-gnu", "x86-64-v3"),
+        "aarch64": ("aarch64-unknown-linux-gnu", "cortex-x925"),
+    }[platform.machine()]
+    assert (target.triple, target.cpu, target.features) == (triple, cpu, "")
+    assert (explicit.triple, explicit.cpu) == ("aarch64-unknown-linux-gnu", "neoverse-n1")
+    assert (tmp_path / "portable.o").stat().st_size > 0
 
 
 @pytest.mark.parametrize("bits", list(range(1, 9)))
