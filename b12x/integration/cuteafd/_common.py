@@ -37,6 +37,7 @@ import torch
 
 from ._kda_contract import KDAGeometry
 
+from b12x._lib.aot_host import pin_aot_host_target
 from b12x._lib.compiler import KernelCompileSpec, compile as compile_cute
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -718,6 +719,7 @@ class AotProgram:
         return {name: int(fn(int(rows))) for name, fn in self.scratch.items()}
 
     def export_to_c(self, file_path: str, file_name: str, function_prefix: str):
+        pin_aot_host_target()
         return self.compiled.export_to_c(str(file_path), file_name, function_prefix)
 
     def launch(self, *tensors: torch.Tensor, scalars: Sequence[object], stream=None):

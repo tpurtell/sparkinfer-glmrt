@@ -174,6 +174,9 @@ def check_policy_descriptors(sass: str) -> int:
 
 def inspect_kernel(launch, directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
+    from b12x._lib.aot_host import pin_aot_host_target
+
+    pin_aot_host_target()
     launch.compiled.export_to_c(str(directory), "core", "cuteafd_core")
     # CuTe embeds cubins as host data; cuobjdump cannot discover them in core.o.
     path = Path(__file__).resolve().parents[3] / "scripts/qualify/deepseek_v41/inspect-cute-object.py"

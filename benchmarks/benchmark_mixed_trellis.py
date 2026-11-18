@@ -411,6 +411,9 @@ def _kernel_resource_info(launch, max_shared_mem: int) -> dict[str, int | float]
             import tempfile
 
             with tempfile.TemporaryDirectory(prefix="b12x_res_") as tmpdir:
+                from b12x._lib.aot_host import pin_aot_host_target
+
+                pin_aot_host_target()
                 launch.compiled.export_to_c(tmpdir, "core", "cuteafd_core")
                 ru = subprocess.run(
                     ["cuobjdump", "-res-usage", f"{tmpdir}/core.o"],
