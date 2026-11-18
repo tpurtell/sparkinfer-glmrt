@@ -8,6 +8,7 @@ in one CUDA process. Bind a common directory for the harness, AOTs and results.
 from __future__ import annotations
 
 import argparse
+import ast
 from collections import defaultdict
 import concurrent.futures
 import ctypes as C
@@ -51,6 +52,10 @@ INKLING = {"q_gate": (4608, 6144), "kv": (4608, 1024), "wr": (4608, 768),
            "mtp_gate_up": (4608, 18432), "mtp_down": (18432, 4608)}
 
 
+INKLING_DRAFT_ROWS = tuple(range(7, 57, 7))
+INKLING_HEAD = "Inkling compact head"
+
+
 def read_json(path):
     return json.loads(path.read_text())
 
@@ -66,7 +71,7 @@ def sha(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
-def build_catalog(manifest):
+def build_catalog(manifest, inkling_exporter=None):
     source = read_json(manifest)
     programs = {p["name"]: p["geometry"] for p in source["programs"] if p["op"] == "trellis_linear"}
     cells = []
@@ -101,8 +106,27 @@ def build_catalog(manifest):
             add("Inkling (planned)", role, name, geometry=dict(
                 input_features=k, output_features=n, bits=bits, codebook="mcg",
                 sharded_side=1, rotation_count=1, max_rows=4096, input_dtype="bf16"))
+    if inkling_exporter:
+        modules = ast.parse(inkling_exporter.read_text())
+        table = next(ast.literal_eval(node.value) for node in modules.body
+                     if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                     and node.targets[0].id == "INKLING_SHAPES")
+        role, k, n, side = next(shape for shape in table if shape[0] == "inkling_head")
+        if (k, n, side) != (4608, 201088, 1):
+            raise ValueError("unexpected Inkling compact head ABI geometry")
+        # Replace the planned MCG duplicates with the matching integration ABI.
+        cells = [c for c in cells if not c["program"].startswith("planned_inkling_head_")]
+        for bits in (6, 8):
+            for book in ("mcg", "mul1"):
+                name = f"{PREFIX}{role}_{book}" + ("_k8" if bits == 8 else "")
+                add(INKLING_HEAD, role, name, geometry=dict(input_features=k, output_features=n,
+                    bits=bits, codebook=book, sharded_side=side, rotation_count=1,
+                    max_rows=4096, input_dtype="bf16"))
+                # #2474 is an integration candidate, not part of the old manifest.
+                cells[-1]["integration_export"] = True
     assert len({c["program"] for c in cells}) == len(cells)
-    return dict(manifest_sha256=sha(manifest), manifest_fork_revision=source["sparkinfer_revision"], cells=cells)
+    return dict(manifest_sha256=sha(manifest), manifest_fork_revision=source["sparkinfer_revision"], cells=cells,
+                **({"inkling_exporter_sha256": sha(inkling_exporter)} if inkling_exporter else {}))
 
 
 def compile_init():
@@ -259,7 +283,7 @@ def same_bits(a, b):
     return torch.equal(a.view(torch.int32), b.view(torch.int32))
 
 
-def row_sets(entries):
+def row_sets(entries, dense_curve=False):
     # Verify every decode arithmetic switch, first/last row of both production
     # single and multi-tile prefill routes, and the headline row samples.
     edges = {edge for entry in entries for edge in entry["geometry"]["decode_route_thresholds"]}
@@ -269,7 +293,8 @@ def row_sets(entries):
     # K8's split-K shuffle/reduce selector also has an M2/M3 edge not
     # advertised in decode_route_thresholds (it preserves arithmetic).
     extra = {3} if any(e["geometry"]["bits"] == 8 for e in entries) else set()
-    timing = sorted(set(ROWS) | extra | {edge + offset for edge in edges for offset in (0, 1)})
+    samples = set(range(1, 65)) if dense_curve else set(ROWS)
+    timing = sorted(samples | extra | {edge + offset for edge in edges for offset in (0, 1)})
     oracle = sorted(set(timing) | {edge + offset for edge in transitions for offset in (0, 1)} | {257})
     return timing, oracle
 
@@ -346,7 +371,7 @@ def run_cell(cell, arms, bundles, torch, reference_type, decoder, lut, flush, ar
     k, n, bits, book, side, rotations, _, groups, dtype = (params.get(key, 1) for key in GEOMETRY)
     weight_bytes = groups*k*n*bits//8
     entries = [b["artifacts"][name] for b in bundles.values()]
-    timing_rows, oracle_rows = row_sets(entries)
+    timing_rows, oracle_rows = row_sets(entries, cell["family"] == INKLING_HEAD)
     capacity = max(oracle_rows) + 1  # Include a poisoned tail even at the largest launch.
     rng = torch.Generator(device="cuda").manual_seed(seed_for(name))
     dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
@@ -426,6 +451,27 @@ def aggregate(cells):
     return output
 
 
+def inkling_head_aggregate(cells):
+    # One launch per draft step; equal weights across reachable slot counts
+    # (there is no production occupancy histogram in this benchmark).
+    output = []
+    for c in cells:
+        if c["family"] != INKLING_HEAD:
+            continue
+        rows = c["rows"]
+        arms = rows[INKLING_DRAFT_ROWS[0]]
+        sums = {a: sum(rows[m][a]["us"] for m in INKLING_DRAFT_ROWS) for a in arms}
+        blocks = {a: [sum(sample) for sample in zip(*(rows[m][a]["blocks_us"]
+                  for m in INKLING_DRAFT_ROWS), strict=True)] for a in arms}
+        output.append(dict(bits=c["params"]["bits"], codebook=c["params"]["codebook"],
+                           ranked=c["params"]["codebook"] == "mcg", rows=INKLING_DRAFT_ROWS,
+                           total_us=sums, mean_us={a: v/len(INKLING_DRAFT_ROWS) for a, v in sums.items()},
+                           baseline_over_arm_blocks={a: [x/y for x, y in zip(blocks["baseline"], v, strict=True)]
+                                                     for a, v in blocks.items()},
+                           one_read_us=c["one_read_us"]))
+    return output
+
+
 def score(input_path, output_path):
     report = read_json(input_path)
     if not report["completed"]:
@@ -454,7 +500,8 @@ def score(input_path, output_path):
                             speedup_min=min(c["ratios"]), speedup_max=max(c["ratios"]),
                             **{k: v for k, v in c.items() if k != "ratios"})
                        for (f, b, s), c in cohorts.items()]
-    write_json(output_path, dict(scores=scores, aggregate=report["aggregate"]))
+    write_json(output_path, dict(scores=scores, aggregate=report["aggregate"],
+                                 inkling_head_aggregate=report.get("inkling_head_aggregate", [])))
 
 
 def table(input_path, output_path):
@@ -519,6 +566,7 @@ def run(args, catalog, arms, bundles):
         report["aggregate"] = aggregate(report["cells"])
         write_json(args.output, report)
     report["metadata"]["thermal_after"] = thermal_snapshot()
+    report["inkling_head_aggregate"] = inkling_head_aggregate(report["cells"])
     report["completed"] = True
     write_json(args.output, report)
 
@@ -528,6 +576,7 @@ def main():
     p.add_argument("command", choices=("catalog", "compile", "check", "run", "table", "score"))
     p.add_argument("--catalog", type=Path)
     p.add_argument("--manifest", type=Path)
+    p.add_argument("--inkling-exporter", type=Path, help="engine exporter from the Inkling compact-head integration")
     p.add_argument("--bundle", type=Path)
     p.add_argument("--source-sha")
     p.add_argument("--jobs", type=int, default=4)
@@ -547,7 +596,7 @@ def main():
     if not args.catalog:
         p.error("--catalog is required")
     if args.command == "catalog":
-        write_json(args.catalog, build_catalog(args.manifest))
+        write_json(args.catalog, build_catalog(args.manifest, args.inkling_exporter))
         return
     catalog = read_json(args.catalog)
     if args.only:
