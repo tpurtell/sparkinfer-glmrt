@@ -76,11 +76,15 @@ def parse_args(argv=None):
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--cells", type=lambda s: s.split(","),
                    help="decode-aot subset, e.g. glm-h64,v4p-h128")
+    p.add_argument("--confirm-c128-1m", action="store_true",
+                   help="decode-aot: only production V4 C128 at 8192 slots")
     args = p.parse_args(argv)
     if args.mode == "decode-aot":
         if args.format or args.rows or args.timing_rows:
             p.error("decode-aot uses fixed AOT geometries and all live rows 1–64")
         known = {f"{family}-h{heads}" for family, heads in AOT_CELLS}
+        if args.confirm_c128_1m:
+            known = {cell for cell in known if cell.startswith("v4")}
         if args.cells and set(args.cells) - known:
             p.error(f"unknown decode-aot cells: {sorted(set(args.cells) - known)}")
         if min(args.samples, args.replays, args.warmup) < 1 or args.samples < 2:
@@ -88,8 +92,8 @@ def parse_args(argv=None):
         if os.environ.get("B12X_MLA_SM120_NUM_SPLITS"):
             p.error("decode-aot must use the runtime planner, not a split override")
         return args
-    if not args.format or args.cells:
-        p.error("prefill/decode require --format and do not take --cells")
+    if not args.format or args.cells or args.confirm_c128_1m:
+        p.error("prefill/decode require --format and do not take decode-aot options")
     args.rows = args.rows or ints("1,64,2048,2752,4096")
     args.timing_rows = args.timing_rows or ints("64,1536,2048,2752,4096")
     args.scores = args.scores.split(",")
@@ -236,7 +240,7 @@ def run_decode_aot(args):
 
     for family, heads in AOT_CELLS:
         cell = f"{family}-h{heads}"
-        if args.cells and cell not in args.cells:
+        if (args.cells and cell not in args.cells) or (args.confirm_c128_1m and not family.startswith("v4")):
             continue
         g = replace(geometries[family], heads=heads)
         v4 = family.startswith("v4")
@@ -246,6 +250,8 @@ def run_decode_aot(args):
         main_width = 128 if v4 else getattr(g, "sparse_topk", g.index_topk)
         sink = torch.linspace(-1, 1, heads, device=device)
         kinds = (("win", 0, 64), ("c4", g.index_topk, 64), ("c128", 1024, 2)) if v4 else (("sparse", 0, 0),)
+        if args.confirm_c128_1m:
+            kinds = (("c128-1m", 8192, 2),)
         for kind, width, page in kinds:
             seed = aot_cell_seed(args.seed, cell, kind)
             generator = torch.Generator(device=device).manual_seed(seed)

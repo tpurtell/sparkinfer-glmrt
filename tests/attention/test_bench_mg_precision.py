@@ -78,3 +78,10 @@ def test_aot_cell_seeds_do_not_depend_on_selection_or_iteration_order():
     assert forward == {cell: aot_cell_seed(2146, *cell) for cell in reversed(cells)}
     assert len(set(forward.values())) == len(cells)
     assert aot_cell_seed(2147, *cells[0]) != forward[cells[0]]
+
+
+def test_c128_1m_confirmation_only_accepts_v4_cells(tmp_path):
+    argv = ["--mode", "decode-aot", "--confirm-c128-1m", "--output", str(tmp_path / "decode.json")]
+    assert parse_args(argv + ["--cells", "v4p-h128"]).confirm_c128_1m
+    with pytest.raises(SystemExit):
+        parse_args(argv + ["--cells", "glm-h64"])
