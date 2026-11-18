@@ -395,3 +395,40 @@ def test_ragged_mla_gpu_attention_and_merged_lse(heads, context, amplitude, kv_c
         expected = torch.einsum("hts,sd->thd", scores.softmax(-1), records[:, :512])
         metrics(out[offsets[request]:offsets[request + 1]], expected)
         torch.testing.assert_close(lse[offsets[request]:offsets[request + 1]], expected_lse, atol=2e-4, rtol=2e-5)
+
+
+@pytest.mark.parametrize("heads", [48, 96])
+def test_compact_extend_bf16_tier_beats_native_fp8(heads):
+    require_b12x()
+    from b12x.attention._shared.mla.reference import (
+        pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference,
+    )
+    from b12x.integration.cuteafd import kimi_mla
+    torch.manual_seed(2146)
+    rows, tokens = 8, 512
+    g = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache="fp8")
+    raw = torch.randn(tokens, 576, device="cuda").bfloat16()
+    packed = pack_mla_kv_cache_reference(raw[:, :512], raw[:, 512:])
+    cache = packed.reshape(-1, 64, 656)
+    keys = unpack_mla_kv_cache_reference(packed).squeeze(1)
+    q = (torch.randn(rows, heads, 576, device="cuda") * 2.5).bfloat16()
+    table = torch.arange(tokens // 64, device="cuda", dtype=torch.int32).reshape(1, -1)
+    lengths = torch.tensor([tokens], device="cuda", dtype=torch.int32)
+    cu = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    scores = torch.einsum("rhd,kd->rhk", q.float(), keys) * g.softmax_scale
+    causal = torch.arange(tokens, device="cuda")[None, :] <= (
+        tokens - rows + torch.arange(rows, device="cuda"))[:, None]
+    scores = scores.masked_fill(~causal[:, None, :], -torch.inf)
+    expected = scores.softmax(-1) @ keys[:, :512]
+    errors = {}
+    for precision in ("fp8", "bf16"):
+        program = kimi_mla.compile_kimi_dense_mla_aot(g, max_rows=rows, max_context=tokens,
+                                                     mode="extend", precision=precision)
+        out = torch.empty_like(expected, dtype=torch.bfloat16)
+        lse = torch.empty((rows, heads), device="cuda")
+        scratch = torch.empty(max(1, program.scratch_bytes(rows)["scratch"]), device="cuda", dtype=torch.uint8)
+        program.launch(q, cache, table, lengths, cu, out, lse, scratch,
+                       scalars=(rows, 1, tokens//64, program.geometry["num_splits"]))
+        errors[precision] = float((out.float() - expected).square().mean().sqrt() / expected.square().mean().sqrt())
+    print(f"Kimi h{heads} compact extend F32 RMS: {errors}")
+    assert errors["bf16"] < min(.01, errors["fp8"]), errors
