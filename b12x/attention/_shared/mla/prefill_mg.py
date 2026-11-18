@@ -3408,6 +3408,253 @@ class UnifiedPrefillMGKernel:
 
                 if cutlass.const_expr(dsv41_fp8_pv):
                     # QK and PV share the same canonical FP8 tile.
+                    acc0, acc1 = s6_xv_nope_mg_dsv4(
+                        w_pre0,
+                        w_pre1,
+                        acc0,
+                        acc1,
+                        kv_fp8_b,
+                        kv_sc_b,
+                        w_head_sc_view_all,
+                        w_fp8_addr,
+                        warp_id,
+                        lane,
+                        tid,
+                        index_base_ptr,
+                        split_cand_end - split_cand_start,
+                        n_v_chunks=t.n_v_chunks,
+                        v_chunk=t.quant_tile,
+                        hpb=t.hpb,
+                        bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16,
+                        w_fp8_group_stride=L.w_fp8_group_bytes,
+                        w_fp8_parity_stride=L.w_fp8_parity_bytes,
+                        n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        n_hg=n_hg,
+                        row_xor=False,
+                    )
+                elif cutlass.const_expr(is_nvfp4):
+                    # NVFP4 XV-NoPE: BF16 P.V with native E2M1+E4M3 V dequant
+                    # (decode s6_xv_nope scale_format==2 branch). The BF16 P
+                    # tiles are staged into the dead W_FP8 region (per-group
+                    # base + sm_p_full_stride rows), exactly like the DSV4
+                    # XV-RoPE weight staging. No FP8 W quant, no w_head_sc.
+                    s5_fill_sm_p_full_mg2_nvfp4(
+                        w_pre0,
+                        w_pre1,
+                        w_fp8_addr,
+                        warp_id,
+                        lane,
+                        bi=t.bi,
+                        hpb=t.hpb,
+                        sm_p_stride=L.sm_p_full_stride,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        n_hg=n_hg,
+                    )
+                    sm_p_g0 = w_fp8_addr
+                    sm_p_g1 = w_fp8_addr + Int32(L.sm_p_full_stride * t.hpb * 2)
+                    acc0 = s6_xv_nope(
+                        w_pre0,
+                        acc0,
+                        kv_fp8_b,
+                        kv_sc_b,
+                        w_head_sc_g0,
+                        glm_w_fp8_g0,
+                        warp_id,
+                        lane,
+                        tid,
+                        latent_scale,
+                        n_v_chunks=t.n_v_chunks,
+                        v_chunk=t.quant_tile,
+                        hpb=t.hpb,
+                        bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16,
+                        n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        scale_format=t.scale_format,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        sm_p_full_addr=sm_p_g0,
+                        sm_p_stride=L.sm_p_full_stride,
+                        latent_scale_per_token=t.latent_scale_per_token,
+                    )
+                    if cutlass.const_expr(n_hg == 2):
+                        acc1 = s6_xv_nope(
+                            w_pre1,
+                            acc1,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            w_head_sc_g1,
+                            glm_w_fp8_g1,
+                            warp_id,
+                            lane,
+                            tid,
+                            latent_scale,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            hpb=t.hpb,
+                            bi=t.bi,
+                            kv_smem_stride=L.kv_smem_stride,
+                            w_fp8_stride=t.bi + 16,
+                            n_warps=8,
+                            scale_bytes_per_token=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            scale_format=t.scale_format,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                            sm_p_full_addr=sm_p_g1,
+                            sm_p_stride=L.sm_p_full_stride,
+                            latent_scale_per_token=t.latent_scale_per_token,
+                        )
+                elif cutlass.const_expr(glm_bf16):
+                    # BF16 P.V over E4M3 V x inline FP32 group scale. A masked
+                    # candidate stages record slot 0 and is weighted by zero;
+                    # zero its V and scales first (0 x NaN = NaN). S4's barriers
+                    # retired this tile's QK reads, and S5's leading barrier
+                    # orders these stores before S6.
+                    tile_length = split_cand_end - split_cand_start
+                    for part in cutlass.range_constexpr(
+                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                    ):
+                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                        if entry < Int32(t.bi):
+                            index = Int32(-1)
+                            if entry < tile_length:
+                                index = _ld_global_index_i32(index_base_ptr, entry)
+                            if index < Int32(0):
+                                for chunk in cutlass.range_constexpr(_GLM_NOPE_SCALE_BYTES // 16):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                    st_shared_u32(
+                                        kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
+                                        Uint32(0),
+                                    )
+                    s5_fill_sm_p_full_mg2_nvfp4(
+                        w_pre0, w_pre1, w_fp8_addr, warp_id, lane,
+                        bi=t.bi, hpb=t.hpb, sm_p_stride=L.sm_p_full_stride,
+                        num_threads=self.math_threads, barrier_id=3, n_hg=n_hg,
+                    )
+                    acc0 = s6_xv_nope_nvfp4_bf16(
+                        acc0, w_fp8_addr, kv_fp8_b, warp_id, lane, latent_scale,
+                        n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride, n_warps=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        sm_p_stride=L.sm_p_full_stride,
+                        inline_fp32_scale_offset=t.d_nope,
+                    )
+                elif cutlass.const_expr(is_glm):
+                    # GLM XV-NoPE: the per-group decode s6_xv_nope (raw-e4m3 V +
+                    # per-(cand,vc) inline fp32 group scale + 2-pass W HIGH+LOW
+                    # residual). V scales + V B operands come from the SHARED kv_fp8
+                    # smem the IO gathered once per tile, so the two groups still
+                    # share the KV gather (the MG win). v_has_rope=False -> NO S6b
+                    # XV-rope.
+                    #
+                    # w_head_sc ZERO-INIT: the decode s6_xv_nope's per-(vc,head)
+                    # absmax is an atomicMax-on-fp32 that ASSUMES w_head_sc was
+                    # pre-zeroed (decode does it in s5_fill_sm_p_full; the DSV4 MG
+                    # fused s6_xv_nope_mg_dsv4 does it internally). GLM calls the bare
+                    # decode s6 with NO s5/sm_p_full, so the prefill arm MUST zero
+                    # w_head_sc itself -- otherwise the FIRST tile of the FIRST launch
+                    # atomicMaxes against uninitialized smem (catastrophic on cold
+                    # launch) and later tiles never reset it (stale max bias).
+                    i_hs = tid
+                    while i_hs < Int32(n_hg * t.n_v_chunks * self.valid_hpb):
+                        group_span = Int32(t.n_v_chunks * self.valid_hpb)
+                        g_hs = i_hs // group_span
+                        rem_hs = i_hs - g_hs * group_span
+                        vc_hs = rem_hs // Int32(self.valid_hpb)
+                        h_hs = rem_hs - vc_hs * Int32(self.valid_hpb)
+                        slot_hs = (
+                            g_hs * Int32(t.n_v_chunks * t.hpb)
+                            + vc_hs * Int32(t.hpb)
+                            + h_hs
+                        )
+                        w_head_sc_view_all[slot_hs] = Float32(0.0)
+                        i_hs += Int32(self.math_threads)
+                    if cutlass.const_expr(self.zero_masked_v):
+                        # Zero a masked candidate's E4M3 V and inline FP32 group
+                        # scales (staged bytes [0, 528)) before S6 weights them by
+                        # zero, as the UE8M0 S6 does: S4's barriers already retired
+                        # every QK read of this tile, and the barrier below orders
+                        # the stores before S6.
+                        tile_length = split_cand_end - split_cand_start
+                        for part in cutlass.range_constexpr(
+                            (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                        ):
+                            entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                            if entry < Int32(t.bi):
+                                index = Int32(-1)
+                                if entry < tile_length:
+                                    index = _ld_global_index_i32(index_base_ptr, entry)
+                                if index < Int32(0):
+                                    for chunk in cutlass.range_constexpr(_GLM_NOPE_SCALE_BYTES // 16):
+                                        offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                        st_shared_u32(
+                                            kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
+                                            Uint32(0),
+                                        )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    acc0 = s6_xv_nope(
+                        w_pre0,
+                        acc0,
+                        kv_fp8_b,
+                        kv_sc_b,
+                        w_head_sc_g0,
+                        glm_w_fp8_g0,
+                        warp_id,
+                        lane,
+                        tid,
+                        latent_scale,
+                        n_v_chunks=t.n_v_chunks,
+                        v_chunk=t.quant_tile,
+                        hpb=t.hpb,
+                        bi=t.bi,
+                        kv_smem_stride=L.kv_smem_stride,
+                        w_fp8_stride=t.bi + 16,
+                        n_warps=8,
+                        scale_bytes_per_token=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        scale_format=t.scale_format,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        valid_hpb=self.valid_hpb,
+                        pack_hilo_rows=self.pack_hilo_rows,
+                    )
+                    if cutlass.const_expr(n_hg == 2):
+                        acc1 = s6_xv_nope(
+                            w_pre1,
+                            acc1,
+                            kv_fp8_b,
+                            kv_sc_b,
+                            w_head_sc_g1,
+                            glm_w_fp8_g1,
+                            warp_id,
+                            lane,
+                            tid,
+                            latent_scale,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            hpb=t.hpb,
+                            bi=t.bi,
+                            kv_smem_stride=L.kv_smem_stride,
+                            w_fp8_stride=t.bi + 16,
+                            n_warps=8,
+                            scale_bytes_per_token=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            scale_format=t.scale_format,
+                            num_threads=self.math_threads,
+                            barrier_id=3,
+                            valid_hpb=t.hpb,
+                        )
+                else:
                     if cutlass.const_expr(t.pv_bf16):
                         # Masked records are copied from slot zero; clear their V
                         # before BF16 PV so zero probability cannot propagate NaN.
@@ -3437,253 +3684,6 @@ class UnifiedPrefillMGKernel:
                             sm_p_stride=L.sm_p_full_stride, ue8m0_scales=True,
                             kv_sc_base_addr=kv_sc_b,
                         )
-                    else:
-                        acc0, acc1 = s6_xv_nope_mg_dsv4(
-                            w_pre0,
-                            w_pre1,
-                            acc0,
-                            acc1,
-                            kv_fp8_b,
-                            kv_sc_b,
-                            w_head_sc_view_all,
-                            w_fp8_addr,
-                            warp_id,
-                            lane,
-                            tid,
-                            index_base_ptr,
-                            split_cand_end - split_cand_start,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            kv_smem_stride=L.kv_smem_stride,
-                            w_fp8_stride=t.bi + 16,
-                            w_fp8_group_stride=L.w_fp8_group_bytes,
-                            w_fp8_parity_stride=L.w_fp8_parity_bytes,
-                            n_warps=8,
-                            scale_bytes_per_token=8,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                            n_hg=n_hg,
-                            row_xor=False,
-                        )
-                    elif cutlass.const_expr(is_nvfp4):
-                        # NVFP4 XV-NoPE: BF16 P.V with native E2M1+E4M3 V dequant
-                        # (decode s6_xv_nope scale_format==2 branch). The BF16 P
-                        # tiles are staged into the dead W_FP8 region (per-group
-                        # base + sm_p_full_stride rows), exactly like the DSV4
-                        # XV-RoPE weight staging. No FP8 W quant, no w_head_sc.
-                        s5_fill_sm_p_full_mg2_nvfp4(
-                            w_pre0,
-                            w_pre1,
-                            w_fp8_addr,
-                            warp_id,
-                            lane,
-                            bi=t.bi,
-                            hpb=t.hpb,
-                            sm_p_stride=L.sm_p_full_stride,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                            n_hg=n_hg,
-                        )
-                        sm_p_g0 = w_fp8_addr
-                        sm_p_g1 = w_fp8_addr + Int32(L.sm_p_full_stride * t.hpb * 2)
-                        acc0 = s6_xv_nope(
-                            w_pre0,
-                            acc0,
-                            kv_fp8_b,
-                            kv_sc_b,
-                            w_head_sc_g0,
-                            glm_w_fp8_g0,
-                            warp_id,
-                            lane,
-                            tid,
-                            latent_scale,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            kv_smem_stride=L.kv_smem_stride,
-                            w_fp8_stride=t.bi + 16,
-                            n_warps=8,
-                            scale_bytes_per_token=8,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            scale_format=t.scale_format,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                            sm_p_full_addr=sm_p_g0,
-                            sm_p_stride=L.sm_p_full_stride,
-                            latent_scale_per_token=t.latent_scale_per_token,
-                        )
-                        if cutlass.const_expr(n_hg == 2):
-                            acc1 = s6_xv_nope(
-                                w_pre1,
-                                acc1,
-                                kv_fp8_b,
-                                kv_sc_b,
-                                w_head_sc_g1,
-                                glm_w_fp8_g1,
-                                warp_id,
-                                lane,
-                                tid,
-                                latent_scale,
-                                n_v_chunks=t.n_v_chunks,
-                                v_chunk=t.quant_tile,
-                                hpb=t.hpb,
-                                bi=t.bi,
-                                kv_smem_stride=L.kv_smem_stride,
-                                w_fp8_stride=t.bi + 16,
-                                n_warps=8,
-                                scale_bytes_per_token=8,
-                                nt_per_warp_xv=t.nt_per_warp_xv,
-                                scale_format=t.scale_format,
-                                num_threads=self.math_threads,
-                                barrier_id=3,
-                                sm_p_full_addr=sm_p_g1,
-                                sm_p_stride=L.sm_p_full_stride,
-                                latent_scale_per_token=t.latent_scale_per_token,
-                            )
-                    elif cutlass.const_expr(glm_bf16):
-                        # BF16 P.V over E4M3 V x inline FP32 group scale. A masked
-                        # candidate stages record slot 0 and is weighted by zero;
-                        # zero its V and scales first (0 x NaN = NaN). S4's barriers
-                        # retired this tile's QK reads, and S5's leading barrier
-                        # orders these stores before S6.
-                        tile_length = split_cand_end - split_cand_start
-                        for part in cutlass.range_constexpr(
-                            (t.bi * 4 + self.math_threads - 1) // self.math_threads
-                        ):
-                            entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
-                            if entry < Int32(t.bi):
-                                index = Int32(-1)
-                                if entry < tile_length:
-                                    index = _ld_global_index_i32(index_base_ptr, entry)
-                                if index < Int32(0):
-                                    for chunk in cutlass.range_constexpr(_GLM_NOPE_SCALE_BYTES // 16):
-                                        offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
-                                        st_shared_u32(
-                                            kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
-                                            Uint32(0),
-                                        )
-                        s5_fill_sm_p_full_mg2_nvfp4(
-                            w_pre0, w_pre1, w_fp8_addr, warp_id, lane,
-                            bi=t.bi, hpb=t.hpb, sm_p_stride=L.sm_p_full_stride,
-                            num_threads=self.math_threads, barrier_id=3, n_hg=n_hg,
-                        )
-                        acc0 = s6_xv_nope_nvfp4_bf16(
-                            acc0, w_fp8_addr, kv_fp8_b, warp_id, lane, latent_scale,
-                            n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
-                            kv_smem_stride=L.kv_smem_stride, n_warps=8,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            sm_p_stride=L.sm_p_full_stride,
-                            inline_fp32_scale_offset=t.d_nope,
-                        )
-                    elif cutlass.const_expr(is_glm):
-                        # GLM XV-NoPE: the per-group decode s6_xv_nope (raw-e4m3 V +
-                        # per-(cand,vc) inline fp32 group scale + 2-pass W HIGH+LOW
-                        # residual). V scales + V B operands come from the SHARED kv_fp8
-                        # smem the IO gathered once per tile, so the two groups still
-                        # share the KV gather (the MG win). v_has_rope=False -> NO S6b
-                        # XV-rope.
-                        #
-                        # w_head_sc ZERO-INIT: the decode s6_xv_nope's per-(vc,head)
-                        # absmax is an atomicMax-on-fp32 that ASSUMES w_head_sc was
-                        # pre-zeroed (decode does it in s5_fill_sm_p_full; the DSV4 MG
-                        # fused s6_xv_nope_mg_dsv4 does it internally). GLM calls the bare
-                        # decode s6 with NO s5/sm_p_full, so the prefill arm MUST zero
-                        # w_head_sc itself -- otherwise the FIRST tile of the FIRST launch
-                        # atomicMaxes against uninitialized smem (catastrophic on cold
-                        # launch) and later tiles never reset it (stale max bias).
-                        i_hs = tid
-                        while i_hs < Int32(n_hg * t.n_v_chunks * self.valid_hpb):
-                            group_span = Int32(t.n_v_chunks * self.valid_hpb)
-                            g_hs = i_hs // group_span
-                            rem_hs = i_hs - g_hs * group_span
-                            vc_hs = rem_hs // Int32(self.valid_hpb)
-                            h_hs = rem_hs - vc_hs * Int32(self.valid_hpb)
-                            slot_hs = (
-                                g_hs * Int32(t.n_v_chunks * t.hpb)
-                                + vc_hs * Int32(t.hpb)
-                                + h_hs
-                            )
-                            w_head_sc_view_all[slot_hs] = Float32(0.0)
-                            i_hs += Int32(self.math_threads)
-                        if cutlass.const_expr(self.zero_masked_v):
-                            # Zero a masked candidate's E4M3 V and inline FP32 group
-                            # scales (staged bytes [0, 528)) before S6 weights them by
-                            # zero, as the UE8M0 S6 does: S4's barriers already retired
-                            # every QK read of this tile, and the barrier below orders
-                            # the stores before S6.
-                            tile_length = split_cand_end - split_cand_start
-                            for part in cutlass.range_constexpr(
-                                (t.bi * 4 + self.math_threads - 1) // self.math_threads
-                            ):
-                                entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
-                                if entry < Int32(t.bi):
-                                    index = Int32(-1)
-                                    if entry < tile_length:
-                                        index = _ld_global_index_i32(index_base_ptr, entry)
-                                    if index < Int32(0):
-                                        for chunk in cutlass.range_constexpr(_GLM_NOPE_SCALE_BYTES // 16):
-                                            offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
-                                            st_shared_u32(
-                                                kv_fp8_b + entry * Int32(L.kv_smem_stride) + offset,
-                                                Uint32(0),
-                                            )
-                        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                        acc0 = s6_xv_nope(
-                            w_pre0,
-                            acc0,
-                            kv_fp8_b,
-                            kv_sc_b,
-                            w_head_sc_g0,
-                            glm_w_fp8_g0,
-                            warp_id,
-                            lane,
-                            tid,
-                            latent_scale,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            kv_smem_stride=L.kv_smem_stride,
-                            w_fp8_stride=t.bi + 16,
-                            n_warps=8,
-                            scale_bytes_per_token=8,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            scale_format=t.scale_format,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                            valid_hpb=self.valid_hpb,
-                            pack_hilo_rows=self.pack_hilo_rows,
-                        )
-                        if cutlass.const_expr(n_hg == 2):
-                            acc1 = s6_xv_nope(
-                                w_pre1,
-                                acc1,
-                                kv_fp8_b,
-                                kv_sc_b,
-                                w_head_sc_g1,
-                                glm_w_fp8_g1,
-                                warp_id,
-                                lane,
-                                tid,
-                                latent_scale,
-                                n_v_chunks=t.n_v_chunks,
-                                v_chunk=t.quant_tile,
-                                hpb=t.hpb,
-                                bi=t.bi,
-                                kv_smem_stride=L.kv_smem_stride,
-                                w_fp8_stride=t.bi + 16,
-                                n_warps=8,
-                                scale_bytes_per_token=8,
-                                nt_per_warp_xv=t.nt_per_warp_xv,
-                                scale_format=t.scale_format,
-                                num_threads=self.math_threads,
-                                barrier_id=3,
-                                valid_hpb=t.hpb,
-                            )
                     else:
                         acc0, acc1 = s6_xv_nope_mg_dsv4(
                             w_pre0,
