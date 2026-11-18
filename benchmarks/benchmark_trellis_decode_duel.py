@@ -266,7 +266,10 @@ def row_sets(entries):
     transitions = set(edges)
     for entry in entries:
         transitions.add(64 if entry["geometry"]["codebook"] == "e4m3" else 129)
-    timing = sorted(set(ROWS) | {edge + offset for edge in edges for offset in (0, 1)})
+    # K8's split-K shuffle/reduce selector also has an M2/M3 edge not
+    # advertised in decode_route_thresholds (it preserves arithmetic).
+    extra = {3} if any(e["geometry"]["bits"] == 8 for e in entries) else set()
+    timing = sorted(set(ROWS) | extra | {edge + offset for edge in edges for offset in (0, 1)})
     oracle = sorted(set(timing) | {edge + offset for edge in transitions for offset in (0, 1)} | {257})
     return timing, oracle
 
