@@ -22,7 +22,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.base_dsl.compiler import OptLevel
-from cutlass.cutlass_dsl import Int32, Int64, Uint32
+from cutlass.cutlass_dsl import Int32, Int64
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
@@ -30,13 +30,9 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     half2_to_float2_scaled,
     ld_global_nc_v2_u32,
-    ld_shared_i32_relaxed,
-    ld_shared_u32,
     pack_f32x2_to_f16x2,
     shared_ptr_to_u32,
     st_global_v2_u32,
-    st_shared_i32,
-    st_shared_u32,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -57,6 +53,7 @@ from .kernel import (
     _cutlass_element_dtype,
     _fake_m_for_specialization,
     _trellis256_execution_lut,
+    _w4a16_small_m_splitk_enabled,
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
@@ -271,8 +268,6 @@ class W4A16MixedTrellisKernel:
     _token_major_rotation = False
     compact_weights = False
     COMPACT_DESCRIPTOR_ROWS = 7
-    m8_expert_span = 1
-    span_smem_off = 0
 
     descriptor_bits = 9
 
@@ -314,14 +309,6 @@ class W4A16MixedTrellisKernel:
             values = tuple(getattr(moe, attr) for moe in (driver, tier0, tier1))
             if values[1:] != values[:-1]:
                 raise ValueError(f"mixed Trellis kernels disagree on {attr}: {values}")
-        span_values = tuple(
-            int(getattr(moe, "m8_expert_span", 1))
-            for moe in (driver, tier0, tier1)
-        )
-        if span_values[1:] != span_values[:-1]:
-            raise ValueError(
-                f"mixed Trellis kernels disagree on m8_expert_span: {span_values}"
-            )
         for phase in ("fc1", "fc2"):
             gemms = tuple(getattr(moe, phase) for moe in (driver, tier0, tier1))
             geometry = tuple(
@@ -399,28 +386,6 @@ class W4A16MixedTrellisKernel:
             tier0.sqg_xor_cheb_t12_smem_off,
             tier1.sqg_xor_cheb_t12_smem_off,
         )
-        self.m8_expert_span = int(getattr(driver, "m8_expert_span", 1))
-        self.span_smem_off = 0
-        if self.m8_expert_span > 1:
-            if (
-                self.compact_weights
-                or self.paired_boundary is not None
-                or driver.direct_topk_routes
-                or driver.fused_input_rotation
-                or int(driver.max_m_blocks) > 65535
-                or int(driver.fc2.schedule_route_block_factor) != 1
-            ):
-                raise ValueError(
-                    "m8_expert_span requires non-compact packed-route whole-tile "
-                    "mixed Trellis with ungrouped FC2 and <=65535 route blocks"
-                )
-            self.span_smem_off = ((self.shared_words * 4 + 15) // 16) * 16
-            if 4 * int(driver.max_m_blocks) > self.span_smem_off:
-                raise ValueError(
-                    "m8_expert_span route-block staging exceeds pre-span shared scratch"
-                )
-            span_bytes = ((4 * (1 + int(driver.max_m_blocks)) + 15) // 16) * 16
-            self.shared_words = (self.span_smem_off + span_bytes) // 4
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
@@ -436,118 +401,7 @@ class W4A16MixedTrellisKernel:
             self.shared_words,
             self.paired_boundary,
             self.token_major_rotation,
-        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)) + (("compact_weights_v2",) if self.compact_weights else ()) + ((("m8_expert_span", self.m8_expert_span, self.span_smem_off),) if self.m8_expert_span > 1 else ())
-
-    @cute.jit
-    def _build_m8_expert_spans(
-        self,
-        block_expert_ids: cute.Tensor,
-        packed_route_count: cute.Tensor,
-        total_experts: Int32,
-        smem_base: Int32,
-        tid: Int32,
-    ):
-        raw_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
-            self.driver.moe_block_size
-        )
-        if raw_blocks < Int32(0):
-            raw_blocks = Int32(0)
-        if raw_blocks > Int32(self.driver.max_m_blocks):
-            raw_blocks = Int32(self.driver.max_m_blocks)
-        tmp_off = smem_base
-        out_off = smem_base + Int32(self.span_smem_off + 4)
-        idx = tid
-        while idx < raw_blocks:
-            e = block_expert_ids[idx].to(Int32)
-            if e < Int32(0) or e >= total_experts:
-                e = Int32(-1)
-            st_shared_i32(tmp_off + idx * Int32(4), e)
-            idx += Int32(self.cta_threads)
-        cute.arch.sync_threads()
-
-        if tid < Int32(32):
-            lane = tid
-            base = Int32(0)
-            out_count = Int32(0)
-            prev_expert = Int32(-2)
-            prev_run_len = Int32(0)
-            while base < raw_blocks:
-                cur = base + lane
-                my_e = Int32(-3) - lane
-                if cur < raw_blocks:
-                    my_e = ld_shared_i32_relaxed(tmp_off + cur * Int32(4))
-                left_e = cute.arch.shuffle_sync_up(
-                    my_e, offset=1, mask_and_clamp=0
-                )
-                seg_start = Int32(0)
-                if lane > Int32(0) and my_e != left_e:
-                    seg_start = lane
-                for shift in cutlass.range_constexpr(5):
-                    offset = 1 << shift
-                    cand = cute.arch.shuffle_sync_up(
-                        seg_start, offset=offset, mask_and_clamp=0
-                    )
-                    if lane >= Int32(offset) and cand > seg_start:
-                        seg_start = cand
-                run_pos = lane - seg_start
-                if seg_start == Int32(0) and my_e == prev_expert:
-                    run_pos = prev_run_len + lane
-                is_head = Int32(0)
-                if cutlass.const_expr(
-                    (self.m8_expert_span & (self.m8_expert_span - 1)) == 0
-                ):
-                    on_boundary = (
-                        run_pos & Int32(self.m8_expert_span - 1)
-                    ) == Int32(0)
-                else:
-                    on_boundary = (
-                        run_pos % Int32(self.m8_expert_span)
-                    ) == Int32(0)
-                if cur < raw_blocks and my_e >= Int32(0) and on_boundary:
-                    is_head = Int32(1)
-                prefix = is_head
-                for shift in cutlass.range_constexpr(5):
-                    offset = 1 << shift
-                    partial_sum = cute.arch.shuffle_sync_up(
-                        prefix, offset=offset, mask_and_clamp=0
-                    )
-                    if lane >= Int32(offset):
-                        prefix = prefix + partial_sum
-                if is_head != Int32(0):
-                    span_len = Int32(1)
-                    cont = Int32(1)
-                    for step in cutlass.range_constexpr(1, self.m8_expert_span):
-                        nxt = cur + Int32(step)
-                        if cont != Int32(0) and nxt < raw_blocks:
-                            nxt_e = ld_shared_i32_relaxed(
-                                tmp_off + nxt * Int32(4)
-                            )
-                            if nxt_e == my_e:
-                                span_len = span_len + Int32(1)
-                            else:
-                                cont = Int32(0)
-                        else:
-                            cont = Int32(0)
-                    pos = out_count + prefix - Int32(1)
-                    entry = (
-                        (Uint32(my_e) << Uint32(20))
-                        | (Uint32(span_len) << Uint32(16))
-                        | Uint32(cur)
-                    )
-                    st_shared_u32(out_off + pos * Int32(4), entry)
-                out_count = out_count + cute.arch.shuffle_sync(
-                    prefix, Int32(31)
-                )
-                prev_expert = cute.arch.shuffle_sync(my_e, Int32(31))
-                prev_run_len = cute.arch.shuffle_sync(
-                    run_pos + Int32(1), Int32(31)
-                )
-                base += Int32(32)
-            if lane == Int32(0):
-                st_shared_i32(
-                    smem_base + Int32(self.span_smem_off), out_count
-                )
-        cute.arch.sync_threads()
+        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)) + (("compact_weights_v2",) if self.compact_weights else ())
 
     @cute.jit
     def _dispatch_tier_gemm(
@@ -656,18 +510,7 @@ class W4A16MixedTrellisKernel:
         reduce_slice_idx: Int32,
         lock_slot: Int32,
     ):
-        first_route_block = route_block_idx
-        span_len = Int32(1)
-        if cutlass.const_expr(self.m8_expert_span > 1):
-            span_entry = ld_shared_u32(
-                smem_base
-                + Int32(self.span_smem_off + 4)
-                + route_block_idx * Int32(4)
-            )
-            first_route_block = Int32(span_entry & Uint32(0xFFFF))
-            span_len = Int32((span_entry >> Uint32(16)) & Uint32(0xF))
-            combined_expert = Int32(span_entry >> Uint32(20))
-        elif cutlass.const_expr(self.driver.direct_topk_routes):
+        if cutlass.const_expr(self.driver.direct_topk_routes):
             combined_expert = packed_route_indices[route_block_idx].to(Int32)
         else:
             metadata_block_idx = route_block_idx
@@ -759,61 +602,34 @@ class W4A16MixedTrellisKernel:
                         gemm = self.tier0.fc1
                     else:
                         gemm = self.tier0.fc2
-                    if cutlass.const_expr(self.m8_expert_span > 1):
-                        gemm._run_tile_m8_span(
-                            a_flat,
-                            a_alt_flat,
-                            t0_b_flat,
-                            c_flat,
-                            t0_scales_flat,
-                            t0_global_scale,
-                            packed_route_indices,
-                            topk_weights,
-                            c_tmp,
-                            locks,
-                            trellis_lut_addr,
-                            smem_base,
-                            tid,
-                            first_route_block,
-                            span_len,
-                            local_expert,
-                            output_n_tile,
-                            reduce_k_tile,
-                            reduce_tile_count,
-                            reduce_slice_count,
-                            reduce_slice_idx,
-                            lock_slot,
-                            active_size_m,
-                        )
-                    else:
-                        self._dispatch_bound(
-                            is_fc1,
-                            combined_expert,
-                            gemm,
-                            compact_weight,
-                            a_flat,
-                            a_alt_flat,
-                            t0_b_flat,
-                            c_flat,
-                            t0_scales_flat,
-                            t0_global_scale,
-                            packed_route_indices,
-                            topk_weights,
-                            c_tmp,
-                            locks,
-                            trellis_lut_addr,
-                            smem_base,
-                            tid,
-                            route_block_idx,
-                            local_expert,
-                            output_n_tile,
-                            reduce_k_tile,
-                            reduce_tile_count,
-                            reduce_slice_count,
-                            reduce_slice_idx,
-                            lock_slot,
-                            active_size_m,
-                        )
+                    self._dispatch_bound(
+                        is_fc1,
+                        combined_expert,
+                        gemm,
+                        compact_weight,
+                        a_flat,
+                        a_alt_flat,
+                        t0_b_flat,
+                        c_flat,
+                        t0_scales_flat,
+                        t0_global_scale,
+                        packed_route_indices,
+                        topk_weights,
+                        c_tmp,
+                        locks,
+                        trellis_lut_addr,
+                        smem_base,
+                        tid,
+                        route_block_idx,
+                        local_expert,
+                        output_n_tile,
+                        reduce_k_tile,
+                        reduce_tile_count,
+                        reduce_slice_count,
+                        reduce_slice_idx,
+                        lock_slot,
+                        active_size_m,
+                    )
                 if cutlass.const_expr(is_fc1):
                     tier1_in_bounds = local_expert < tier1_gate_experts
                     if output_n_tile >= fc1_half_tiles:
@@ -825,61 +641,34 @@ class W4A16MixedTrellisKernel:
                         gemm = self.tier1.fc1
                     else:
                         gemm = self.tier1.fc2
-                    if cutlass.const_expr(self.m8_expert_span > 1):
-                        gemm._run_tile_m8_span(
-                            a_flat,
-                            a_alt_flat,
-                            t1_b_flat,
-                            c_flat,
-                            t1_scales_flat,
-                            t1_global_scale,
-                            packed_route_indices,
-                            topk_weights,
-                            c_tmp,
-                            locks,
-                            trellis_lut_addr,
-                            smem_base,
-                            tid,
-                            first_route_block,
-                            span_len,
-                            local_expert,
-                            output_n_tile,
-                            reduce_k_tile,
-                            reduce_tile_count,
-                            reduce_slice_count,
-                            reduce_slice_idx,
-                            lock_slot,
-                            active_size_m,
-                        )
-                    else:
-                        self._dispatch_bound(
-                            is_fc1,
-                            combined_expert,
-                            gemm,
-                            compact_weight,
-                            a_flat,
-                            a_alt_flat,
-                            t1_b_flat,
-                            c_flat,
-                            t1_scales_flat,
-                            t1_global_scale,
-                            packed_route_indices,
-                            topk_weights,
-                            c_tmp,
-                            locks,
-                            trellis_lut_addr,
-                            smem_base,
-                            tid,
-                            route_block_idx,
-                            local_expert,
-                            output_n_tile,
-                            reduce_k_tile,
-                            reduce_tile_count,
-                            reduce_slice_count,
-                            reduce_slice_idx,
-                            lock_slot,
-                            active_size_m,
-                        )
+                    self._dispatch_bound(
+                        is_fc1,
+                        combined_expert,
+                        gemm,
+                        compact_weight,
+                        a_flat,
+                        a_alt_flat,
+                        t1_b_flat,
+                        c_flat,
+                        t1_scales_flat,
+                        t1_global_scale,
+                        packed_route_indices,
+                        topk_weights,
+                        c_tmp,
+                        locks,
+                        trellis_lut_addr,
+                        smem_base,
+                        tid,
+                        route_block_idx,
+                        local_expert,
+                        output_n_tile,
+                        reduce_k_tile,
+                        reduce_tile_count,
+                        reduce_slice_count,
+                        reduce_slice_idx,
+                        lock_slot,
+                        active_size_m,
+                    )
 
     @cute.jit
     def _prefetch_tier_tile(
@@ -890,7 +679,6 @@ class W4A16MixedTrellisKernel:
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         descriptor_map: cute.Tensor,
-        smem_base: Int32,
         tid: Int32,
         tier0_num_experts: Int32,
         tier1_num_experts: Int32,
@@ -906,26 +694,16 @@ class W4A16MixedTrellisKernel:
         """L2 weight schedule: resolve a whole tile's expert exactly as
         _emit_tier_tile does (packed routes, disjoint ownership) and prefetch
         its first weight K tiles with the owning tier's GEMM geometry."""
-        first_route_block = route_block_idx
-        if cutlass.const_expr(self.m8_expert_span > 1):
-            span_entry = ld_shared_u32(
-                smem_base
-                + Int32(self.span_smem_off + 4)
-                + route_block_idx * Int32(4)
-            )
-            first_route_block = Int32(span_entry & Uint32(0xFFFF))
-            combined_expert = Int32(span_entry >> Uint32(20))
-        else:
-            metadata_block_idx = route_block_idx
-            if cutlass.const_expr(not is_fc1):
-                metadata_block_idx = route_block_idx // Int32(
-                    self.driver.moe_block_size
-                    // (
-                        self.driver.fc2.moe_block_size
-                        * self.driver.fc2.schedule_route_block_factor
-                    )
+        metadata_block_idx = route_block_idx
+        if cutlass.const_expr(not is_fc1):
+            metadata_block_idx = route_block_idx // Int32(
+                self.driver.moe_block_size
+                // (
+                    self.driver.fc2.moe_block_size
+                    * self.driver.fc2.schedule_route_block_factor
                 )
-            combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
+            )
+        combined_expert = block_expert_ids[metadata_block_idx].to(Int32)
         total_experts = tier0_num_experts + tier1_num_experts
         descriptor_row = Int32(2)
         if cutlass.const_expr(is_fc1):
@@ -955,23 +733,23 @@ class W4A16MixedTrellisKernel:
                     if cutlass.const_expr(is_fc1):
                         self.tier0.fc1._prefetch_tile_b_l2(
                             t0_b_flat, packed_route_indices, tid,
-                            first_route_block, local_expert, output_n_tile,
+                            route_block_idx, local_expert, output_n_tile,
                         )
                     else:
                         self.tier0.fc2._prefetch_tile_b_l2(
                             t0_b_flat, packed_route_indices, tid,
-                            first_route_block, local_expert, output_n_tile,
+                            route_block_idx, local_expert, output_n_tile,
                         )
                 if tier == Int32(1) and tier1_in_bounds:
                     if cutlass.const_expr(is_fc1):
                         self.tier1.fc1._prefetch_tile_b_l2(
                             t1_b_flat, packed_route_indices, tid,
-                            first_route_block, local_expert, output_n_tile,
+                            route_block_idx, local_expert, output_n_tile,
                         )
                     else:
                         self.tier1.fc2._prefetch_tile_b_l2(
                             t1_b_flat, packed_route_indices, tid,
-                            first_route_block, local_expert, output_n_tile,
+                            route_block_idx, local_expert, output_n_tile,
                         )
 
     @cute.jit
@@ -1562,15 +1340,6 @@ class W4A16MixedTrellisKernel:
 
         storage = smem.allocate(Storage)
         smem_base = shared_ptr_to_u32(storage.words.data_ptr())
-        total_experts = tier0_num_experts + tier1_num_experts
-        if cutlass.const_expr(self.m8_expert_span > 1):
-            self._build_m8_expert_spans(
-                block_expert_ids,
-                packed_route_count,
-                total_experts,
-                smem_base,
-                tid,
-            )
         trellis_lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
         phase_lut_addr = trellis_lut_addr
         if cutlass.const_expr(self.driver.sqg_xor_cheb_t12_smem):
@@ -1665,7 +1434,6 @@ class W4A16MixedTrellisKernel:
                 packed_route_indices,
                 block_expert_ids,
                 descriptor_map,
-                smem_base,
                 tid,
                 tier0_num_experts,
                 tier1_num_experts,
@@ -1685,7 +1453,6 @@ class W4A16MixedTrellisKernel:
                 packed_route_indices,
                 block_expert_ids,
                 descriptor_map,
-                smem_base,
                 tid,
                 tier0_num_experts,
                 tier1_num_experts,
@@ -1696,6 +1463,7 @@ class W4A16MixedTrellisKernel:
                 tier0_up_experts,
                 tier1_up_experts,
             )
+        total_experts = tier0_num_experts + tier1_num_experts
         if cutlass.const_expr(self.token_major_rotation):
             if active_m >= Int32(_TOKEN_MAJOR_ROTATION_MIN_ROWS):
                 self._run_input_rotation_token_major(
@@ -1773,9 +1541,6 @@ class W4A16MixedTrellisKernel:
             input_rotated=self.token_major_rotation,
             fc1_prefetch_tile=fc1_prefetch,
             fc2_prefetch_tile=fc2_prefetch,
-            span_count_smem_off=(
-                self.span_smem_off if self.m8_expert_span > 1 else None
-            ),
         )
 
 
@@ -2763,7 +2528,7 @@ def compile_mixed_trellis(
     workspace_sms: int | None = None,
     ws_prerotate: bool | None = None,
     row_addresses: bool = False,
-    m8_expert_span: int | None = None,
+    _kimi_tp6_override: bool | None = None,
 ) -> MixedTrellisCompileResult:
     if row_addresses and not 0 < int(size_m) <= 8192:
         raise ValueError("row-address WS capacity must be in 1..8192")
@@ -2829,29 +2594,6 @@ def compile_mixed_trellis(
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
     descriptor_bits = _descriptor_bits(route_num_experts)
-    if m8_expert_span is None:
-        span_bytes = ((4 * (1 + int(max_m_blocks)) + 15) // 16) * 16
-        use_m8_span4 = (
-            not warp_specialized
-            and not direct_topk_routes
-            and paired_boundary is None
-            and not compact_weights
-            and not fused_input_rotation
-            and int(moe_block_size) == 8
-            and int(size_m) > 1
-            and int(top_k) == 16
-            and (tier0_bits, tier1_bits) == (2, 3)
-            and activation == "situ"
-            and full_rotation_output_dtype == "bf16"
-            and (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n)
-            == (64, 256, 64, 256)
-            and int(max_m_blocks) <= 65535
-            and 4 * int(max_m_blocks) <= 43520
-            and 43520 + span_bytes <= int(max_shared_mem)
-        )
-        resolved_m8_expert_span = 4 if use_m8_span4 else 1
-    else:
-        resolved_m8_expert_span = int(m8_expert_span)
     def make_kernel(
         num_experts: int,
         bits: int,
@@ -2891,7 +2633,6 @@ def compile_mixed_trellis(
             schedule_whole_tiles=True,
             fused_input_rotation=fused_input_rotation and not warp_specialized,
             activation_output_a8=activations == "a8",
-            m8_expert_span=resolved_m8_expert_span,
             **({} if schedule is None else schedule.kernel_options()),
         )
 
@@ -2919,6 +2660,49 @@ def compile_mixed_trellis(
                 compact_weights=compact_weights,
                 prerotate=ws_prerotate,
                 row_addresses=row_addresses,
+            )
+        use_kimi_tp6 = (
+            _kimi_tp6_override
+            if _kimi_tp6_override is not None
+            else (
+                (hidden_size, intermediate_size, top_k, route_num_experts)
+                == (3584, 512, 16, 896)
+                and str(activation).strip().lower() == "situ"
+                and swiglu_limit is None
+                and (tier0_bits, tier1_bits) == (2, 3)
+                and trellis_codebook == "mcg"
+                and rotation_input_dtype == "bf16"
+                and full_rotation_output_dtype == "bf16"
+                and int(size_m) in (1, 80)
+                and int(moe_block_size) == 8
+                and not grouped_m8_fc2
+                and force_blocks_per_sm in (None, 1)
+                and not direct_topk_routes
+                and not broadcast_suh
+                and not compact_weights
+                and paired_boundary is None
+                and not token_major_rotation
+                and not fused_input_rotation
+                and activations == "a16"
+                and input_format == "bf16"
+                and not row_addresses
+                and (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n)
+                == (64, 256, 64, 256)
+                and schedule == MixedTrellisDecodeSchedule(l2_evict_first_b=True)
+                and not _w4a16_small_m_splitk_enabled()
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(torch.cuda.current_device())
+                == (12, 1)
+            )
+        )
+        if use_kimi_tp6:
+            from .mixed_trellis_kimi import W4A16MixedTrellisKimiTP6
+
+            return W4A16MixedTrellisKimiTP6(
+                driver=make_kernel(total_experts, tier0_bits, **common),
+                tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
+                tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+                descriptor_bits=descriptor_bits,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
