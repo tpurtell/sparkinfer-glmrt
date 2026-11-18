@@ -561,7 +561,7 @@ def test_glmf_owned_expand_shards_union_the_full_selection(ties):
     scratch = torch.zeros(index.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
     top_i = torch.empty((rows, k), device="cuda", dtype=torch.int32)
     top_v = torch.empty((rows, k), device="cuda")
-    index.launch(q, weights, full_cache, table, pools_seen, top_i, top_v, scratch, scalars=(rows, units, units, 1, 0))
+    index.launch(q, weights, full_cache, table, pools_seen, top_i, top_v, scratch, scalars=(rows, units, units, 1, 0, units))
     # glmf_index_topk emits physical pool slots; scored emits logical. Map logical -> physical.
     full_pools = torch.where(top_i >= 0, table.gather(1, (top_i.clamp(min=0) // 64).long()) * 64 + top_i % 64,
                              torch.zeros_like(top_i)).int()
