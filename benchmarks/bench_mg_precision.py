@@ -471,7 +471,9 @@ def run_context_aot(args):
                                 finally:
                                     if was_enabled:
                                         gc.enable()
+                                graph.replay()
                                 graphs[arm, rank] = graph
+                            torch.cuda.synchronize()
                             combine.launch(out[arm, 0], lse[arm, 0], out[arm, 1], lse[arm, 1], sink, combined,
                                            scalars=(rows,))
                             actual_lse = torch.logaddexp(lse[arm, 0][:rows] * math.log(2), lse[arm, 1][:rows] * math.log(2))
