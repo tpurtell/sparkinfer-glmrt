@@ -633,3 +633,44 @@ def test_bf16_input_fp64_oracle_and_range(side, codebook, bits):
         c.launch(rows)
         assert torch.equal(c.output[:rows].view(torch.int32), expected[:rows].view(torch.int32))
         assert torch.isnan(c.output[rows:]).all()
+
+
+@pytest.mark.parametrize("bits", [6, 8])
+@pytest.mark.skipif(__import__("os").environ.get("NATIVE_INKLING_HEAD_SHARDS") != "1",
+                    reason="opt-in full Inkling head sharding gate")
+def test_inkling_head_output_shards_byte_exact(bits):
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+
+    k, n, capacity = 4608, 201088, 130
+    limit = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * 4
+    rng = torch.Generator(device="cuda").manual_seed(408)
+    x = torch.randn((capacity, k), device="cuda", dtype=torch.bfloat16, generator=rng)
+    inputs = torch.tensor([x.data_ptr()], device="cuda", dtype=torch.int64)
+    scales = torch.rand(k // 128, device="cuda", dtype=torch.float16, generator=rng) + 0.5
+    payload = torch.randint(256, (k * n * bits // 8,), device="cuda", dtype=torch.uint8, generator=rng)
+
+    def bind(start, width, *, shard):
+        kernel = compile_trellis_linear_aot(input_features=k, output_features=width,
+            bits=bits, codebook="mcg", rotation_count=1, max_rows=capacity,
+            input_dtype="bf16", compact_head_shard=shard)
+        offset, length = start * k * bits // 8, width * k * bits // 8
+        weight = payload.narrow(0, offset, length)
+        partial = torch.empty((capacity * ((k + 1023) // 1024) * width,), device="cuda")
+        output = torch.empty((capacity, width), device="cuda")
+
+        def launch(rows):
+            kernel.launch(inputs, weight, scales, partial, output.view(-1), scalars=(rows, 0, limit))
+            return output[:rows]
+
+        return launch
+
+    full = bind(0, n, shard=False)
+    # Split into complete H128 output units. The production vocabulary has an
+    # odd number of units. Also test equal shards and a highly uneven split.
+    for total, cut in [(n, 100608), (n - 128, 100480), (n, 128)]:
+        left, right = bind(0, cut, shard=True), bind(cut, total - cut, shard=True)
+        for rows in (1, 2, 4, 8, 16, 17, 32, 33, 48, 49, 56, 57, 64, 65, 129, 130):
+            expected = full(rows)[:, :total]
+            actual = torch.cat((left(rows), right(rows)), dim=1)
+            assert torch.isfinite(expected).all(), (bits, cut, rows)
+            assert torch.equal(expected.view(torch.int32), actual.view(torch.int32)), (bits, cut, rows)
