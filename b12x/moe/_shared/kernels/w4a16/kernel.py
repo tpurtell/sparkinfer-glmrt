@@ -1829,6 +1829,8 @@ class W4A16GemmKernel:
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
         prefetch_tile: cutlass.Constexpr = None,
+        span_count_smem_off: cutlass.Constexpr = None,
+        reverse_tail_wave: cutlass.Constexpr = False,
     ):
         # prefetch_tile(route_block_idx, output_n_tile) (whole tiles only, as
         # the L2 schedule options require): called before each tile is
@@ -1836,7 +1838,11 @@ class W4A16GemmKernel:
         # first weight K tiles wait in L2 when its pipeline starts.
         n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
-        if cutlass.const_expr(self.dense_route_fast_path):
+        if cutlass.const_expr(span_count_smem_off is not None):
+            route_blocks = ld_shared_i32_relaxed(
+                smem_base + Int32(span_count_smem_off)
+            )
+        elif cutlass.const_expr(self.dense_route_fast_path):
             route_blocks = (
                 active_size_m + Int32(self.moe_block_size) - Int32(1)
             ) // Int32(self.moe_block_size)
@@ -1899,6 +1905,8 @@ class W4A16GemmKernel:
         output_n_tile = Int32(0)
         if iters == Int32(0) and full_grid_mn_iters == Int32(0):
             has_work = Int32(0)
+        if cutlass.const_expr(reverse_tail_wave):
+            full_wave_tiles = (global_mn_tiles // grid_x) * grid_x
 
         while has_work != Int32(0):
             reduce_tile_count = Int32(0)
@@ -1906,8 +1914,15 @@ class W4A16GemmKernel:
             reduce_slice_idx = Int32(0)
 
             if in_tail_region == Int32(0) and full_grid_mn_iters > Int32(0):
-                route_block_idx = work_mn_tile // n_tiles
-                output_n_tile = work_mn_tile - route_block_idx * n_tiles
+                if cutlass.const_expr(reverse_tail_wave):
+                    cur_mn_tile = work_mn_tile
+                    if work_mn_tile >= full_wave_tiles:
+                        cur_mn_tile = full_wave_tiles + (grid_x - Int32(1) - cta)
+                    route_block_idx = cur_mn_tile // n_tiles
+                    output_n_tile = cur_mn_tile - route_block_idx * n_tiles
+                else:
+                    route_block_idx = work_mn_tile // n_tiles
+                    output_n_tile = work_mn_tile - route_block_idx * n_tiles
                 reduce_k_tile = Int32(0)
                 reduce_tile_count = k_tiles
                 full_grid_mn_iters -= Int32(1)
@@ -7013,6 +7028,7 @@ class W4A16FusedMoeKernel:
         ):
             raise ValueError("phase L2 prefetch requires FC1 and FC2 tile prefetch")
         self.cta_threads = max(self.fc1.cta_threads, self.fc2.cta_threads)
+        self.max_m_blocks = int(max_m_blocks)
         if self.fc1.cta_threads != self.fc2.cta_threads:
             raise ValueError(
                 "fused W4A16 kernel expects matching FC1/FC2 thread counts"
@@ -7621,6 +7637,9 @@ class W4A16FusedMoeKernel:
         input_rotated: cutlass.Constexpr = False,
         fc1_prefetch_tile: cutlass.Constexpr = None,
         fc2_prefetch_tile: cutlass.Constexpr = None,
+        span_count_smem_off: cutlass.Constexpr = None,
+        reverse_tail_wave: cutlass.Constexpr = False,
+        activation_hook: cutlass.Constexpr = None,
     ):
         # Phase assembly shared by the single-tier fused kernel and the hybrid
         # multi-tier entry: zero prologue, FC1, grid barrier, activation, grid
@@ -7731,6 +7750,8 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
                 fc1_prefetch_tile,
+                span_count_smem_off,
+                reverse_tail_wave,
             )
             if cutlass.const_expr(self.phase_l2_prefetch and fc2_prefetch_tile is not None):
                 # A CTA done with FC1 waits at the barrier for the slowest one
@@ -7738,7 +7759,9 @@ class W4A16FusedMoeKernel:
                 # meanwhile (the down weights do not depend on FC1's output).
                 self.fc2._prefetch_first_tile(fc2_prefetch_tile, packed_route_count, cta)
             self._grid_barrier(locks_i32_flat, tid, grid_x)
-            if cutlass.const_expr(self.full_rotation):
+            if cutlass.const_expr(activation_hook is not None):
+                activation_hook()
+            elif cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.coupled_hadamard):
                     self._run_activation_coupled(
                         fc1_bf16_flat,
@@ -7802,6 +7825,9 @@ class W4A16FusedMoeKernel:
                 grid_x,
                 active_m,
                 fc1_emit_tile,
+                None,
+                span_count_smem_off,
+                reverse_tail_wave,
             )
         self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.collect_activation_amax):
@@ -7843,6 +7869,8 @@ class W4A16FusedMoeKernel:
             active_m * Int32(self.top_k),
             fc2_emit_tile,
             fc2_prefetch_tile,
+            span_count_smem_off,
+            reverse_tail_wave,
         )
 
     @cute.jit
