@@ -13,6 +13,7 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from cuda.bindings import driver as cuda
 
@@ -25,7 +26,7 @@ WATCH = [55, 56, 57, 58, 59, 60, 61, 62, 63]
 
 def independent(cache, q, ids, begin, scale):
     # Decode physical bytes on the CPU without the benchmark unpacker. Use
-    # FP64 row-by-row GEMMs, not its GPU batches of eight. Return both ranks
+    # FP64 row-by-row reductions, not its GPU batches of eight. Return both ranks
     # and the direct unsharded result; no kernel merge enters the oracle.
     rows = cache.cpu().contiguous().view(-1, 656)
     codes = rows[:, :512].contiguous().view(torch.float8_e4m3fn).double()
@@ -34,14 +35,28 @@ def independent(cache, q, ids, begin, scale):
     rope = rows[:, 528:].contiguous().view(torch.bfloat16).double()
     k = torch.cat([v, rope], dim=1)
     qq, ii = q[WATCH, begin:begin+32].cpu().double(), ids[WATCH].cpu().long()
+    qq, ii, k, v = qq.numpy(), ii.numpy(), k.numpy(), v.numpy()
+    tile = 128
     refs = [([], []) for _ in range(3)]
     for query, idx in zip(qq, ii):
-        score = (query @ k[idx].T) * scale
-        for (outputs, lses), sl in zip(refs, [slice(0, 1536), slice(1536, 2048), slice(None)]):
-            x = score[:, sl]
-            outputs.append(x.softmax(-1) @ v[idx[sl]])
-            lses.append(x.logsumexp(-1))
-    return [(torch.stack(o), torch.stack(l)) for o, l in refs]
+        # Unoptimized einsum uses NumPy's direct contraction, not a BLAS GEMM.
+        # Bound both indexed gathers to one tile and normalize each shard separately.
+        score = np.empty((len(query), len(idx)), dtype=np.float64)
+        for start in range(0, len(idx), tile):
+            sl = slice(start, start + tile)
+            score[:, sl] = np.einsum('hd,kd->hk', query, k[idx[sl]], optimize=False) * scale
+        for (outputs, lses), shard in zip(refs, [slice(0, 1536), slice(1536, 2048), slice(None)]):
+            x, slots = score[:, shard], idx[shard]
+            peak = x.max(axis=1)
+            weight = np.exp(x - peak[:, None])
+            denom = weight.sum(axis=1)
+            value = np.zeros((len(query), v.shape[1]), dtype=np.float64)
+            for start in range(0, len(slots), tile):
+                sl = slice(start, start + tile)
+                value += np.einsum('hk,kd->hd', weight[:, sl], v[slots[sl]], optimize=False)
+            outputs.append(value / denom[:, None])
+            lses.append(peak + np.log(denom))
+    return [(torch.from_numpy(np.stack(o)), torch.from_numpy(np.stack(l))) for o, l in refs]
 
 
 def row_errors(actual, expected):
@@ -62,7 +77,7 @@ def run(args, emit):
     spec.loader.exec_module(bench)
     torch.backends.cuda.matmul.allow_tf32 = False
     phase("set CPU thread count")
-    torch.set_num_threads(4)
+    torch.set_num_threads(1)
     phase("create CUDA stream")
     stream = torch.cuda.Stream()
     handle = cuda.CUstream(stream.cuda_stream)
