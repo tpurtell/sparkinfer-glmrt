@@ -249,8 +249,17 @@ class _Decode:
         n = self.heads
         self.kernels, self.merges = [], []
         for _, splits, per_split in self.buckets:
+            arm, arm_layout = traits, layout
+            if precision == "bf16" and per_split >= (4 if traits.d_rope else 3):
+                # Short splits cannot amortize an extra gather stage or a
+                # register-resident Q prefix (required only with RoPE).
+                # For 656-byte records keep the first 192 Q features in warp
+                # registers; 528-byte Flash records fit alongside the full Q.
+                arm = replace(traits, glm_record_ring=True,
+                              q_nope_stride=traits.q_nope_stride - (192 if traits.d_rope else 0))
+                arm_layout = make_smem_layout(arm)
             self.kernels.append(UnifiedDecodeKernel(
-                traits, layout, g.page_rows, per_split, h_blocks=n // hpb, num_splits=splits,
+                arm, arm_layout, g.page_rows, per_split, h_blocks=n // hpb, num_splits=splits,
                 num_heads=n, q_head_dim=self.qk, topk=self.topk, extra_topk=0,
                 q_stride=(n * self.qk, self.qk, 1), swa_indices_stride0=self.topk,
                 extra_indices_stride0=self.topk,
