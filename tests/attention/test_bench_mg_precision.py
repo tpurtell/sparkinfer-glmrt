@@ -1,7 +1,7 @@
 """CPU-only contracts for the MG precision diagnostic."""
 import pytest
 
-from benchmarks.bench_mg_precision import aot_cell_seed, arm_traits, decode_arm_traits, parse_args
+from benchmarks.bench_mg_precision import aot_cell_seed, arm_traits, critical_path_samples, decode_arm_traits, parse_args
 from b12x.attention._shared.mla.traits import ComputeMode, ModelType
 
 
@@ -85,3 +85,9 @@ def test_c128_1m_confirmation_only_accepts_v4_cells(tmp_path):
     assert parse_args(argv + ["--cells", "v4p-h128"]).confirm_c128_1m
     with pytest.raises(SystemExit):
         parse_args(argv + ["--cells", "glm-h64"])
+
+
+def test_context_critical_path_pairs_alternating_blocks(tmp_path):
+    args = parse_args(["--mode", "context-aot", "--cells", "v4p,ml4nope", "--output", str(tmp_path / "out.json")])
+    assert args.cells == ["v4p", "ml4nope"]
+    assert critical_path_samples([[1.0, 4.0, 1.0], [3.0, 2.0, 3.0]]) == [3.0, 4.0, 3.0]

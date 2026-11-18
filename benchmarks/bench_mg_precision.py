@@ -62,7 +62,7 @@ def parse_args(argv=None):
         return v
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--format", choices=("dsv4", "dsv41"))
-    p.add_argument("--mode", choices=("prefill", "decode", "decode-aot"), default="prefill")
+    p.add_argument("--mode", choices=("prefill", "decode", "decode-aot", "context-aot"), default="prefill")
     p.add_argument("--heads", type=int, default=64)
     p.add_argument("--indexed-width", type=int, default=512)
     p.add_argument("--rows", type=ints)
@@ -79,10 +79,14 @@ def parse_args(argv=None):
     p.add_argument("--confirm-c128-1m", action="store_true",
                    help="decode-aot: only production V4 C128 at 8192 slots")
     args = p.parse_args(argv)
-    if args.mode == "decode-aot":
+    if args.mode in ("decode-aot", "context-aot"):
         if args.format or args.rows or args.timing_rows:
             p.error("decode-aot uses fixed AOT geometries and all live rows 1–64")
         known = {f"{family}-h{heads}" for family, heads in AOT_CELLS}
+        if args.mode == "context-aot":
+            if args.confirm_c128_1m:
+                p.error("context-aot currently uses the production GLM sparse or V4 C4 partial")
+            known = {"glm", "glmf", "v4f", "v4p", "ml4", "ml4nope"}
         if args.confirm_c128_1m:
             known = {cell for cell in known if cell.startswith("v4")}
         if args.cells and set(args.cells) - known:
@@ -191,10 +195,8 @@ def aot_cell_seed(seed, cell, kind):
     return int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
 
 
-def run_decode_aot(args):
-    """Compare the production launch ABI over full-width packed records."""
+def make_records(width, page, qdim, v4, generator, capacity, device):
     import torch
-    from cuda.bindings import driver as cuda
     from b12x.attention._shared.mla.compressed_reference import (
         pack_compressed_sparse_mla_kv_cache_reference as pack_v4,
         unpack_compressed_sparse_mla_kv_cache_reference as unpack_v4,
@@ -202,6 +204,24 @@ def run_decode_aot(args):
     from b12x.attention._shared.mla.reference import (
         pack_mla_kv_cache_reference as pack_glm, unpack_mla_kv_cache_reference as unpack_glm,
     )
+    slots = max(8192, width)
+    raw = torch.randn((slots, qdim), device=device, generator=generator).bfloat16()
+    if v4:
+        cache = pack_v4(raw[:, :448], raw[:, 448:], page_size=page)
+        k, v = unpack_v4(cache, page_size=page)
+    else:
+        records = pack_glm(raw[:, :512], raw[:, 512:] if qdim == 576 else None)
+        cache = records.reshape(slots // page, -1).contiguous()
+        k = unpack_glm(records).squeeze(1)
+        v = k[:, :512]
+    ids = (torch.arange(capacity, device=device)[:, None] * 149
+           + torch.arange(width, device=device)[None, :] * 59) % slots
+    return cache, ids.int().contiguous(), torch.full((capacity,), width, device=device, dtype=torch.int32), k, v
+
+def run_decode_aot(args):
+    """Compare the production launch ABI over full-width packed records."""
+    import torch
+    from cuda.bindings import driver as cuda
     from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
     from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
     from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
@@ -223,21 +243,6 @@ def run_decode_aot(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     geometries = {"glm": GLM53, "glmf": GLM53_FLASH, "v4f": FLASH, "v4p": PRO}
 
-    def make_records(width, page, qdim, v4, generator):
-        slots = max(8192, width)
-        raw = torch.randn((slots, qdim), device=device, generator=generator).bfloat16()
-        if v4:
-            cache = pack_v4(raw[:, :448], raw[:, 448:], page_size=page)
-            k, v = unpack_v4(cache, page_size=page)
-        else:
-            records = pack_glm(raw[:, :512], raw[:, 512:] if qdim == 576 else None)
-            cache = records.reshape(slots // page, -1).contiguous()
-            k = unpack_glm(records).squeeze(1)
-            v = k[:, :512]
-        ids = (torch.arange(capacity, device=device)[:, None] * 149
-               + torch.arange(width, device=device)[None, :] * 59) % slots
-        return cache, ids.int().contiguous(), torch.full((capacity,), width, device=device, dtype=torch.int32), k, v
-
     for family, heads in AOT_CELLS:
         cell = f"{family}-h{heads}"
         if (args.cells and cell not in args.cells) or (args.confirm_c128_1m and not family.startswith("v4")):
@@ -256,11 +261,11 @@ def run_decode_aot(args):
             seed = aot_cell_seed(args.seed, cell, kind)
             generator = torch.Generator(device=device).manual_seed(seed)
             main_cache, main_ids, main_lengths, mk, mv = make_records(
-                main_width, 256 if v4 else g.page_rows, qdim, v4, generator)
+                main_width, 256 if v4 else g.page_rows, qdim, v4, generator, capacity, device)
             q = (torch.randn((capacity, heads, qdim), device=device, generator=generator) * 2.5).bfloat16()
             inputs = (q, main_cache, main_ids, main_lengths)
             if width:
-                extra, extra_ids, extra_lengths, ek, ev = make_records(width, page, qdim, True, generator)
+                extra, extra_ids, extra_lengths, ek, ev = make_records(width, page, qdim, True, generator, capacity, device)
             if v4:
                 inputs += ((extra, extra_ids, extra_lengths) if width else (None, None, None)) + (sink,)
             ref_out, ref_lse = [], []
@@ -354,10 +359,160 @@ def run_decode_aot(args):
     return 0
 
 
+def critical_path_samples(rank_samples):
+    """Pair corresponding alternating sample blocks, not rank medians."""
+    return [max(a, b) for a, b in zip(*rank_samples, strict=True)]
+
+
+def run_context_aot(args):
+    import torch
+    from cuda.bindings import driver as cuda
+    from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
+    from b12x.integration.cuteafd import context_split as split, mistral_large4 as ml4
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    capacity = 64
+    geometries = {"glm": GLM53, "glmf": GLM53_FLASH, "v4f": FLASH, "v4p": PRO,
+                  "ml4": ml4.rope_attention(), "ml4nope": ml4.nope_attention()}
+    arms = ("fp8", "bf16")
+    report = {"mode": args.mode, "seed": args.seed, "capacity": capacity, "device": props.name,
+              "sms": props.multi_processor_count, "lse_unit": "natural_log",
+              "fork_sha": subprocess.check_output(["git", "-C", str(SOURCE), "rev-parse", "HEAD"], text=True).strip(),
+              "bench_sha": subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"], text=True).strip(),
+              "warmup": args.warmup, "replays": args.replays, "sample_blocks": args.samples, "records": []}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    stream = torch.cuda.Stream()
+    handle = cuda.CUstream(stream.cuda_stream)
+
+    for family, g in geometries.items():
+        if args.cells and family not in args.cells:
+            continue
+        half = g.heads // 2
+        v4 = family in ("v4f", "v4p")
+        qdim, scale = (512, 512 ** -.5) if v4 else (g.latent_dim, g.softmax_scale)
+        main_width = 128 if v4 else getattr(g, "sparse_topk", g.index_topk)
+        extra_width = g.index_topk if v4 else 0
+        # Each rank sees the production fixed-size table but only its owned entries.
+        def shard(ids, count, rank):
+            owned = ids[:, :count] if rank == 0 else ids[:, count:]
+            masked = torch.full_like(ids, -1)
+            masked[:, :owned.shape[1]] = owned
+            return masked, torch.full((capacity,), owned.shape[1], device=device, dtype=torch.int32)
+
+        plans = {cap: split.sparse_mla_partial_split_plan(g, max_rows=cap, head_count=half,
+                 sm_count=props.multi_processor_count) for cap in (1, 8, capacity)}
+        # One compilation per distinct planned split count and head half.
+        with exportable_compilation():
+            programs = {(begin, splits, arm): split.compile_sparse_mla_partial_aot(g, max_rows=capacity,
+                         head_begin=begin, head_count=half, num_splits=splits, precision=arm)
+                        for begin in (0, half) for splits in set(plans.values()) for arm in arms}
+        for balance in ("balanced", "asymmetric"):
+            seed = aot_cell_seed(args.seed, family, balance)
+            gen = torch.Generator(device=device).manual_seed(seed)
+            main, ix, _, mk, mv = make_records(main_width, 256 if v4 else g.page_rows, qdim, v4, gen, capacity, device)
+            q = (torch.randn((capacity, g.heads, qdim), device=device, generator=gen) * 2.5).bfloat16()
+            main_count = main_width if v4 else main_width * (1 if balance == "balanced" else 3) // (2 if balance == "balanced" else 4)
+            extra_count = extra_width * (1 if balance == "balanced" else 3) // (2 if balance == "balanced" else 4)
+            if v4:
+                extra, ei, _, ek, ev = make_records(extra_width, 64, qdim, True, gen, capacity, device)
+                sink = torch.linspace(-1, 1, half, device=device)
+            else:
+                extra = ei = sink = None
+            rank_inputs = []
+            for rank in (0, 1):
+                mi, ml = shard(ix, main_count, rank)
+                ci, cl = shard(ei, extra_count, rank) if v4 else (None, None)
+                rank_inputs.append((q, main, mi, ml, extra, ci, cl))
+            combine = split.compile_lse_combine2_aot(heads=half, has_sink=v4)
+            for begin in (0, half):
+                refs, lses = [], []
+                for lo in range(0, capacity, 8):
+                    hi = lo + 8
+                    k, v = mk[ix[lo:hi].long()], mv[ix[lo:hi].long()]
+                    if v4:
+                        k = torch.cat((k, ek[ei[lo:hi].long()]), 1)
+                        v = torch.cat((v, ev[ei[lo:hi].long()]), 1)
+                    score = torch.bmm(q[lo:hi, begin:begin + half].float(), k.transpose(1, 2)) * scale
+                    if v4:
+                        score = torch.cat((score, sink[None, :, None].expand(hi-lo, -1, -1)), -1)
+                    refs.append(torch.bmm(score.softmax(-1)[:, :, :main_width + extra_width], v))
+                    lses.append(score.logsumexp(-1))
+                ref, ref_lse = torch.cat(refs), torch.cat(lses)
+                for cap, splits in plans.items():
+                    out = {(arm, rank): torch.empty_like(ref, dtype=torch.bfloat16) for arm in arms for rank in (0, 1)}
+                    lse = {(arm, rank): torch.empty_like(ref_lse) for arm in arms for rank in (0, 1)}
+                    scratch = {(arm, rank): torch.empty(programs[begin, splits, arm].scratch_bytes(capacity)["scratch"],
+                               device=device, dtype=torch.uint8) for arm in arms for rank in (0, 1)}
+                    combined = torch.empty_like(ref, dtype=torch.bfloat16)
+                    for rows in range(1, capacity + 1):
+                        rec = {"cell": family, "kind": balance, "cell_seed": seed, "head_begin": begin,
+                               "heads": half, "plan_rows": cap, "rows": rows, "splits": splits,
+                               "rank_kv_bytes_per_row": [(main_count + extra_count) * (584 if v4 else g.record_bytes),
+                                  (main_width + extra_width - main_count - extra_count) * (584 if v4 else g.record_bytes)], "arms": {}}
+                        graphs = {}
+                        def execute(arm, rank):
+                            key = arm, rank
+                            programs[begin, splits, arm].launch(*rank_inputs[rank], out[key], lse[key], scratch[key],
+                                                                scalars=(rows,), stream=handle)
+                        for arm in arms:
+                            for rank in (0, 1):
+                                with torch.cuda.stream(stream):
+                                    for _ in range(args.warmup):
+                                        execute(arm, rank)
+                                stream.synchronize()
+                                graph = torch.cuda.CUDAGraph()
+                                was_enabled = gc.isenabled()
+                                gc.disable()
+                                try:
+                                    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+                                        execute(arm, rank)
+                                finally:
+                                    if was_enabled:
+                                        gc.enable()
+                                graphs[arm, rank] = graph
+                            combine.launch(out[arm, 0], lse[arm, 0], out[arm, 1], lse[arm, 1], sink, combined,
+                                           scalars=(rows,))
+                            actual_lse = torch.logaddexp(lse[arm, 0][:rows] * math.log(2), lse[arm, 1][:rows] * math.log(2))
+                            if v4:
+                                actual_lse = torch.logaddexp(actual_lse, sink[None, :])
+                            delta = combined[:rows].float() - ref[:rows]
+                            ld = actual_lse - ref_lse[:rows]
+                            if not bool(torch.isfinite(delta).all() & torch.isfinite(ld).all()):
+                                raise RuntimeError(f"nonfinite context result: {family}/{begin}/{cap}/{rows}/{arm}")
+                            rec["arms"][arm] = {"output_rel_rms": float(delta.square().mean().sqrt() / ref[:rows].square().mean().sqrt()),
+                                "lse_rms": float(ld.square().mean().sqrt()), "lse_max_abs": float(ld.abs().max())}
+                        samples = {(arm, rank): [] for arm in arms for rank in (0, 1)}
+                        for block in range(args.samples):
+                            for arm in arms[::1 if (block + rows) % 2 else -1]:
+                                for rank in ((0, 1) if block % 2 == 0 else (1, 0)):
+                                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                                    start.record()
+                                    for _ in range(args.replays):
+                                        graphs[arm, rank].replay()
+                                    end.record()
+                                    end.synchronize()
+                                    samples[arm, rank].append(start.elapsed_time(end) * 1000 / args.replays)
+                        for arm in arms:
+                            per_rank = [samples[arm, i] for i in (0, 1)]
+                            critical = critical_path_samples(per_rank)
+                            rec["arms"][arm].update(rank_samples_us=per_rank, rank_median_us=list(map(statistics.median, per_rank)),
+                                samples_us=critical, median_us=statistics.median(critical), min_us=min(critical), max_us=max(critical))
+                        for graph in graphs.values():
+                            graph.reset()
+                        report["records"].append(rec)
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
+            print(f"{family}/{balance}: {len(report['records'])} rows", flush=True)
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
     if args.mode == "decode-aot":
         return run_decode_aot(args)
+    if args.mode == "context-aot":
+        return run_context_aot(args)
     import torch
     from b12x.attention._shared.mla.compressed_reference import (
         pack_compressed_sparse_mla_kv_cache_reference, pack_deepseek_v41_cache_reference,
