@@ -238,15 +238,8 @@ class _Decode:
         traits = _traits(g)
         if precision == "bf16":
             from dataclasses import replace
-            from b12x.attention._shared.mla.native_v41_aot import (
-                query_pv_bf16_eff_sms,
-                resolve_pv_bf16_compact_launch_attrs,
-            )
             from b12x.attention._shared.mla.traits import with_bf16_attention
             traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
-            self._query_eff_sms = query_pv_bf16_eff_sms
-            self.block_threads = int(traits.block_threads)
-            self.cache_symbol = f"_pv_bf16_glm_sms_q{self.qk}"
         layout = make_smem_layout(traits)
         hpb = int(traits.hpb)
         if self.heads % hpb:
@@ -254,15 +247,19 @@ class _Decode:
         self.buckets = decode_buckets(g, plan_capacity_rows or max_rows, full_launch_splits=full_launch_splits,
                                       sm_count=sm_count)
         n = self.heads
-        self.h_blocks = n // hpb
-        self.kernels, self.kernels_compact, self.merges = [], [], []
-        self.compact_smem_bytes = 0
-        compact_tag = ()
+        self.kernels, self.merges = [], []
         for _, splits, per_split in self.buckets:
             arm, arm_layout = traits, layout
-            compact_kernel = None
-            common_kw = dict(
-                h_blocks=n // hpb, num_splits=splits,
+            if precision == "bf16" and per_split >= (4 if traits.d_rope else 3):
+                # Short splits cannot amortize an extra gather stage or a
+                # register-resident Q prefix (required only with RoPE).
+                # For 656-byte records keep the first 192 Q features in warp
+                # registers; 528-byte Flash records fit alongside the full Q.
+                arm = replace(traits, glm_record_ring=True,
+                              q_nope_stride=traits.q_nope_stride - (192 if traits.d_rope else 0))
+                arm_layout = make_smem_layout(arm)
+            self.kernels.append(UnifiedDecodeKernel(
+                arm, arm_layout, g.page_rows, per_split, h_blocks=n // hpb, num_splits=splits,
                 num_heads=n, q_head_dim=self.qk, topk=self.topk, extra_topk=0,
                 q_stride=(n * self.qk, self.qk, 1), swa_indices_stride0=self.topk,
                 extra_indices_stride0=self.topk,
@@ -272,42 +269,11 @@ class _Decode:
                 native_dsv4_h8=False, native_dsv4_h16=False, native_dsv41_fp8=False, vector_q=True,
                 zero_masked_v=zero_masked_v,
                 single_split_partial_bf16=(not fp32_partials) if self.elide_single_split and splits == 1 else None,
-            )
-            if precision == "bf16":
-                if per_split >= 2:
-                    arm = replace(
-                        traits,
-                        glm_record_ring=True,
-                        q_nope_stride=traits.q_nope_stride - (192 if traits.d_rope else 0),
-                    )
-                    arm_layout = make_smem_layout(arm)
-                else:
-                    arm_2cta = replace(
-                        traits,
-                        glm_compact_2cta=True,
-                        q_nope_stride=(16 if traits.d_rope else traits.q_nope_stride - 192),
-                    )
-                    compact_layout = make_smem_layout(arm_2cta)
-                    min_blk_c, carve_c = resolve_pv_bf16_compact_launch_attrs(
-                        block_threads=int(traits.block_threads),
-                        compact_smem_bytes=int(compact_layout.total_bytes),
-                        full_smem_bytes=int(layout.total_bytes),
-                    )
-                    if min_blk_c >= 2:
-                        self.compact_smem_bytes = int(compact_layout.total_bytes)
-                        compact_tag = ("compact2cta", min_blk_c)
-                        compact_kernel = UnifiedDecodeKernel(
-                            arm_2cta, compact_layout, g.page_rows, per_split, **common_kw,
-                            min_blocks_per_mp=min_blk_c, preferred_smem_carveout=carve_c,
-                        )
-            self.kernels.append(UnifiedDecodeKernel(
-                arm, arm_layout, g.page_rows, per_split, **common_kw,
             ))
-            self.kernels_compact.append(compact_kernel)
             self.merges.append(SparseMLASplitDecodeMergeKernel(static_num_chunks=splits))
         self.key = ("decode", self.buckets, "fp32") if fp32_partials else ("decode", self.buckets)
         if precision == "bf16":
-            self.key += ("bf16", *compact_tag)
+            self.key += ("bf16",)
         if zero_masked_v:
             self.key += ("zero_masked_v",)
         if self.elide_single_split and any(s == 1 for _, s, _ in self.buckets):
@@ -332,32 +298,6 @@ class _Decode:
         idx = cute.make_tensor(indices, cute.make_layout((m, self.topk), stride=(self.topk, 1)))
         lens = cute.make_tensor(lengths, cute.make_layout((m,)))
         scale = Float32(float(self.g.softmax_scale) * LOG2_E)
-        if cutlass.const_expr(self.kernels_compact[b] is not None):
-            eff_sms = self._query_eff_sms(
-                self.cache_symbol,
-                block_threads=self.block_threads,
-                compact_smem_bytes=self.compact_smem_bytes,
-            )
-            use_compact = eff_sms > Int32(0) and (rows * Int32(self.h_blocks * s)) > (Int32(2) * eff_sms)
-            if cutlass.const_expr(self.elide_single_split and s == 1):
-                direct = cute.make_tensor(out, cute.make_layout((m, n, 1, _DV), stride=(n * _DV, _DV, _DV, 1)))
-                if use_compact:
-                    self.kernels_compact[b].call_pertok(qt, kv, idx, direct, partial_lse, scale, Float32(1.0), lens,
-                                                        Int64(self.g.kv_page_bytes), rows, stream)
-                else:
-                    self.kernels[b].call_pertok(qt, kv, idx, direct, partial_lse, scale, Float32(1.0), lens,
-                                                Int64(self.g.kv_page_bytes), rows, stream)
-                return
-            if use_compact:
-                self.kernels_compact[b].call_pertok(qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
-                                                    Int64(self.g.kv_page_bytes), rows, stream)
-            else:
-                self.kernels[b].call_pertok(qt, kv, idx, partials, partial_lse, scale, Float32(1.0), lens,
-                                            Int64(self.g.kv_page_bytes), rows, stream)
-            self.merges[b](partials, partial_lse, lens,
-                           cute.make_tensor(out, cute.make_layout((m, n, _DV), stride=(n * _DV, _DV, 1))),
-                           stream)
-            return
         if cutlass.const_expr(self.elide_single_split and s == 1):
             # Strides coincide with the one-split partial layout; only the
             # destination and rounding-preserving epilogue change.

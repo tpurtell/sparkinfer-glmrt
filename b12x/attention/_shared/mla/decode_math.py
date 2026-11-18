@@ -535,13 +535,13 @@ def _scale_e4m3_pair_bf16(code: Uint32, factor: Uint32, *, loc=None, ip=None):
 @cute.jit
 def expand_v4_tile(base: Int32, sc_base: Int32, tok: cute.Tensor, warp: Int32, lane: Int32, *,
                    row_stride: cutlass.Constexpr, packed: cutlass.Constexpr):
-    """Widen each warp's eight raw KV rows to swizzled BF16 in place."""
+    """Each warp owns exactly its eight QK rows. Save raw bytes before expanding in place."""
     for ri in cutlass.range(8, unroll=1):
         row = warp * Int32(8) + Int32(ri)
         ptr = base + row * Int32(row_stride)
         valid = True
         if cutlass.const_expr(packed):
-            valid = Int32(tok[row]) >= Int32(0)
+            valid = tok[row] >= Int32(0)
         groups = []
         for half in cutlass.range_constexpr(2):
             vec = lane + Int32(half * 32)
@@ -583,82 +583,54 @@ def stage_decode_q_bf16_vec(q_token: cute.Tensor, q_base: Int32, rope_base: Int3
             if h < Int32(valid_hpb):
                 offset = cute.crd2idx((head_base + h, d), q_token.layout)
                 a, b, c, e = ld_global_nc_v4_u32(get_ptr_as_int64(q_token, offset))
-            if cutlass.const_expr(skip >= d_nope):
-                dst = rope_base + (h * Int32(rope_stride) + d - Int32(d_nope)) * Int32(2)
-            else:
-                dst = q_base + (h * Int32(q_stride) + d - Int32(skip)) * Int32(2)
-                if cutlass.const_expr(d_rope):
-                    if d >= Int32(d_nope):
-                        dst = rope_base + (h * Int32(rope_stride) + d - Int32(d_nope)) * Int32(2)
+            dst = q_base + (h * Int32(q_stride) + d - Int32(skip)) * Int32(2)
+            if cutlass.const_expr(d_rope):
+                if d >= Int32(d_nope):
+                    dst = rope_base + (h * Int32(rope_stride) + d - Int32(d_nope)) * Int32(2)
             st_shared_v4_u32(dst, a, b, c, e)
     cute.arch.barrier(barrier_id=2, number_of_threads=threads)
 
 
 @cute.jit
-def load_glm_q_tile_gmem(q: cute.Tensor, head: Int32, lane: Int32, k_tile: cutlass.Constexpr, *,
-                         valid_hpb: cutlass.Constexpr = 16):
+def load_glm_q_prefix(q: cute.Tensor, head: Int32, lane: Int32):
+    # Same A register order as ldmatrix.x4 on a row-major 16x16 BF16 tile.
+    # Every warp reads the same immutable 192-feature prefix once per split.
     r = lane >> Int32(2)
-    col = (lane & Int32(3)) * Int32(2) + Int32(k_tile * 16)
-    if cutlass.const_expr(valid_hpb >= 16):
-        lo = get_ptr_as_int64(q, cute.crd2idx((head + r, col), q.layout))
-        hi = get_ptr_as_int64(q, cute.crd2idx((head + r + Int32(8), col), q.layout))
-        return (
-            ld_global_nc_u32(lo),
-            ld_global_nc_u32(hi),
-            ld_global_nc_u32(lo + Int64(16)),
-            ld_global_nc_u32(hi + Int64(16)),
-        )
-    a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-    if r < Int32(valid_hpb):
-        lo = get_ptr_as_int64(q, cute.crd2idx((head + r, col), q.layout))
-        a0 = ld_global_nc_u32(lo)
-        a2 = ld_global_nc_u32(lo + Int64(16))
-    if r + Int32(8) < Int32(valid_hpb):
-        hi = get_ptr_as_int64(q, cute.crd2idx((head + r + Int32(8), col), q.layout))
-        a1 = ld_global_nc_u32(hi)
-        a3 = ld_global_nc_u32(hi + Int64(16))
-    return a0, a1, a2, a3
+    col = (lane & Int32(3)) * Int32(2)
+    lo = get_ptr_as_int64(q, cute.crd2idx((head + r, col), q.layout))
+    hi = get_ptr_as_int64(q, cute.crd2idx((head + r + Int32(8), col), q.layout))
+    return [(ld_global_nc_u32(lo + Int64(ks * 32)), ld_global_nc_u32(hi + Int64(ks * 32)),
+             ld_global_nc_u32(lo + Int64(ks * 32 + 16)), ld_global_nc_u32(hi + Int64(ks * 32 + 16)))
+            for ks in range(12)]
 
 
 @cute.jit
-def load_glm_q_prefix(q: cute.Tensor, head: Int32, lane: Int32, *,
-                      n_tiles: cutlass.Constexpr = 12, valid_hpb: cutlass.Constexpr = 16):
-    if cutlass.const_expr(valid_hpb >= 16):
-        r = lane >> Int32(2)
-        col = (lane & Int32(3)) * Int32(2)
-        lo = get_ptr_as_int64(q, cute.crd2idx((head + r, col), q.layout))
-        hi = get_ptr_as_int64(q, cute.crd2idx((head + r + Int32(8), col), q.layout))
-        return [(ld_global_nc_u32(lo + Int64(ks * 32)), ld_global_nc_u32(hi + Int64(ks * 32)),
-                 ld_global_nc_u32(lo + Int64(ks * 32 + 16)), ld_global_nc_u32(hi + Int64(ks * 32 + 16)))
-                for ks in range(n_tiles)]
-    return [load_glm_q_tile_gmem(q, head, lane, ks, valid_hpb=valid_hpb) for ks in range(n_tiles)]
-
-
-@cute.jit
-def snapshot_glm_scales(base: Int32, warp: Int32, lane: Int32, tok_buf_view: cute.Tensor, *,
-                        stride: cutlass.Constexpr, zero_masked_v: cutlass.Constexpr = False):
-    addr0 = base + lane * Int32(stride) + Int32(512) + (warp >> Int32(1)) * Int32(4)
-    addr1 = addr0 + Int32(32 * stride)
-    if cutlass.const_expr(zero_masked_v):
-        s0 = Float32(0.0)
-        s1 = Float32(0.0)
-        if Int32(tok_buf_view[lane]) >= Int32(0):
-            s0 = ld_shared_f32(addr0)
-        if Int32(tok_buf_view[lane + Int32(32)]) >= Int32(0):
-            s1 = ld_shared_f32(addr1)
-        return s0, s1
-    return ld_shared_f32(addr0), ld_shared_f32(addr1)
-
-
-@cute.jit
-def apply_glm_pv(acc, scales, pbuf: Int32, warp: Int32, lane: Int32,
-                 ring_base: Int32, tok_buf_view: cute.Tensor, zero_16b_addr: Int32, *,
-                 pstride: cutlass.Constexpr, record_stride: cutlass.Constexpr,
-                 zero_masked_v: cutlass.Constexpr = False):
-    pbase = pbuf + ((lane & Int32(15)) * Int32(pstride) + (lane >> Int32(4)) * Int32(8)) * Int32(2)
+def snapshot_glm_pv(base: Int32, warp: Int32, lane: Int32, *, stride: cutlass.Constexpr):
+    # One warp owns 64 adjacent output dims (half of a scale group). Permute
+    # the address lanes so trans.b8 delivers the two K pairs of each B fragment.
     l = lane & Int32(15)
-    row = (l & Int32(1)) | ((l & Int32(12)) >> Int32(1)) | ((l & Int32(2)) << Int32(2))
-    vbase = ring_base + row * Int32(record_stride) + warp * Int32(64)
+    r = (l & Int32(1)) | ((l & Int32(12)) >> Int32(1)) | ((l & Int32(2)) << Int32(2))
+    dst = base + r * Int32(stride) + warp * Int32(64)
+    return [ldmatrix_m16n16x1_trans_b8(dst + Int32(ks * 16 * stride + nt * 16))
+            for ks in range(4) for nt in range(4)]
+
+
+@cute.jit
+def snapshot_glm_scales(base: Int32, warp: Int32, lane: Int32, *, stride: cutlass.Constexpr):
+    # Each lane loads just two scales. The four-way tid cohort broadcasts
+    # scales for k=2*tid + {0,1,8,9} during PV, avoiding 4x redundant loads.
+    addr = base + lane * Int32(stride) + Int32(512) + (warp >> Int32(1)) * Int32(4)
+    return ld_shared_f32(addr), ld_shared_f32(addr + Int32(32 * stride))
+
+
+@cute.jit
+def apply_glm_pv(acc, raw, scales, pbuf: Int32, lane: Int32, *, pstride: cutlass.Constexpr,
+                 ring_base=None, warp=None, record_stride: cutlass.Constexpr = 0):
+    pbase = pbuf + ((lane & Int32(15)) * Int32(pstride) + (lane >> Int32(4)) * Int32(8)) * Int32(2)
+    if cutlass.const_expr(ring_base is not None):
+        l = lane & Int32(15)
+        row = (l & Int32(1)) | ((l & Int32(12)) >> Int32(1)) | ((l & Int32(2)) << Int32(2))
+        vbase = ring_base + row * Int32(record_stride) + warp * Int32(64)
     tmp = [[Float32(0.0) for _ in range(4)] for _ in range(8)]
     for ks in cutlass.range_constexpr(4):
         a0, a1, a2, a3 = ldmatrix_m8n8x4_b16(pbase + Int32(ks * 32))
@@ -667,18 +639,15 @@ def apply_glm_pv(acc, scales, pbuf: Int32, warp: Int32, lane: Int32,
         s1 = cute.arch.shuffle_sync(scales[ks // 2], src + Int32(1))
         s8 = cute.arch.shuffle_sync(scales[ks // 2], src + Int32(8))
         s9 = cute.arch.shuffle_sync(scales[ks // 2], src + Int32(9))
-        row_ok = True
-        if cutlass.const_expr(zero_masked_v):
-            row_ok = Int32(tok_buf_view[Int32(ks * 16) + row]) >= Int32(0)
         for nt in cutlass.range_constexpr(8):
-            if cutlass.const_expr(nt % 2 == 0):
-                v_ptr = vbase + Int32(ks * 16 * record_stride + (nt // 2) * 16)
-                if cutlass.const_expr(zero_masked_v):
-                    if not row_ok:
-                        v_ptr = zero_16b_addr
-                code, next_code = ldmatrix_m16n16x1_trans_b8(v_ptr)
+            if cutlass.const_expr(ring_base is not None):
+                if cutlass.const_expr(nt % 2 == 0):
+                    code, next_code = ldmatrix_m16n16x1_trans_b8(
+                        vbase + Int32(ks * 16 * record_stride + (nt // 2) * 16))
+                else:
+                    code = next_code
             else:
-                code = next_code
+                code = raw[ks * 4 + nt // 2][nt % 2]
             lo, hi = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(code))
             lo8, hi8 = f16x2_to_f32x2(_cvt_e4m3x2_to_f16x2(code >> Uint32(16)))
             b0 = pack_f32x2_to_bfloat2(lo * s0, hi * s1)
@@ -1959,13 +1928,8 @@ def s4_online_softmax(
     # --- cross-warp reduce: stage per-warp (max,sum) for heads gid / gid+8. ---
     if tid == Int32(0):
         if cutlass.const_expr(vector_fold):
-            st_shared_v4_f32(
-                reduce_max_addr + (warp_id * Int32(8) + gid) * Int32(16),
-                local_max0,
-                local_sum0,
-                local_max1,
-                local_sum1,
-            )
+            st_shared_v4_f32(reduce_max_addr + (warp_id * Int32(8) + gid) * Int32(16),
+                             local_max0, local_sum0, local_max1, local_sum1)
         else:
             st_shared_f32(
                 reduce_max_addr + (warp_id * Int32(hpb) + gid) * Int32(4), local_max0
@@ -1995,9 +1959,7 @@ def s4_online_softmax(
     wsum1 = []
     for w in cutlass.range_constexpr(n_warps):
         if cutlass.const_expr(vector_fold):
-            m0, s0, m1, s1 = ld_shared_v4_f32(
-                reduce_max_addr + (Int32(w * 8) + gid) * Int32(16)
-            )
+            m0, s0, m1, s1 = ld_shared_v4_f32(reduce_max_addr + (Int32(w * 8) + gid) * Int32(16))
             wmax0.append(m0)
             wsum0.append(s0)
             wmax1.append(m1)
@@ -3772,10 +3734,6 @@ def s1_qk_nope_bf16_mg2(
     n_hg: cutlass.Constexpr = 2,
     inline_fp32_scale_offset: cutlass.Constexpr = 0,
     reg_prefix=None,
-    q_token=None,
-    head_base: Int32 = Int32(0),
-    gmem_q_tail: cutlass.Constexpr = False,
-    valid_hpb: cutlass.Constexpr = 16,
 ):
     """S1 (BF16): fused QK-NoPE bf16 m16n8k16 MMA with per-thread inline
     FP8->BF16 K dequant.
@@ -3817,20 +3775,12 @@ def s1_qk_nope_bf16_mg2(
                 b1 = e4m3_pair_to_bf16x2_sm120(
                     ld_shared_u16_offset(kv_lane_base, blk * quant_tile + ks * 16 + 8)
                 )
-                k_tile = blk * (quant_tile // 16) + ks
                 a_byte = a_row * Int32(q_nope_bf16_stride * 2) + (ko + a_col) * Int32(2)
-                if cutlass.const_expr(reg_prefix is not None and k_tile < len(reg_prefix)):
-                    a00, a01, a02, a03 = reg_prefix[k_tile]
-                elif cutlass.const_expr(gmem_q_tail):
-                    a00, a01, a02, a03 = load_glm_q_tile_gmem(
-                        q_token, head_base, lane, k_tile, valid_hpb=valid_hpb
-                    )
+                if cutlass.const_expr(reg_prefix is not None and blk * quant_tile // 16 + ks < 12):
+                    a00, a01, a02, a03 = reg_prefix[blk * quant_tile // 16 + ks]
                 else:
                     a00, a01, a02, a03 = ldmatrix_m8n8x4_b16(
-                        _smem_byte(
-                            q_nope_bf16_g0_addr,
-                            a_byte - Int32(len(reg_prefix) * 32 if reg_prefix is not None else 0),
-                        )
+                        _smem_byte(q_nope_bf16_g0_addr, a_byte - Int32(384 if reg_prefix is not None else 0))
                     )
                 t0[0], t0[1], t0[2], t0[3] = mma_m16n8k16_f32_bf16(
                     t0[0], t0[1], t0[2], t0[3], a00, a01, a02, a03, b0, b1

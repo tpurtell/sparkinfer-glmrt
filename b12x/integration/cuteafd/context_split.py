@@ -469,6 +469,9 @@ class _Partial:
         self.extra_page_bytes = 37440 if self.v4 else 0
         self.scale = (512 ** -0.5) if self.v4 else g.softmax_scale
         traits = v4_traits() if self.v4 else _traits(g)
+        if precision == "bf16":
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
         hpb = traits.hpb
         if heads % hpb:
             raise ValueError(f"head_count must be divisible by {hpb}")
@@ -478,59 +481,6 @@ class _Partial:
             h_blocks=heads // hpb, forced_num_splits=num_splits,
             sm_count=torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
         n, s = heads, self.splits
-        self.decode_compact = None
-        self.bf16_tag = ()
-        if precision == "bf16":
-            from b12x.attention._shared.mla.traits import with_bf16_attention
-            if self.v4:
-                traits = replace(
-                    with_bf16_attention(traits),
-                    q_nope_stride=traits.d_nope + traits.d_rope + 8,
-                    packed_bf16_decode=True,
-                )
-            elif chunks >= 2:
-                traits = replace(
-                    with_bf16_attention(traits),
-                    glm_record_ring=True,
-                    q_nope_stride=traits.d_nope + 8 - (192 if traits.d_rope else 0),
-                )
-            else:
-                from b12x.attention._shared.mla.native_v41_aot import (
-                    query_pv_bf16_eff_sms,
-                    resolve_pv_bf16_compact_launch_attrs,
-                )
-                traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
-                full_layout = make_smem_layout(traits)
-                arm_2cta = replace(
-                    traits,
-                    glm_compact_2cta=True,
-                    q_nope_stride=(16 if traits.d_rope else traits.q_nope_stride - 192),
-                )
-                compact_layout = make_smem_layout(arm_2cta)
-                min_blk_c, carve_c = resolve_pv_bf16_compact_launch_attrs(
-                    block_threads=int(traits.block_threads),
-                    compact_smem_bytes=int(compact_layout.total_bytes),
-                    full_smem_bytes=int(full_layout.total_bytes),
-                )
-                if min_blk_c >= 2:
-                    self._query_eff_sms = query_pv_bf16_eff_sms
-                    self.block_threads = int(traits.block_threads)
-                    self.compact_smem_bytes = int(compact_layout.total_bytes)
-                    self.ctas_per_row = (n // hpb) * s
-                    self.cache_symbol = f"_pv_bf16_ctx_sms_q{self.qk}"
-                    self.bf16_tag = ("compact2cta", min_blk_c)
-                    self.decode_compact = UnifiedDecodeKernel(
-                        arm_2cta, compact_layout, self.page_rows, chunks,
-                        h_blocks=n // hpb, num_splits=s, num_heads=n, q_head_dim=self.qk,
-                        topk=self.topk, extra_topk=self.extra_topk,
-                        q_stride=(g.heads * self.qk, self.qk, 1), swa_indices_stride0=self.topk,
-                        extra_indices_stride0=self.extra_topk if self.v4 else self.topk,
-                        mid_out_stride=(n*s*512, s*512, 512, 1), mid_lse_stride=(n*s, s, 1),
-                        has_extra=False, pbs_extra=1,
-                        valid_hpb=hpb, head_block_offset=0, per_token_len=True,
-                        native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
-                        native_dsv41_fp8=False, vector_q=True, zero_masked_v=True,
-                        min_blocks_per_mp=min_blk_c, preferred_smem_carveout=carve_c)
         self.decode = UnifiedDecodeKernel(
             traits, make_smem_layout(traits), self.page_rows, chunks,
             h_blocks=n // hpb, num_splits=s, num_heads=n, q_head_dim=self.qk,
@@ -541,7 +491,7 @@ class _Partial:
             has_extra=self.v4, pbs_extra=64 if self.v4 else 1,
             valid_hpb=hpb, head_block_offset=0, per_token_len=True,
             native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
-            native_dsv41_fp8=False, vector_q=True,
+            native_dsv41_fp8=False, vector_q=not (self.v4 and precision == "bf16"),
             zero_masked_v=(not self.v4 and precision == "bf16"))
         self.merge = _PartialMerge(n, s)
 
@@ -574,18 +524,6 @@ class _Partial:
                 cute.make_tensor(extra_indices, cute.make_layout((m,self.extra_topk), stride=(self.extra_topk,1))),
                 cute.make_tensor(extra_lengths, cute.make_layout((m,))),
                 Int32(2), Int64(self.extra_page_bytes), rows, stream)
-        elif cutlass.const_expr(self.decode_compact is not None):
-            eff_sms = self._query_eff_sms(
-                self.cache_symbol,
-                block_threads=self.block_threads,
-                compact_smem_bytes=self.compact_smem_bytes,
-            )
-            if eff_sms > Int32(0) and (rows * Int32(self.ctas_per_row)) > (Int32(2) * eff_sms):
-                self.decode_compact.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
-                                                Int64(self.page_bytes), rows, stream)
-            else:
-                self.decode.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
-                                        Int64(self.page_bytes), rows, stream)
         else:
             self.decode.call_pertok(qt, kv, ix, po, pl, scale, Float32(1), ln,
                                    Int64(self.page_bytes), rows, stream)
@@ -629,7 +567,7 @@ def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 
                                 head_begin, head_count, max_rows, launch.splits, launch.record_bytes,
                                 # The softmax scale is a geometry fact (GLM's 256^-0.5, Mistral Large 4's
                                 # 128^-0.5 at the same record): two scales are two programs.
-                                float(launch.scale)) + (("bf16", *launch.bf16_tag) if precision == "bf16" else ()),
+                                float(launch.scale)) + (("bf16",) if precision == "bf16" else ()),
                            geometry={"heads": g.heads, "head_begin": head_begin, "head_count": head_count,
                                      "record_bytes": launch.record_bytes, "num_splits": launch.splits,
                                      **({"attention_precision": "bf16"} if precision == "bf16" else {})},

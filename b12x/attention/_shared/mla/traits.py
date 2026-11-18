@@ -95,12 +95,10 @@ class UnifiedMLATraits:
     # over V dequantized in registers. False keeps every existing
     # specialization's layout and PTX.
     pv_bf16: bool = False
-    # DSV4 BF16 split decode packs 448 NoPE + 64 RoPE into one 512-wide swizzled BF16 slab.
+    # Indexed V4 split decode packs raw RoPE into the same 512-wide tile.
     packed_bf16_decode: bool = False
-    # Multi-chunk GLM/ML4 BF16 split decode double-buffers whole raw records.
+    # Multi-chunk GLM BF16 producer runs one full raw record tile ahead.
     glm_record_ring: bool = False
-    # Single-chunk multi-wave GLM/ML4 BF16 split decode fits 2 CTAs/SM under 48 KB SMEM.
-    glm_compact_2cta: bool = False
 
 
 def make_unified_traits(
