@@ -62,16 +62,50 @@ def test_bf16_attention_beats_fp8_on_identical_records(family, route):
             program = compile_glm_sparse_mla_aot(geometry, route=route, max_rows=rows, precision=precision)
         output = torch.empty((rows, heads, 512), device="cuda", dtype=torch.bfloat16)
         scratch = torch.empty(program.scratch_bytes(rows)["scratch"], device="cuda", dtype=torch.uint8)
-        if family == "v4":
-            program.launch(query, cache, indices, lengths, None, None, None,
-                           sink, output, scratch, scalars=(rows,))
-        else:
-            program.launch(query, cache, indices, lengths, output, scratch,
-                           scalars=(rows, rows) if route == "decode" else (rows,))
+        def launch(live_rows):
+            if family == "v4":
+                program.launch(query, cache, indices, lengths, None, None, None,
+                               sink, output, scratch, scalars=(live_rows,))
+            else:
+                program.launch(query, cache, indices, lengths, output, scratch,
+                               scalars=(live_rows, rows) if route == "decode" else (live_rows,))
+
+        launch(rows)
         torch.cuda.synchronize()
         assert torch.isfinite(output).all()
         errors[precision] = float((output.float() - expected).square().mean().sqrt()
                                   / expected.square().mean().sqrt())
+        if precision == "bf16":
+            eager = output.clone()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                launch(rows)
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+                launch(rows)
+            output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(output.view(torch.int16), eager.view(torch.int16))
+            output.fill_(float("nan"))
+            launch(3)
+            torch.cuda.synchronize()
+            assert torch.equal(output[:3].view(torch.int16), eager[:3].view(torch.int16))
+            assert torch.isnan(output[3:]).all()
+            lengths[0] = 0
+            indices[0].fill_(-1)
+            launch(rows)
+            torch.cuda.synchronize()
+            assert not torch.count_nonzero(output[0])
+            if route == "prefill":
+                row_lse = scratch.view(torch.float32).reshape(rows, heads)[0]
+                if family == "v4":
+                    # Sink contributes to normalization even with no real keys.
+                    assert torch.equal(row_lse, sink)
+                else:
+                    assert torch.isneginf(row_lse).all()
     print(f"{family}/{route}: F32 relative RMS {errors}")
     assert errors["bf16"] < .01, errors
     assert errors["bf16"] < errors["fp8"] * .6, errors
