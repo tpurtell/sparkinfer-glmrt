@@ -62,7 +62,8 @@ def write_json(path, data):
 
 
 def sha(path):
-    return hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+    with path.open("rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 def build_catalog(manifest):
