@@ -18,6 +18,7 @@ Decode/verify example::
 from __future__ import annotations
 
 import argparse
+import gc
 from dataclasses import asdict, replace
 import json
 import math
@@ -302,8 +303,18 @@ def run_decode_aot(args):
                                                "lse_rms": float(lse_delta.square().mean().sqrt()), "lse_max_abs": float(lse_delta.abs().max())}
                         graph = torch.cuda.CUDAGraph()
                         torch.cuda.synchronize()
-                        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
-                            execute(arm)
+                        # Python finalizers for old compiled CUDA modules must not
+                        # run during global-mode stream capture.
+                        collected = gc.isenabled()
+                        gc.disable()
+                        try:
+                            with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+                                execute(arm)
+                        except Exception as exc:
+                            raise RuntimeError(f"capture failed: {cell}/{kind}/{plan_rows}/{rows}/{arm}") from exc
+                        finally:
+                            if collected:
+                                gc.enable()
                         graph.replay()
                         graphs[arm] = graph
                     torch.cuda.synchronize()
