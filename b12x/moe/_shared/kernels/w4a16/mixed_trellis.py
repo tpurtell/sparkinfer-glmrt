@@ -53,6 +53,7 @@ from .kernel import (
     _cutlass_element_dtype,
     _fake_m_for_specialization,
     _trellis256_execution_lut,
+    _w4a16_small_m_splitk_enabled,
     compile_w4a16_topk_sum,
     pack_topk_routes_by_expert,
 )
@@ -2659,7 +2660,21 @@ def compile_mixed_trellis(
                 prerotate=ws_prerotate,
                 row_addresses=row_addresses,
             )
-        return W4A16MixedTrellisKernel(
+        cooperative = W4A16MixedTrellisKernel
+        if (
+            (hidden_size, intermediate_size, top_k, route_num_experts) == (3584, 512, 16, 896)
+            and activation == "situ" and bits == (2, 3) and trellis_codebook == "mcg"
+            and size_m in (1, 80) and moe_block_size == 8 and not direct_topk_routes
+            and not compact_weights and paired_boundary is None and not fused_input_rotation
+            and (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) == (64, 256, 64, 256)
+            and schedule == MixedTrellisDecodeSchedule(l2_evict_first_b=True)
+            and not _w4a16_small_m_splitk_enabled()
+            and torch.cuda.get_device_capability() == (12, 1)
+        ):
+            from .mixed_trellis_k2_slab import W4A16MixedTrellisK2Slab
+
+            cooperative = W4A16MixedTrellisK2Slab
+        return cooperative(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
             tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
