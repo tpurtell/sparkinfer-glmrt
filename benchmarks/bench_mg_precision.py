@@ -364,6 +364,40 @@ def critical_path_samples(rank_samples):
     return [max(a, b) for a, b in zip(*rank_samples, strict=True)]
 
 
+def context_cpu_reference(q, main, extra, sink, scale):
+    """Compute an independent scalar-row oracle before allocating output slabs."""
+    import torch
+    query = q.to(device="cpu", dtype=torch.float64)
+    parts = [(k.cpu(), v.cpu(), ids.cpu()) for k, v, ids in (main, *extra)]
+    sink = None if sink is None else sink.to(device="cpu", dtype=torch.float64)
+    output, lse = [], []
+    for row, qr in enumerate(query):
+        keys = torch.cat([k[ids[row].long()] for k, _, ids in parts]).double()
+        values = torch.cat([v[ids[row].long()] for _, v, ids in parts]).double()
+        logits = qr @ keys.T * scale
+        if sink is not None:
+            logits = torch.cat((logits, sink[:, None]), dim=-1)
+        output.append(logits.softmax(-1)[:, :len(values)] @ values)
+        lse.append(logits.logsumexp(-1))
+    return torch.stack(output), torch.stack(lse)
+
+
+def check_context_outputs(out, lse, combined, sink, rows):
+    """Check live stores, untouched inactive tails, and the independent merge."""
+    import torch
+    if not all(bool(x[:rows].isfinite().all() & x[rows:].isnan().all())
+               for x in (*out, *lse, combined)):
+        raise RuntimeError("context graph left poison in live rows or wrote an inactive row")
+    a, b = (x[:rows].double() * math.log(2) for x in lse)
+    norm = torch.logaddexp(a, b)
+    if sink is not None:
+        norm = torch.logaddexp(norm, sink.double()[None, :])
+    expected = sum(v[:rows].double() * (x - norm).exp()[..., None]
+                   for v, x in zip(out, (a, b), strict=True))
+    # The production fold accumulates in FP32 before one BF16 rounding.
+    torch.testing.assert_close(combined[:rows].double(), expected, rtol=0.004, atol=0.0005)
+
+
 def run_context_aot(args):
     import torch
     from cuda.bindings import driver as cuda
@@ -371,6 +405,7 @@ def run_context_aot(args):
     from b12x.integration.cuteafd import context_split as split, mistral_large4 as ml4
 
     torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_num_threads(min(torch.get_num_threads(), 4))
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
     capacity = 64
@@ -439,7 +474,14 @@ def run_context_aot(args):
                         score = torch.cat((score, sink[None, :, None].expand(hi-lo, -1, -1)), -1)
                     refs.append(torch.bmm(score.softmax(-1)[:, :, :main_width + extra_width], v))
                     lses.append(score.logsumexp(-1))
-                ref, ref_lse = torch.cat(refs), torch.cat(lses)
+                batched, batched_lse = torch.cat(refs), torch.cat(lses)
+                cpu_ref, cpu_lse = context_cpu_reference(
+                    q[:, begin:begin + half], (mk, mv, ix), ((ek, ev, ei),) if v4 else (), sink, scale)
+                # Retain the independent host oracle; its storage cannot alias a GPU slab.
+                torch.testing.assert_close(batched.cpu().double(), cpu_ref, rtol=1e-4, atol=2e-5)
+                torch.testing.assert_close(batched_lse.cpu().double(), cpu_lse, rtol=1e-5, atol=2e-5)
+                ref, ref_lse = cpu_ref.float().to(device), cpu_lse.float().to(device)
+                torch.cuda.synchronize()
                 for cap, splits in plans.items():
                     out = {(arm, rank): torch.empty_like(ref, dtype=torch.bfloat16) for arm in arms for rank in (0, 1)}
                     lse = {(arm, rank): torch.empty_like(ref_lse) for arm in arms for rank in (0, 1)}
@@ -473,9 +515,36 @@ def run_context_aot(args):
                                         gc.enable()
                                 graph.replay()
                                 graphs[arm, rank] = graph
-                            torch.cuda.synchronize()
-                            combine.launch(out[arm, 0], lse[arm, 0], out[arm, 1], lse[arm, 1], sink, combined,
-                                           scalars=(rows,))
+                            stream.synchronize()
+                            with torch.cuda.stream(stream):
+                                def reset_outputs():
+                                    for rank in (0, 1):
+                                        scratch[arm, rank].fill_(255)
+                                        out[arm, rank].fill_(float("nan"))
+                                        lse[arm, rank].fill_(float("nan"))
+                                    combined.fill_(float("nan"))
+
+                                def finish():
+                                    ranks = (out[arm, 0], out[arm, 1])
+                                    logs = (lse[arm, 0], lse[arm, 1])
+                                    combine.launch(ranks[0], logs[0], ranks[1], logs[1], sink, combined,
+                                                   scalars=(rows,), stream=handle)
+                                    check_context_outputs(ranks, logs, combined, sink, rows)
+                                    return (*ranks, *logs, combined)
+
+                                reset_outputs()
+                                for rank in (0, 1):
+                                    graphs[arm, rank].replay()
+                                observed = finish()
+                                # Sample the whole width and both sides of the former failure boundary.
+                                if rows in (1, 56, 57, 64):
+                                    snapshots = [x[:rows].clone() for x in observed]
+                                    reset_outputs()
+                                    for rank in (0, 1):
+                                        execute(arm, rank)
+                                    if not all(torch.equal(x[:rows], y) for x, y in zip(finish(), snapshots, strict=True)):
+                                        raise RuntimeError(f"context eager/replay mismatch: {family}/{begin}/{cap}/{rows}/{arm}")
+                            stream.synchronize()
                             actual_lse = torch.logaddexp(lse[arm, 0][:rows] * math.log(2), lse[arm, 1][:rows] * math.log(2))
                             if v4:
                                 actual_lse = torch.logaddexp(actual_lse, sink[None, :])
@@ -483,17 +552,21 @@ def run_context_aot(args):
                             ld = actual_lse - ref_lse[:rows]
                             if not bool(torch.isfinite(delta).all() & torch.isfinite(ld).all()):
                                 raise RuntimeError(f"nonfinite context result: {family}/{begin}/{cap}/{rows}/{arm}")
-                            rec["arms"][arm] = {"output_rel_rms": float(delta.square().mean().sqrt() / ref[:rows].square().mean().sqrt()),
+                            rms = float(delta.square().mean().sqrt() / ref[:rows].square().mean().sqrt())
+                            if rms >= (0.15 if arm == "fp8" else 0.02):
+                                raise RuntimeError(f"context oracle out of bounds: {family}/{balance}/{begin}/{cap}/{rows}/{arm}: {rms}")
+                            rec["arms"][arm] = {"output_rel_rms": rms,
                                 "lse_rms": float(ld.square().mean().sqrt()), "lse_max_abs": float(ld.abs().max())}
                         samples = {(arm, rank): [] for arm in arms for rank in (0, 1)}
                         for block in range(args.samples):
                             for arm in arms[::1 if (block + rows) % 2 else -1]:
                                 for rank in ((0, 1) if block % 2 == 0 else (1, 0)):
                                     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                                    start.record()
-                                    for _ in range(args.replays):
-                                        graphs[arm, rank].replay()
-                                    end.record()
+                                    with torch.cuda.stream(stream):
+                                        start.record(stream)
+                                        for _ in range(args.replays):
+                                            graphs[arm, rank].replay()
+                                        end.record(stream)
                                     end.synchronize()
                                     samples[arm, rank].append(start.elapsed_time(end) * 1000 / args.replays)
                         for arm in arms:
@@ -501,6 +574,7 @@ def run_context_aot(args):
                             critical = critical_path_samples(per_rank)
                             rec["arms"][arm].update(rank_samples_us=per_rank, rank_median_us=list(map(statistics.median, per_rank)),
                                 samples_us=critical, median_us=statistics.median(critical), min_us=min(critical), max_us=max(critical))
+                        stream.synchronize()
                         for graph in graphs.values():
                             graph.reset()
                         report["records"].append(rec)
