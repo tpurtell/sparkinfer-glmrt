@@ -12,11 +12,17 @@ from b12x._lib.intrinsics import (
     cp_async4_shared_global,
     cp_async4_shared_global_pred_l2hint,
     create_l2_evict_first_policy,
+    cvt_bf16x2_to_f16x2_via_f32,
+    f16x2_to_f32x2,
     get_ptr_as_int64,
+    half2_mul,
+    ld_global_nc_v2_u32,
     ld_shared_u32,
     st_shared_i32,
     ldmatrix_m8n8x2_b16,
     packed_dequant_trellis_to_half2x4,
+    pack_f32x2_to_f16x2,
+    st_global_v2_u32,
 )
 from .kernel import _SCALAR_ACC_FRAGMENT_WIDTH
 from .mixed_trellis import W4A16MixedTrellisKernel
@@ -32,6 +38,9 @@ class W4A16MixedTrellisK2Slab(W4A16MixedTrellisKernel):
         super().__init__(**kwargs)
         # Keep the original shared route metadata live across the main loop;
         # fold/store may reuse the slabs only after the final CTA rendezvous.
+        self.route_h128_rotation = (self.driver.rotation_input_dtype == "bf16"
+                                    and not self.driver.broadcast_suh
+                                    and not self.driver.coupled_hadamard)
         self.slab_offset = self.tier0.fc1.sh_b_off * 16
         assert self.slab_offset == self.tier0.fc2.sh_b_off * 16
         bank_bytes = self.BANK_BYTES + (4096 if self.size_m != 1 else 0)
@@ -39,7 +48,47 @@ class W4A16MixedTrellisK2Slab(W4A16MixedTrellisKernel):
 
     @property
     def __cache_key__(self):
-        return super().__cache_key__ + ("k2_m8_pair_slab_v2",)
+        return super().__cache_key__ + ("k2_m8_pair_slab_live_rotate_v3",)
+
+    @cute.jit
+    def _rotate_live_routes(self, x, gate, up, gate_suh, up_suh, ids, expert_map,
+                            n_global, n_combined, tid, cta, grid_x, active_m):
+        # Packing is useful to GEMM but pads a sparse expert to eight rows.
+        # Rotations write route-major scratch, so address the original top-k
+        # list directly. A CTA owns one route and eight adjacent H128 blocks.
+        nblk = self.hidden_size // 128
+        groups = (nblk + 7) // 8
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        unit = cta
+        while unit < active_m * Int32(self.top_k * groups):
+            route = unit // Int32(groups)
+            blk = (unit % Int32(groups)) * Int32(8) + warp
+            expert = Int32(-1)
+            global_id = ids[route].to(Int32)
+            if global_id >= Int32(0) and global_id < n_global:
+                expert = expert_map[global_id].to(Int32)
+            if expert >= Int32(0) and expert < n_combined and blk < Int32(nblk):
+                col = blk * Int32(128) + lane * Int32(4)
+                src = (route // Int32(self.top_k)) * Int32(self.hidden_size) + col
+                sc = expert * Int32(self.hidden_size) + col
+                dst = route * Int32(self.hidden_size) + col
+                w0, w1 = ld_global_nc_v2_u32(get_ptr_as_int64(x, src))
+                x0 = cvt_bf16x2_to_f16x2_via_f32(w0)
+                x1 = cvt_bf16x2_to_f16x2_via_f32(w1)
+                for proj in cutlass.range_constexpr(2):
+                    suh = gate_suh
+                    out = gate
+                    if cutlass.const_expr(proj == 1):
+                        suh = up_suh
+                        out = up
+                    s0, s1 = ld_global_nc_v2_u32(get_ptr_as_int64(suh, sc))
+                    v0, v1 = f16x2_to_f32x2(half2_mul(x0, s0))
+                    v2, v3 = f16x2_to_f32x2(half2_mul(x1, s1))
+                    h0, h1, h2, h3 = self.driver._had128_quad(v0, v1, v2, v3, lane)
+                    st_global_v2_u32(get_ptr_as_int64(out, dst),
+                                     pack_f32x2_to_f16x2(h0, h1), pack_f32x2_to_f16x2(h2, h3))
+            unit += grid_x
 
     def _dispatch_bound(self, is_fc1, combined_expert, gemm, compact_weight, *args):
         if gemm.trellis_bits == 2:

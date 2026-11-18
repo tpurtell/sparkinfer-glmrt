@@ -266,6 +266,7 @@ class W4A16MixedTrellisKernel:
     # version whenever the compiled argument or tensor-layout contract changes.
     ABI_VERSION = 21
     _token_major_rotation = False
+    route_h128_rotation = False
     pair_k2_route_blocks = False
     compact_weights = False
     COMPACT_DESCRIPTOR_ROWS = 7
@@ -1467,7 +1468,12 @@ class W4A16MixedTrellisKernel:
                 tier1_up_experts,
             )
         total_experts = tier0_num_experts + tier1_num_experts
-        if cutlass.const_expr(self.token_major_rotation):
+        if cutlass.const_expr(self.route_h128_rotation):
+            self._rotate_live_routes(rotation_input, rotation_gate, rotation_up,
+                                     gate_suh, up_suh, raw_topk_ids, global_to_combined,
+                                     route_num_experts, total_experts, tid, cta, grid_x, active_m)
+            self.driver._grid_barrier(workspace, tid, grid_x)
+        elif cutlass.const_expr(self.token_major_rotation):
             if active_m >= Int32(_TOKEN_MAJOR_ROTATION_MIN_ROWS):
                 self._run_input_rotation_token_major(
                     rotation_input,
@@ -1541,7 +1547,7 @@ class W4A16MixedTrellisKernel:
             active_m,
             fc1_emit,
             fc2_emit,
-            input_rotated=self.token_major_rotation,
+            input_rotated=self.token_major_rotation or self.route_h128_rotation,
             fc1_prefetch_tile=fc1_prefetch,
             fc2_prefetch_tile=fc2_prefetch,
         )
