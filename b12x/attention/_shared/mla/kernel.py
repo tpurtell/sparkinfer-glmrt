@@ -42,6 +42,8 @@ from .decode_math import (
     s0_quantize_q_to_smem,
     s0_quantize_q_vec,
     s1_qk_nope_block_scaled,
+    s1_qk_nope_bf16_mg2,
+    s6_xv_nope_nvfp4_bf16,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
     s2_qk_rope_bf16,
@@ -533,6 +535,7 @@ class UnifiedDecodeKernel:
         self.vector_q = bool(
             vector_q
             and not self.native_h16
+            and not traits.pv_bf16
             and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
         )
         self.vector_q_bf16 = bool(
@@ -1584,7 +1587,7 @@ class UnifiedDecodeKernel:
                 if cutlass.const_expr(has_extra):
                     if active_idx >= main_chunk_count:
                         ci = extra_first_chunk + active_idx - main_chunk_count
-                buf = Int32(0) if cutlass.const_expr(self.dsv41_bf16_tile) else (Int32(lc) & Int32(1))
+                buf = Int32(0) if cutlass.const_expr(n_buf == 1) else (Int32(lc) & Int32(1))
 
                 cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
 
@@ -1825,7 +1828,7 @@ class UnifiedDecodeKernel:
             if cutlass.const_expr(self.vector_q or self.vector_q_bf16):
                 pass
             elif cutlass.const_expr(
-                t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8
+                t.pv_bf16 or (t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8)
             ):
                 s0_load_q_bf16_to_smem(
                     q_token, q_fp8_stage, q_rope_stage, head_base_stage,
@@ -1874,7 +1877,7 @@ class UnifiedDecodeKernel:
                     if active_idx >= main_chunk_count:
                         ci = extra_first_chunk + active_idx - main_chunk_count
                 split_cand_start = ci * Int32(_CAND_WINDOW)
-                buf = Int32(0) if cutlass.const_expr(self.dsv41_bf16_tile) else (Int32(lc) & Int32(1))
+                buf = Int32(0) if cutlass.const_expr(n_buf == 1) else (Int32(lc) & Int32(1))
 
                 kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
                 kv_rope_b = kv_rope_addr + buf * kv_rope_buf
@@ -2137,7 +2140,17 @@ class UnifiedDecodeKernel:
                             packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
                         )
                 else:
-                    if cutlass.const_expr(self.dsv41_bf16_tile):
+                    if cutlass.const_expr(t.pv_bf16):
+                        qk, _unused = s1_qk_nope_bf16_mg2(
+                            qk, [Float32(0.0)] * 4, q_fp8_addr, q_fp8_addr,
+                            kv_fp8_b, kv_sc_b, warp_first_cand, lane,
+                            num_scales=t.num_scales, quant_tile=t.quant_tile,
+                            q_nope_bf16_stride=t.q_nope_stride,
+                            kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
+                            n_hg=1, inline_fp32_scale_offset=(
+                                t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
+                        )
+                    elif cutlass.const_expr(self.dsv41_bf16_tile):
                         qk = s1_qk_dsv41_bf16_smem(
                             qk,
                             q_fp8_addr,
@@ -2241,7 +2254,7 @@ class UnifiedDecodeKernel:
                         p[2] * wr1,
                         p[3] * wr1,
                     ]
-                    if cutlass.const_expr(self.dsv41_bf16_tile):
+                    if cutlass.const_expr(self.dsv41_bf16_tile or t.pv_bf16):
                         s5_fill_sm_p_bf16(
                             w_pre,
                             sm_p_full_addr,
@@ -2250,17 +2263,24 @@ class UnifiedDecodeKernel:
                             sm_p_stride=L.sm_p_full_stride,
                         )
                         cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                        acc_nope = s6_pv_dsv41_bf16_smem(
-                            acc_nope,
-                            sm_p_full_addr,
-                            kv_fp8_b,
-                            warp_id,
-                            lane,
-                            n_v_chunks=t.n_v_chunks,
-                            bi=t.bi,
-                            sm_p_stride=L.sm_p_full_stride,
-                            kv_bf16_stride=staged_kv_stride,
-                        )
+                        if cutlass.const_expr(t.pv_bf16):
+                            acc_nope = s6_xv_nope_nvfp4_bf16(
+                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane, latent_scale,
+                                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
+                                kv_smem_stride=staged_kv_stride, n_warps=8,
+                                nt_per_warp_xv=t.nt_per_warp_xv,
+                                sm_p_stride=L.sm_p_full_stride,
+                                inline_fp32_scale_offset=(
+                                    t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
+                                ue8m0_scales=t.scale_format == ScaleFormat.UE8M0_BYTE,
+                                kv_sc_base_addr=kv_sc_b,
+                            )
+                        else:
+                            acc_nope = s6_pv_dsv41_bf16_smem(
+                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane,
+                                n_v_chunks=t.n_v_chunks, bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride, kv_bf16_stride=staged_kv_stride,
+                            )
                     else:
                         s5_fill_sm_p_full(
                             w_pre,

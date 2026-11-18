@@ -225,7 +225,7 @@ class _Prefill:
 class _Decode:
     def __init__(self, g: GLMGeometry, max_rows: int, fp32_partials=False, full_launch_splits=None,
                  sm_count: int | None = None, plan_capacity_rows: int | None = None,
-                 zero_masked_v=False, elide_single_split=True):
+                 zero_masked_v=False, elide_single_split=True, precision="fp8"):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel
         from b12x.attention._shared.mla.merge import SparseMLASplitDecodeMergeKernel
         from b12x.attention._shared.mla.smem import make_smem_layout
@@ -236,6 +236,10 @@ class _Decode:
         self.partial_bytes = 4 if fp32_partials else 2
         self.heads, self.topk, self.qk = g.heads, _topk(g), _qk(g)
         traits = _traits(g)
+        if precision == "bf16":
+            from dataclasses import replace
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
         layout = make_smem_layout(traits)
         hpb = int(traits.hpb)
         if self.heads % hpb:
@@ -259,6 +263,8 @@ class _Decode:
             ))
             self.merges.append(SparseMLASplitDecodeMergeKernel(static_num_chunks=splits))
         self.key = ("decode", self.buckets, "fp32") if fp32_partials else ("decode", self.buckets)
+        if precision == "bf16":
+            self.key += ("bf16",)
         if zero_masked_v:
             self.key += ("zero_masked_v",)
         if self.elide_single_split and any(s == 1 for _, s, _ in self.buckets):
@@ -345,15 +351,16 @@ def compile_glm_sparse_mla_aot(g: GLMGeometry = GLM53, *, route: str = "prefill"
         raise ValueError("fp32_partials is supported only for GLM Flash decode")
     if full_launch_splits is not None and (route != "decode" or int(full_launch_splits) < 1):
         raise ValueError("full_launch_splits plans decode buckets: a split count of at least 1")
-    if precision not in ("fp8", "bf16") or (precision == "bf16" and route != "prefill"):
-        raise ValueError("precision is 'fp8' or, for the prefill route, 'bf16'")
+    if precision not in ("fp8", "bf16"):
+        raise ValueError("precision is 'fp8' or 'bf16'")
     if route == "prefill":
         launch = _Prefill(g, zero_masked_v, precision)
         zero_masked_v = launch.zero_masked_v
         buckets = ()
     elif route == "decode":
         launch = _Decode(g, int(max_rows), fp32_partials, full_launch_splits, sm_count,
-                         plan_capacity_rows, zero_masked_v=zero_masked_v, elide_single_split=elide_single_split)
+                         plan_capacity_rows, zero_masked_v=zero_masked_v, elide_single_split=elide_single_split,
+                         precision=precision)
         buckets = launch.buckets
     else:
         raise ValueError("route must be 'prefill' or 'decode'")

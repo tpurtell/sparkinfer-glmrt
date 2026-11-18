@@ -446,9 +446,9 @@ def with_bf16_attention(traits: UnifiedMLATraits) -> UnifiedMLATraits:
     dequantized to BF16 in registers, P is BF16 and both products accumulate
     in FP32.
     """
-    if int(traits.scale_format) != int(ScaleFormat.ARBITRARY_FP32):
+    if int(traits.scale_format) not in (int(ScaleFormat.ARBITRARY_FP32), int(ScaleFormat.UE8M0_BYTE)):
         raise ValueError(
-            "with_bf16_attention applies to inline-FP32-scale records; "
+            "with_bf16_attention applies to inline-FP32 or UE8M0-scale records; "
             f"got scale_format={traits.scale_format!r}"
         )
     return replace(traits, compute_mode=ComputeMode.BF16, pv_bf16=True)
