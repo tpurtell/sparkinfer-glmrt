@@ -23,7 +23,8 @@ SCALARS = ("rows", "rotation_id", "cta_limit")
 
 
 def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
-             sharded_side=1, rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
+             sharded_side=1, rotation_count=4, max_rows=4096, groups=1, input_dtype="f16",
+             compact_head_shard=False):
     values = (input_features, output_features, rotation_count, max_rows)
     if any(type(v) is not int or not 0 < v <= 2**31-1 for v in values):
         raise ValueError("trellis geometry must contain positive int32 dimensions")
@@ -33,6 +34,9 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
         raise ValueError("trellis requires K1--K8, mcg/mul1/e4m3/f16, side 1/2 and groups 1/4")
     if input_dtype not in ("f16", "bf16"):
         raise ValueError("trellis input dtype must be f16 or bf16")
+    if compact_head_shard and (input_features != 4608 or bits not in (6, 8)
+            or codebook != "mcg" or input_dtype != "bf16" or sharded_side != 1 or groups != 1):
+        raise ValueError("compact head shards require output-sharded Inkling BF16 K6/K8 MCG geometry")
     splits = (input_features + 1023) // 1024
     tasks = (max_rows + 15) // 16 * (output_features // 128) * splits * groups
     if max(tasks, max_rows * (output_features // 128) * groups, input_features * output_features // 256) > (2**31-1)//2:
@@ -44,7 +48,8 @@ def geometry(input_features, output_features, *, bits=4, codebook="e4m3",
                 output_features=output_features, bits=bits, codebook=codebook,
                 sharded_side=sharded_side, rotation_count=rotation_count,
                 max_rows=max_rows, split_k_blocks=8, splits=splits, input_dtype=input_dtype,
-                ctas_per_sm=CTAS_PER_SM, **({"groups": groups} if groups != 1 else {}))
+                ctas_per_sm=CTAS_PER_SM, **({"groups": groups} if groups != 1 else {}),
+                **({"compact_head_shard": True} if compact_head_shard else {}))
 
 
 class _Pointers:
@@ -100,10 +105,12 @@ class _GroupedPointers:
 
 def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                                codebook="e4m3", sharded_side=1,
-                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16"):
+                               rotation_count=4, max_rows=4096, groups=1, input_dtype="f16",
+                               compact_head_shard=False):
     g = geometry(input_features, output_features, bits=bits, codebook=codebook,
                  sharded_side=sharded_side, rotation_count=rotation_count,
-                 max_rows=max_rows, groups=groups, input_dtype=input_dtype)
+                 max_rows=max_rows, groups=groups, input_dtype=input_dtype,
+                 compact_head_shard=compact_head_shard)
     k, n, s = g["input_features"], g["output_features"], g["splits"]
     if groups == 1:
         operands = (

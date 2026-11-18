@@ -180,8 +180,9 @@ def decode_route_thresholds(g):
         if (g["codebook"] == "mcg" and g.get("input_dtype") == "bf16" and
                 (k, n, g["sharded_side"]) in _K6_VERIFY_WIDE1):
             narrow = True
-        if ((k, n, g["sharded_side"]) == (4608, 201088, 1) and
-                g["codebook"] == "mcg" and g.get("input_dtype") == "bf16"):
+        if (g.get("compact_head_shard") or
+                ((k, n, g["sharded_side"]) == (4608, 201088, 1) and
+                 g["codebook"] == "mcg" and g.get("input_dtype") == "bf16")):
             edges.append(56)
         low_route, wide_verify = _k6_selective_routes(g)
         if (narrow or low_route or wide_verify) and _K6_NARROW_ROWS < edge:
@@ -991,7 +992,8 @@ class NativeTrellisLinear:
         self.decode_rows = decode_rows(g)
         self.parallel_k128 = _uses_parallel_k128(g)
         self.k6_low_route, self.k6_wide_verify = _k6_selective_routes(g)
-        self.compact_head = (self.k == 4608 and self.n == 201088 and self.bits in (6, 8)
+        self.compact_head_shard = g.get("compact_head_shard", False)
+        self.compact_head = self.compact_head_shard or (self.k == 4608 and self.n == 201088 and self.bits in (6, 8)
                              and self.input_bf16 and g["codebook"] == "mcg"
                              and g["sharded_side"] == 1 and g.get("groups", 1) == 1)
         self.verify_wide1 = (self.input_bf16 and g["codebook"] == "mcg" and
@@ -1097,7 +1099,7 @@ class NativeTrellisLinear:
                     if cutlass.const_expr(
                         self.bits == 8
                         and not self.e4m3
-                        and self.k * self.n * self.bits > 256 * 1024 * 1024 * 8
+                        and (self.compact_head_shard or self.k * self.n * self.bits > 256 * 1024 * 1024 * 8)
                         and self.n % 128 == 0
                     ):
                         prefill_tiles_128 = ((rows + Int32(127)) // Int32(128)) * Int32(self.n // 128)
@@ -1122,7 +1124,12 @@ class NativeTrellisLinear:
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if cutlass.const_expr(self.compact_head):
             if rows <= Int32(16):
-                if cutlass.const_expr(self.bits == 8):
+                # Shard width affects grid and addressing, not the K fold.
+                if cutlass.const_expr(self.compact_head_shard and self.bits == 6):
+                    self._legacy(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                elif cutlass.const_expr(self.compact_head_shard and self.bits == 8):
+                    self._launch_k8_mult(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                elif cutlass.const_expr(self.bits == 8):
                     self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
                 else:
                     self._decode_k6(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
@@ -1289,7 +1296,7 @@ class NativeTrellisLinear:
             self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-        elif rows <= Int32(self.decode_rows):
+        elif rows <= Int32(16 if self.compact_head_shard else self.decode_rows):
             self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
                 grid=(min(tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
@@ -4920,7 +4927,7 @@ class NativeTrellisLinear:
         tiles = Int32(self.n // 128 * self.splits)
         # 481-672 tiles keep the shuffle-free 2-CTA/SM wave (576 and 672 tiles
         # measured); K1536 x N>=16384 (12 K blocks, wide N) loses 4-7% to shuffles.
-        if cutlass.const_expr(self.n > 65536 or (480 < (self.n // 128) * self.splits <= 672)
+        if cutlass.const_expr(self.compact_head_shard or self.n > 65536 or (480 < (self.n // 128) * self.splits <= 672)
                               or (self.k == 1536 and self.n >= 16384)):
             self.multiply(inputs, payload, scales, partial, rows, rotation_id, False).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
@@ -4938,7 +4945,7 @@ class NativeTrellisLinear:
             self.multiply(inputs, payload, scales, partial, rows, rotation_id, True).launch(
                 grid=(min(((rows + Int32(15)) // Int32(16)) * tiles, cta_limit), 1, 1),
                 block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
-        if cutlass.const_expr(480 < (self.n // 128) * self.splits <= 672):
+        if cutlass.const_expr(not self.compact_head_shard and 480 < (self.n // 128) * self.splits <= 672):
             if rows <= Int32(2):
                 self.reduce_nc_128(partial, output, rows).launch(
                     grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
