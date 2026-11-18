@@ -12,6 +12,8 @@ to the caller; launches neither allocate nor resolve kernels.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -450,7 +452,7 @@ def sparse_mla_partial_split_plan(g=GLM53, *, max_rows: int, head_count: int, sm
 
 
 class _Partial:
-    def __init__(self, g, max_rows: int, begin: int, heads: int, num_splits: int | None):
+    def __init__(self, g, max_rows: int, begin: int, heads: int, num_splits: int | None, precision: str):
         from b12x.attention._shared.mla.kernel import UnifiedDecodeKernel, plan_unified_decode_splits
         from b12x.attention._shared.mla.smem import make_smem_layout
         from ._common import DSV4Geometry
@@ -467,6 +469,9 @@ class _Partial:
         self.extra_page_bytes = 37440 if self.v4 else 0
         self.scale = (512 ** -0.5) if self.v4 else g.softmax_scale
         traits = v4_traits() if self.v4 else _traits(g)
+        if precision == "bf16":
+            from b12x.attention._shared.mla.traits import with_bf16_attention
+            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
         hpb = traits.hpb
         if heads % hpb:
             raise ValueError(f"head_count must be divisible by {hpb}")
@@ -486,7 +491,8 @@ class _Partial:
             has_extra=self.v4, pbs_extra=64 if self.v4 else 1,
             valid_hpb=hpb, head_block_offset=0, per_token_len=True,
             native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
-            native_dsv41_fp8=False, vector_q=True)
+            native_dsv41_fp8=False, vector_q=not (self.v4 and precision == "bf16"),
+            zero_masked_v=(not self.v4 and precision == "bf16"))
         self.merge = _PartialMerge(n, s)
 
     def scratch_bytes(self, rows):
@@ -525,7 +531,8 @@ class _Partial:
 
 
 def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 0,
-                                   head_count: int | None = None, num_splits: int | None = None):
+                                   head_count: int | None = None, num_splits: int | None = None,
+                                   precision: str = "fp8"):
     """Normalized partial + base2 LSE, no sink. ABI: q BF16 [R,H,D],
     cache u8 [P,page_bytes], indices i32 [R,K], lengths i32 [R], extra_cache,
     extra_indices, extra_lengths (ignored for GLM), out BF16 [R,N,512],
@@ -541,7 +548,9 @@ def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 
         raise ValueError("positive capacity and an in-bounds head range required")
     if num_splits is not None and num_splits <= 0:
         raise ValueError("num_splits must be positive")
-    launch = _Partial(g, int(max_rows), int(head_begin), head_count, num_splits)
+    if precision not in ("fp8", "bf16"):
+        raise ValueError("precision must be 'fp8' or 'bf16'")
+    launch = _Partial(g, int(max_rows), int(head_begin), head_count, num_splits, precision)
     operands = (Operand("q", torch.bfloat16, f"[rows,{g.heads},{launch.qk}]"),
                 Operand("cache", torch.uint8, f"[pages,{launch.page_bytes}]"),
                 Operand("indices", torch.int32, f"[rows,{launch.topk}]", align=4),
@@ -558,9 +567,10 @@ def compile_sparse_mla_partial_aot(g=GLM53, *, max_rows: int, head_begin: int = 
                                 head_begin, head_count, max_rows, launch.splits, launch.record_bytes,
                                 # The softmax scale is a geometry fact (GLM's 256^-0.5, Mistral Large 4's
                                 # 128^-0.5 at the same record): two scales are two programs.
-                                float(launch.scale)),
+                                float(launch.scale)) + (("bf16",) if precision == "bf16" else ()),
                            geometry={"heads": g.heads, "head_begin": head_begin, "head_count": head_count,
-                                     "record_bytes": launch.record_bytes, "num_splits": launch.splits},
+                                     "record_bytes": launch.record_bytes, "num_splits": launch.splits,
+                                     **({"attention_precision": "bf16"} if precision == "bf16" else {})},
                            scratch={"scratch": launch.scratch_bytes}, doc=compile_sparse_mla_partial_aot.__doc__)
 
 
