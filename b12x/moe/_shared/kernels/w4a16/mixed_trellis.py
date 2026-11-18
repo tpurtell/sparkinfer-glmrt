@@ -266,6 +266,7 @@ class W4A16MixedTrellisKernel:
     # version whenever the compiled argument or tensor-layout contract changes.
     ABI_VERSION = 21
     _token_major_rotation = False
+    pair_k2_route_blocks = False
     compact_weights = False
     COMPACT_DESCRIPTOR_ROWS = 7
 
@@ -1353,6 +1354,8 @@ class W4A16MixedTrellisKernel:
             phase_lut_addr = Int64(
                 smem_base + Int32(self.driver.sqg_xor_cheb_t12_smem_off)
             )
+        if cutlass.const_expr(self.pair_k2_route_blocks and self.size_m != 1):
+            self._k2_route_blocks = (block_expert_ids, packed_route_count)
         fc1_a = rotation_gate
         fc1_a_alt = rotation_up
         if cutlass.const_expr(self.driver.fused_input_rotation):
