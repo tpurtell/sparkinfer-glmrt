@@ -407,11 +407,18 @@ def aggregate(cells):
             if sum(c["rank1_count"] for c in mix) != sum(KIMI.values()):
                 continue
             for rows in ROWS:
+                arms = mix[0]["rows"][rows]
+                sums = {a: sum(c["rows"][rows][a]["us"]*c["rank1_count"] for c in mix) for a in arms}
+                blocks = {
+                    a: [sum(v*c["rank1_count"] for v, c in zip(values, mix, strict=True))
+                        for values in zip(*(c["rows"][rows][a]["blocks_us"] for c in mix), strict=True)]
+                    for a in arms
+                }
                 output.append(dict(bits=bits, codebook=book, rows=rows,
-                    rank1_ms={a: sum(c["rows"][rows][a]["us"]*c["rank1_count"] for c in mix)/1000
-                              for a in mix[0]["rows"][rows]},
-                    per_layer_us={a: sum(c["rows"][rows][a]["us"]*c["rank1_count"] for c in mix)/93
-                                  for a in mix[0]["rows"][rows]},
+                    rank1_ms={a: v/1000 for a, v in sums.items()},
+                    per_layer_us={a: v/93 for a, v in sums.items()},
+                    baseline_over_arm_blocks={a: [x/y for x, y in zip(blocks["baseline"], v, strict=True)]
+                                              for a, v in blocks.items()},
                     one_read_ms=sum(c["one_read_us"]*c["rank1_count"] for c in mix)/1000))
     return output
 
