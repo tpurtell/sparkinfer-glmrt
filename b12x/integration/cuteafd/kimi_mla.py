@@ -641,7 +641,9 @@ def compile_kimi_mla_output_aot(g=KimiMlaGeometry(), *, max_rows=64):
         geometry=vars(g))
 
 
-def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=1048576, mode="decode"):
+def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=1048576, mode="decode", precision="fp8"):
+    if precision not in ("fp8", "bf16"):
+        raise ValueError("precision must be fp8 or bf16")
     layout = attention_layout(g, max_rows, max_context=max_context, mode=mode)
     smem = dense_mla_layout(g, max_rows, mode=mode)
     operands = (
@@ -654,7 +656,7 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
         Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]", "out"),
         Operand("lse", torch.float32, f"[rows,{g.heads}]", "out"),
         Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"))
-    native_fp8_extend = (g.kv_cache == "fp8" and mode == "extend"
+    native_fp8_extend = (precision == "fp8" and g.kv_cache == "fp8" and mode == "extend"
                          and not isinstance(g, MlaDraftGeometry))
     if native_fp8_extend:
         # Compact records on the causal extend route read FP8 natively (no
@@ -678,7 +680,8 @@ def compile_kimi_dense_mla_aot(g=KimiMlaGeometry(), *, max_rows=64, max_context=
              smem.kv_stages, smem.heads_per_tile, smem.candidates_per_chunk,
              smem.math_warps_per_query),
         scratch={"scratch": lambda rows: attention_layout(g, rows, max_context=max_context, mode=mode)["scratch_bytes"]},
-        geometry={**vars(g), **layout, "mode": mode, "max_context": max_context})
+        geometry={**vars(g), **layout, "mode": mode, "max_context": max_context,
+                  **({"attention_precision": "bf16"} if precision == "bf16" else {})})
 
 
 KIMI_CONTEXT_H16_MIN_ROWS = 4
