@@ -95,6 +95,8 @@ class UnifiedMLATraits:
     # over V dequantized in registers. False keeps every existing
     # specialization's layout and PTX.
     pv_bf16: bool = False
+    # Indexed V4 split decode packs raw RoPE into the same 512-wide tile.
+    packed_bf16_decode: bool = False
 
 
 def make_unified_traits(

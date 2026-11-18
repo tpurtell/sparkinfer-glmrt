@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Uint16, Uint32
+from cutlass import Float32, Int32, Int64, Uint32
 
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -529,36 +529,35 @@ def _scale_e4m3_pair_bf16(code: Uint32, factor: Uint32, *, loc=None, ip=None):
 
 
 @cute.jit
-def expand_decode_v_tile(base: Int32, sc_base: Int32, warp: Int32, lane: Int32, *,
-                         d_nope: cutlass.Constexpr, row_stride: cutlass.Constexpr,
-                         inline_fp32: cutlass.Constexpr):
-    """Widen each raw row in place. One warp owns its 8 QK candidates."""
+def expand_v4_tile(base: Int32, sc_base: Int32, tok: cute.Tensor, warp: Int32, lane: Int32, *,
+                   row_stride: cutlass.Constexpr, packed: cutlass.Constexpr):
+    """Each warp owns exactly its eight QK rows. Save raw bytes before expanding in place."""
     for ri in cutlass.range(8, unroll=1):
         row = warp * Int32(8) + Int32(ri)
         ptr = base + row * Int32(row_stride)
-        # Read both halves before expanding over the raw record. GLM's
-        # group scales at +512 must also survive until these loads.
+        valid = True
+        if cutlass.const_expr(packed):
+            valid = tok[row] >= Int32(0)
         groups = []
         for half in cutlass.range_constexpr(2):
             vec = lane + Int32(half * 32)
             lo, hi = ld_shared_v2_u32(ptr + vec * Int32(8))
-            if cutlass.const_expr(inline_fp32):
-                scale = ld_shared_f32(ptr + Int32(d_nope) + (vec >> Int32(4)) * Int32(4))
-                a, b = dequant_kv_e4m3_pair_to_bf16x2(Uint16(lo), Uint16(lo >> Uint32(16)), scale)
-                c, d = dequant_kv_e4m3_pair_to_bf16x2(Uint16(hi), Uint16(hi >> Uint32(16)), scale)
-            else:
-                # Match the source path's exponent-bit expansion, including zero.
-                exp = ld_shared_u8_offset(sc_base + row * Int32(8) + (vec >> Int32(3)), 0)
-                sf = (exp << Uint32(7)) | (exp << Uint32(23))
-                a = _scale_e4m3_pair_bf16(lo, sf)
-                b = _scale_e4m3_pair_bf16(lo >> Uint32(16), sf)
-                c = _scale_e4m3_pair_bf16(hi, sf)
-                d = _scale_e4m3_pair_bf16(hi >> Uint32(16), sf)
+            exp = ld_shared_u8_offset(sc_base + row * Int32(8) + (vec >> Int32(3)), 0)
+            sf = (exp << Uint32(7)) | (exp << Uint32(23))
+            a = _scale_e4m3_pair_bf16(lo, sf)
+            b = _scale_e4m3_pair_bf16(lo >> Uint32(16), sf)
+            c = _scale_e4m3_pair_bf16(hi, sf)
+            d = _scale_e4m3_pair_bf16(hi >> Uint32(16), sf)
+            if cutlass.const_expr(packed):
+                if half == 1 and lane >= Int32(24):
+                    a, b, c, d = ld_shared_v4_u32(ptr + Int32(448) + (lane & Int32(7)) * Int32(16))
+                if not valid:
+                    a, b, c, d = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
             groups.append((a, b, c, d))
         cute.arch.sync_warp()
         for half in cutlass.range_constexpr(2):
             vec = lane + Int32(half * 32)
-            if vec < Int32(d_nope // 8):
+            if vec < Int32(64 if packed else 56):
                 a, b, c, d = groups[half]
                 st_shared_v4_u32(ptr + (vec ^ (row & Int32(7))) * Int32(16), a, b, c, d)
 

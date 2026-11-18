@@ -249,7 +249,8 @@ class _Decode:
         traits = plan.traits
         if precision == "bf16":
             from b12x.attention._shared.mla.traits import with_bf16_attention
-            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + 8)
+            traits = replace(with_bf16_attention(traits), q_nope_stride=traits.d_nope + (traits.d_rope if self.has_extra else 0) + 8,
+                             packed_bf16_decode=self.has_extra)
             plan = replace(plan, traits=traits, native_dsv4_h8=False, native_dsv4_h16=False,
                            hpb=16, h_blocks_full=self.heads // 16, rem_heads=self.heads % 16,
                            vector_q=True)

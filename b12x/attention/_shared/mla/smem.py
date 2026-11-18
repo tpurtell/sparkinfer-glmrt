@@ -204,7 +204,9 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     num_scales = traits.num_scales
     n_v_chunks = traits.n_v_chunks
     # BF16 split decode widens each row in place, after its last raw read.
-    kv_smem_stride = 2 * traits.d_nope if traits.pv_bf16 else traits.kv_smem_stride
+    kv_smem_stride = traits.kv_smem_stride
+    if traits.pv_bf16 and traits.scale_format == ScaleFormat.UE8M0_BYTE:
+        kv_smem_stride = 2 * (traits.d_nope + (d_rope if traits.packed_bf16_decode else 0))
     q_nope_stride = traits.q_nope_stride
     bufs = 1 if traits.pv_bf16 else _KV_BUF_COUNT
 
@@ -275,7 +277,7 @@ def make_smem_layout(traits: UnifiedMLATraits) -> SmemLayout:
     # --- Double-buffered KV rope (bf16) linear entry*D_ROPE + d. ---
     kv_rope_off = off
     kv_rope_stride = d_rope if d_rope else 1
-    kv_rope_buf_bytes = bi * kv_rope_stride * 2
+    kv_rope_buf_bytes = 16 if traits.packed_bf16_decode else bi * kv_rope_stride * 2
     off = kv_rope_off + kv_rope_buf_bytes * bufs
 
     # --- P6 mbarrier pair placeholder (16B aligned; reserved, unused in P5). ---
