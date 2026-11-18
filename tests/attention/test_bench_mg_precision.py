@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.bench_mg_precision import SOURCE, aot_cell_seed, arm_traits, critical_path_samples, decode_arm_traits, parse_args
+from benchmarks.bench_mg_precision import SOURCE, aot_cell_seed, arm_traits, context_cpu_reference, critical_path_samples, decode_arm_traits, parse_args
 from b12x.attention._shared.mla.traits import ComputeMode, ModelType
 
 
@@ -167,3 +167,14 @@ assert torch.equal(cold.view(torch.int16), out.view(torch.int16)), "cold graph d
     result = subprocess.run([sys.executable, "-c", child, family], env=env,
                             capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_context_reference_respects_ordered_indices_and_sink():
+    import torch
+    q = torch.tensor([[[0.]], [[1.]]])
+    k, v = torch.tensor([[0.], [1.]]), torch.tensor([[2.], [5.]])
+    ids = torch.tensor([[0, 1], [1, 1]])
+    output, lse = context_cpu_reference(q, (k, v, ids), (), torch.zeros(1), 1.)
+    score = torch.tensor([[0., 0., 0.], [1., 1., 0.]], dtype=torch.float64)
+    torch.testing.assert_close(lse[:, 0], score.logsumexp(-1))
+    torch.testing.assert_close(output[:, 0, 0], (score.softmax(-1) * torch.tensor([[2., 5., 0.], [5., 5., 0.]])).sum(-1))

@@ -366,20 +366,25 @@ def critical_path_samples(rank_samples):
 
 def context_cpu_reference(q, main, extra, sink, scale):
     """Compute an independent scalar-row oracle before allocating output slabs."""
+    import numpy as np
     import torch
-    query = q.to(device="cpu", dtype=torch.float64)
-    parts = [(k.cpu(), v.cpu(), ids.cpu()) for k, v, ids in (main, *extra)]
-    sink = None if sink is None else sink.to(device="cpu", dtype=torch.float64)
+    query = q.to(device="cpu", dtype=torch.float64).numpy()
+    parts = [(k.cpu().numpy(), v.cpu().numpy(), ids.cpu().numpy()) for k, v, ids in (main, *extra)]
+    sink = None if sink is None else sink.to(device="cpu", dtype=torch.float64).numpy()
     output, lse = [], []
     for row, qr in enumerate(query):
-        keys = torch.cat([k[ids[row].long()] for k, _, ids in parts]).double()
-        values = torch.cat([v[ids[row].long()] for _, v, ids in parts]).double()
-        logits = qr @ keys.T * scale
+        keys = np.concatenate([k[ids[row]] for k, _, ids in parts]).astype(np.float64)
+        values = np.concatenate([v[ids[row]] for _, v, ids in parts]).astype(np.float64)
+        # Unoptimized einsum deliberately avoids both Torch GEMM and BLAS dispatch.
+        logits = np.einsum("hd,kd->hk", qr, keys, optimize=False) * scale
         if sink is not None:
-            logits = torch.cat((logits, sink[:, None]), dim=-1)
-        output.append(logits.softmax(-1)[:, :len(values)] @ values)
-        lse.append(logits.logsumexp(-1))
-    return torch.stack(output), torch.stack(lse)
+            logits = np.concatenate((logits, sink[:, None]), axis=-1)
+        maximum = logits.max(axis=-1, keepdims=True)
+        mass = np.exp(logits - maximum)
+        norm = mass.sum(axis=-1, keepdims=True)
+        output.append(np.einsum("hk,kd->hd", (mass / norm)[:, :len(values)], values, optimize=False))
+        lse.append((maximum + np.log(norm)).squeeze(-1))
+    return torch.from_numpy(np.stack(output)), torch.from_numpy(np.stack(lse))
 
 
 def check_context_outputs(out, lse, combined, sink, rows):
