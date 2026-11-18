@@ -427,8 +427,8 @@ def main():
     p.add_argument('--host', help='physical host name when running inside a container')
     p.add_argument('--json', type=Path, required=True)
     args = p.parse_args()
-    if not all(1 <= rows <= 64 for rows in args.rows) or args.iterations < 1 or args.blocks < 2:
-        p.error('rows must be in 1..64, iterations positive and blocks >=2')
+    if not all(1 <= rows <= 80 for rows in args.rows) or args.iterations < 1 or args.blocks < 2:
+        p.error('rows must be in 1..80, iterations positive and blocks >=2')
     if not ({1, 80} <= set(args.candidate_capacities) <= set(range(1, 81))):
         p.error('candidate capacities must include 1 and 80 and fit the decode band')
     import torch
