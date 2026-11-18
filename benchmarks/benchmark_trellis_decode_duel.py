@@ -11,6 +11,7 @@ import argparse
 from collections import defaultdict
 import concurrent.futures
 import ctypes as C
+import csv
 import hashlib
 import importlib.util
 import json
@@ -414,6 +415,29 @@ def aggregate(cells):
     return output
 
 
+def table(input_path, output_path):
+    report = read_json(input_path)
+    if not report["completed"]:
+        raise ValueError("incomplete measurement report")
+    with output_path.open("w", newline="") as f:
+        rows = csv.writer(f, delimiter="\t")
+        rows.writerow(("family", "shipping", "role", "program", "K", "N", "bits", "book", "side",
+                       "groups", "rows", "arm", "us", "GB/s", "one_read_us", "paired_speedup",
+                       "paired_min", "paired_max", "invariant", "max_abs", "rms", "worse_max", "worse_rms"))
+        for c in report["cells"]:
+            p = c["params"]
+            for m, arms in c["rows"].items():
+                for arm, s in arms.items():
+                    o = c["oracle"][arm][m]
+                    rows.writerow((c["family"], c["shipping"], c["role"], c["program"],
+                                   p["input_features"], p["output_features"], p["bits"], p["codebook"],
+                                   p["sharded_side"], p.get("groups", 1), m, arm,
+                                   round(s["us"], 4), round(s["gbs"], 3), round(c["one_read_us"], 4),
+                                   s["baseline_over_arm"], s["paired_min"], s["paired_max"],
+                                   o["row_invariant"], o["max_abs"], o["rms"],
+                                   o.get("worse_max_outputs", 0), o.get("worse_rms_outputs", 0)))
+
+
 def run(args, catalog, arms, bundles):
     import torch
     from cuda.bindings import driver
@@ -459,19 +483,27 @@ def run(args, catalog, arms, bundles):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=("catalog", "compile", "check", "run"))
-    p.add_argument("--catalog", type=Path, required=True)
+    p.add_argument("command", choices=("catalog", "compile", "check", "run", "table"))
+    p.add_argument("--catalog", type=Path)
     p.add_argument("--manifest", type=Path)
     p.add_argument("--bundle", type=Path)
     p.add_argument("--source-sha")
     p.add_argument("--jobs", type=int, default=4)
     p.add_argument("--arm", action="append", default=[], metavar="NAME=PATH")
     p.add_argument("--output", type=Path)
+    p.add_argument("--input", type=Path)
     p.add_argument("--blocks", type=int, default=6)
     p.add_argument("--intervals", type=int, default=12)
     p.add_argument("--dram-gbs", type=float, default=1792.)
     p.add_argument("--only", help="restrict to program names containing this string (pilot only)")
     args = p.parse_args()
+    if args.command == "table":
+        if not args.input or not args.output:
+            p.error("table requires --input and --output")
+        table(args.input, args.output)
+        return
+    if not args.catalog:
+        p.error("--catalog is required")
     if args.command == "catalog":
         write_json(args.catalog, build_catalog(args.manifest))
         return
