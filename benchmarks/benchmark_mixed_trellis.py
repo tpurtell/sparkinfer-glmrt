@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes as c
+from collections import Counter
 import hashlib
 import json
 import re
@@ -512,6 +514,254 @@ def _make_kimi_layer(seed: int, device: torch.device, bits=KIMI_BITS):
     )
     rotations = combine_trellis_rotations(tier0, tier1)
     return tier0, tier1, global_to_combined, descriptor, rotations
+
+
+def check(ok, message):
+    if not ok:
+        raise RuntimeError(message)
+
+
+def native_call(fn, *args):
+    code = fn(*args)
+    check(code == 0, f'{fn.__name__} failed: {code}')
+
+
+def bind(lib, name, types, result=c.c_int):
+    fn = getattr(lib, 'cuteafd_exl3_' + name)
+    fn.argtypes, fn.restype = types, result
+    return fn
+
+
+def _make_kimi_replay_weights(torch, seed):
+    device = 'cuda'
+    rng = torch.Generator(device=device).manual_seed(seed)
+    descriptors = torch.full((3, KIMI_EXPERTS * 2), -1, device=device, dtype=torch.int32)
+    expert_map = torch.arange(KIMI_EXPERTS, device=device, dtype=torch.int32)
+    descriptors[:, :KIMI_EXPERTS] = expert_map  # tier bit zero for all three projections
+
+    def rotation(shape, normalizer=1.0):
+        # Nonuniform finite signed K2 rotation/scaling operands; bound the
+        # down projection so random words do not create pathological activations.
+        values = torch.rand(shape, device=device, generator=rng) * .50 + .75
+        signs = torch.randint(0, 2, shape, device=device, generator=rng) * 2 - 1
+        return (values * signs * normalizer).half()
+
+    ptr = dict(descriptor_map_ptr=descriptors, global_to_combined_ptr=expert_map,
+               expert_map_ptr=expert_map, intermediate_rotations_ptr=rotation((2 * KIMI_EXPERTS, 3 * KIMI_INTERMEDIATE)),
+               gate_suh_ptr=rotation((2 * KIMI_EXPERTS, KIMI_HIDDEN)), up_suh_ptr=rotation((2 * KIMI_EXPERTS, KIMI_HIDDEN)),
+               svh_ptr=rotation((2 * KIMI_EXPERTS, KIMI_HIDDEN), .01))
+    scalar = dict(route_num_experts=KIMI_EXPERTS, weight_num_experts=2 * KIMI_EXPERTS)
+    plane_words = KIMI_HIDDEN * KIMI_INTERMEDIATE * 2 // 32
+    zeros = torch.zeros(16, device=device, dtype=torch.uint8)
+    ones = torch.ones(KIMI_EXPERTS, device=device, dtype=torch.float32)
+    for tier, count in enumerate((KIMI_EXPERTS, 0)):
+        for kind, planes in [('w13', 2), ('w2', 1)]:
+            ptr[f't{tier}_{kind}_ptr'] = (torch.randint(-2**31, 2**31 - 1,
+                (count * planes, plane_words), generator=rng, device=device,
+                dtype=torch.int32) if count else zeros)
+            ptr[f't{tier}_{kind}_scales_ptr'] = zeros
+            ptr[f't{tier}_{kind}_global_ptr'] = ones
+        scalar[f'tier{tier}_num_experts'] = KIMI_EXPERTS
+        for p in ['fc2', 'gate', 'up']:
+            scalar[f'tier{tier}_{p}_experts'] = count
+    return ptr, scalar
+
+
+class _KimiReplayVariant:
+    def __init__(self, torch, directory, capacity, weights):
+        self.torch = torch
+        self.capacity = capacity
+        meta = json.loads((directory / 'v41_exl3.json').read_text())
+        self.meta = meta
+        check((meta['compute'], meta['hidden'], meta['intermediate'], meta['experts'], meta['top_k'],
+               meta['capacity'], meta['bits'], meta['activation'], meta['output_dtype'],
+               meta['requires_route_preparation'], meta.get('route_block', 8)) ==
+              ([12, 1], KIMI_HIDDEN, KIMI_INTERMEDIATE, KIMI_EXPERTS, KIMI_TOPK, capacity, [2, 3], 'situ', 'bf16', True, 8)
+              and not meta.get('warp_specialized'), f'unexpected decode recipe: {directory}')
+        check([o['label'] for o in meta['objects']] == ['v41_exl3_core', 'v41_exl3_sum'],
+              f'unexpected launch sequence: {directory}')
+        self.buffers = buffers = {}
+        for name, spec in meta['buffers'].items():
+            if name == spec['allocation']:
+                value = torch.empty(spec['shape'], dtype=getattr(torch, spec['dtype'].removeprefix('torch.')),
+                                    device='cuda')
+                check(value.nbytes == spec['bytes'], f'size mismatch: {name}')
+                if spec['zero_on_create']:
+                    value.zero_()
+                buffers[name] = value
+        for name, spec in meta['buffers'].items():
+            buffers[name] = buffers[spec['allocation']]
+            check(spec['bytes'] <= buffers[name].nbytes, f'bad alias: {name}')
+        raw = (directory / meta['trellis_lut']['file']).read_bytes()
+        check(hashlib.sha256(raw).hexdigest() == meta['trellis_lut']['sha256'], 'trellis LUT checksum mismatch')
+        lut = torch.frombuffer(bytearray(raw), dtype=torch.float16).to('cuda')
+        self.x = torch.empty((capacity, KIMI_HIDDEN), dtype=torch.bfloat16, device='cuda')
+        self.ids = torch.empty((capacity, KIMI_TOPK), dtype=torch.int32, device='cuda')
+        self.gates = torch.empty((capacity, KIMI_TOPK), dtype=torch.float32, device='cuda')
+        weight_ptr, scalar = weights
+        self.ptr = dict(buffers, **weight_ptr, rotation_input_ptr=self.x, raw_topk_ids=self.ids,
+                        route_expert_ids_ptr=self.ids, topk_weights_ptr=self.gates, trellis_lut_ptr=lut,
+                        fc2_ptr=buffers['fc2'], output_ptr=buffers['output'])
+        # Match the daemon's requested grid; the bridge queries device attributes
+        # at create time and clamps to the runtime device before any capture.
+        self.scalar = dict(scalar, grid_x=meta['sms'] * meta['blocks_per_sm'])
+        self.lib = c.CDLL(str(directory / 'libcuteafd_exl3.so'))
+        route = directory / meta['route_preparation']['manifest']
+        check(hashlib.sha256(route.read_bytes()).hexdigest() == meta['route_preparation']['sha256'],
+              'route manifest checksum mismatch')
+        self.route_lib = c.CDLL(str(route.parent / 'libv41_exl3_routes.so'))
+        self.ctx, self.route_ctx = c.c_void_p(), c.c_void_p()
+        self.destroy = bind(self.lib, 'destroy', [c.c_void_p], None)
+        self.destroy_routes = bind(self.route_lib, 'routes_destroy', [c.c_void_p])
+        native_call(bind(self.lib, 'create', [c.POINTER(c.c_void_p)]), c.byref(self.ctx))
+        native_call(bind(self.route_lib, 'routes_create', [c.POINTER(c.c_void_p)]), c.byref(self.route_ctx))
+        self.pack = bind(self.route_lib, 'routes_launch', [c.c_void_p, c.POINTER(c.c_void_p),
+                         c.POINTER(c.c_uint64), c.c_int32, c.c_void_p])
+        self.objects = [bind(self.lib, name, [c.c_void_p, c.POINTER(c.c_void_p),
+                        c.POINTER(c.c_int32), c.c_void_p]) for name in ('core', 'sum')]
+        self.route_buffers = [self.ids, weight_ptr['expert_map_ptr']] + [buffers[name] for name in (
+            'packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts')]
+
+    def load(self, tensors, rows):
+        self.x[:rows].copy_(tensors[0][:rows])
+        self.ids[:rows].copy_(tensors[1][:rows])
+        self.gates[:rows].copy_(tensors[2][:rows])
+
+    def run(self, rows):
+        stream = self.torch.cuda.current_stream().cuda_stream
+        native_call(self.pack, self.route_ctx,
+                    (c.c_void_p * 7)(*(x.data_ptr() for x in self.route_buffers)),
+                    (c.c_uint64 * 7)(rows * KIMI_TOPK * 4, *(x.nbytes for x in self.route_buffers[1:])),
+                    rows, stream)
+        for fn, obj in zip(self.objects, self.meta['objects']):
+            p = obj['pointer_slots']
+            s = obj['scalar_slots']
+            scalars = dict(self.scalar, active_m=rows)
+            native_call(fn, self.ctx, (c.c_void_p * len(p))(*(self.ptr[k].data_ptr() for k in p)),
+                        (c.c_int32 * len(s))(*(scalars[k] for k in s)), stream)
+
+    def capture(self, rows):
+        torch = self.torch
+        self.run(rows)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self.run(rows)
+        return graph
+
+    def output(self, rows):
+        return self.buffers['output'][:rows]
+
+    def poison_output(self):
+        self.buffers['output'].fill_(float('nan'))
+
+    def close(self):
+        self.torch.cuda.synchronize()
+        native_call(self.destroy_routes, self.route_ctx)
+        self.destroy(self.ctx)
+
+
+
+
+def _kimi_replay_waves(args):
+    data = json.loads(args.routes.read_text())
+    if (data.get("schema"), data.get("family"), data.get("experts"), data.get("top_k")) != (
+        1, "kimik3", KIMI_EXPERTS, KIMI_TOPK,
+    ):
+        raise ValueError("expected schema 1 Kimi route waves with 896 experts and top-k 16")
+    if not 1 <= args.capacity <= 80:
+        raise ValueError("recorded Kimi decode capacity must be in 1..80")
+    requested = {int(v) for v in args.rows.split(",")} if args.rows else None
+    waves = []
+    seen = set()
+    for i, wave in enumerate(data.get("waves", [])):
+        name = wave.get("id", str(i))
+        if name in seen:
+            raise ValueError(f"duplicate route case {name}")
+        seen.add(name)
+        rows, ids = wave.get("rows"), wave.get("topk")
+        if (args.route_case and name not in args.route_case) or (requested and rows not in requested):
+            continue
+        if (type(rows) is not int or not 1 <= rows <= args.capacity
+                or not isinstance(ids, list) or len(ids) != rows
+                or any(not isinstance(row, list) or len(row) != KIMI_TOPK
+                       or any(type(e) is not int or not 0 <= e < KIMI_EXPERTS for e in row)
+                       or len(set(row)) != KIMI_TOPK for row in ids)):
+            raise ValueError(f"invalid recorded row/top-k routes for {name}")
+        histogram = Counter(e for row in ids for e in row)
+        if "expert_rows" in wave and sorted(map(tuple, wave["expert_rows"])) != sorted(histogram.items()):
+            raise ValueError(f"histogram disagrees with row/top-k routes for {name}")
+        waves.append((name, ids, len(histogram)))
+    if (not waves or (args.route_case and set(args.route_case) != {w[0] for w in waves})
+            or (requested and requested != {len(w[1]) for w in waves})):
+        raise ValueError("no recorded wave for at least one requested Kimi case or row count")
+    return waves
+
+
+def _run_kimi_replay(args, device, waves):
+    if torch.cuda.get_device_capability(device) != (12, 1):
+        raise ValueError("Kimi TP6 replay requires SM121")
+    # Same least-fitting decode export as serving; no JIT variant.
+    buckets = sorted(int(d.name[1:]) for d in args.kimi_aot.glob("m*")
+                     if re.fullmatch(r"m\d+", d.name) and int(d.name[1:]) <= args.capacity
+                     and (d / "v41_exl3.json").is_file())
+    if not buckets or buckets[0] != 1 or buckets[-1] != args.capacity:
+        raise ValueError("m1 or requested decode capacity is absent from the sealed package")
+    weights = _make_kimi_replay_weights(torch, args.seed)
+    rng = torch.Generator(device=device).manual_seed(args.seed + 1)
+    x = (torch.randn((args.capacity, KIMI_HIDDEN), device=device, generator=rng) * .03).bfloat16()
+    gates = torch.randn((args.capacity, KIMI_TOPK), device=device, generator=rng).softmax(-1)
+    paths = {cap: args.kimi_aot / f"m{cap}" for cap in buckets}
+    report = dict(device=torch.cuda.get_device_name(device), source_sha256=PREFILL_SOURCE_SHA256,
+                  route_sha256=hashlib.sha256(args.routes.read_bytes()).hexdigest(),
+                  manifest_sha256={cap: hashlib.sha256((p / "v41_exl3.json").read_bytes()).hexdigest()
+                                   for cap, p in paths.items()},
+                  seed=args.seed, weights="synthetic K2; recorded expert IDs only", cases=[])
+    variants = {}
+    try:
+        for cap, p in paths.items():
+            variants[cap] = _KimiReplayVariant(torch, p, cap, weights)
+        for name, ids, distinct in waves:
+            rows = len(ids)
+            cap = next(cap for cap in buckets if rows <= cap)
+            v = variants[cap]
+            data = (x, torch.tensor(ids, dtype=torch.int32, device=device), gates)
+            v.load(data, rows)
+            v.poison_output()
+            v.run(rows)
+            eager = v.output(rows).clone()
+            check(bool(eager.isfinite().all() and eager.count_nonzero()), f"invalid output for {name}")
+            graph = v.capture(rows)
+            v.poison_output()
+            graph.replay()
+            check(torch.equal(eager.view(torch.int16), v.output(rows).view(torch.int16)),
+                  f"eager and graph outputs differ for {name}")
+            for other_cap, other in variants.items():
+                if other_cap != cap and rows <= other_cap:
+                    other.load(data, rows)
+                    other.poison_output()
+                    other.run(rows)
+                    check(torch.equal(eager.view(torch.int16), other.output(rows).view(torch.int16)),
+                          f"m{cap}/m{other_cap} outputs differ for {name}")
+            for _ in range(args.warmup):
+                graph.replay()
+            samples = _times(graph, args.replays)
+            # Profile one warmed replay, not correctness or warm-up launches.
+            torch.cuda.nvtx.range_push("kimi_recorded_core")
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+            cell = dict(id=name, rows=rows, capacity=cap, distinct=distinct,
+                        median_us=statistics.median(samples), samples_us=samples,
+                        digest=_output_digest(eager))
+            report["cases"].append(cell)
+            print(json.dumps({k: v for k, v in cell.items() if k != "samples_us"}), flush=True)
+            graph.reset()
+        if args.output:
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
+    finally:
+        for v in variants.values():
+            v.close()
 
 
 def _run_kimi_benchmark(args, device: torch.device, props) -> None:
@@ -2215,7 +2465,8 @@ def _run_row_address_curve(args, device, props):
 def benchmark_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--row-address-curve", action="store_true", help="SM121 GLM WS strided versus row-table curve")
-    parser.add_argument("--capacity", type=int, default=8192, help="compiled extent for --row-address-curve")
+    parser.add_argument("--capacity", type=int,
+                        help="compiled extent (default 8192 for GLM row curve, 80 for recorded Kimi decode)")
     parser.add_argument("--compare-routes-exact", action="store_true", help="require ordinary/addressed byte equality (always on for row curve)")
     parser.add_argument("--check-prefix-rows", action="store_true", help="check ordinary WS prefix row invariance")
     parser.add_argument("--m", type=int, nargs="+", default=[1, 2, 4, 8, 32])
@@ -2242,6 +2493,8 @@ def benchmark_parser():
         default=None,
         help="Comma-separated decode row counts for --kimi (default: 1,2,4,6,8,12,16,24,32,36)",
     )
+    parser.add_argument("--kimi-aot", type=Path, help="sealed EXL3 TP6 rank package containing m1/m80")
+    parser.add_argument("--route-case", action="append", help="recorded Kimi wave ID (repeatable)")
     parser.add_argument(
         "--kimi-variant",
         action="append",
@@ -2294,7 +2547,24 @@ def benchmark_parser():
 def main() -> None:
     parser = benchmark_parser()
     args = parser.parse_args()
+    if args.kimi and (args.routes or args.kimi_aot or args.capacity is not None or args.route_case):
+        if not args.routes or not args.kimi_aot or args.kimi_variant:
+            parser.error("recorded Kimi decode needs --routes and --kimi-aot and uses sealed AOT only")
+        args.capacity = 80 if args.capacity is None else args.capacity
+        try:
+            waves = _kimi_replay_waves(args)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        if args.preflight_only:
+            print(json.dumps({"preflight": True, "cells": [w[0] for w in waves]}))
+            return
+        device = torch.device("cuda", torch.cuda.current_device())
+        _run_kimi_replay(args, device, waves)
+        return
+    if args.kimi_aot or args.route_case:
+        parser.error("--kimi-aot and --route-case require --kimi")
     if args.row_address_curve:
+        args.capacity = 8192 if args.capacity is None else args.capacity
         if args.output is None:
             parser.error("--row-address-curve requires --output")
         device = torch.device("cuda", torch.cuda.current_device())
