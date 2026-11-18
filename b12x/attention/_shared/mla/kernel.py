@@ -446,9 +446,13 @@ class UnifiedDecodeKernel:
         native_v41_2cta=False,
         min_blocks_per_mp=1,
         preferred_smem_carveout=None,
+        skip_empty_context_split=False,
     ):
         if single_split_partial_bf16 is not None and (num_splits != 1 or traits.v_has_rope):
             raise ValueError("direct single-split output requires one split and no V RoPE")
+        if skip_empty_context_split and (not per_token_len or single_split_partial_bf16 is not None):
+            raise ValueError("skip_empty_context_split requires per_token_len and split merge")
+        self.skip_empty_context_split = bool(skip_empty_context_split)
         self.single_split_partial_bf16 = single_split_partial_bf16
         self.native_v41_2cta = bool(native_v41_2cta)
         self.min_blocks_per_mp = int(min_blocks_per_mp)
@@ -1536,6 +1540,27 @@ class UnifiedDecodeKernel:
                     extra_section_len = Int32(0)
                 if extra_section_len > extra_total:
                     extra_section_len = extra_total
+
+        if cutlass.const_expr(self.skip_empty_context_split):
+            if cutlass.const_expr(not has_extra):
+                if split_idx * Int32(self.chunks_per_split * _CAND_WINDOW) >= section_len:
+                    if tid < Int32(self.valid_hpb):
+                        mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
+                    _exit_thread()
+            else:
+                _n_main = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
+                _s_first = split_idx * Int32(self.chunks_per_split)
+                _s_last = _s_first + Int32(self.chunks_per_split)
+                _e_first = _s_first
+                if _e_first < _n_main:
+                    _e_first = _n_main
+                if (_s_first * Int32(_CAND_WINDOW) >= section_len) and (
+                    (_s_last <= _n_main)
+                    or ((_e_first - _n_main) * Int32(_CAND_WINDOW) >= extra_section_len)
+                ):
+                    if tid < Int32(self.valid_hpb):
+                        mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
+                    _exit_thread()
 
         smem = cutlass_utils.SmemAllocator()
         SharedStorage = get_unified_shared_storage_cls(t)

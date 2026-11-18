@@ -612,7 +612,8 @@ class _Partial:
                         valid_hpb=hpb, head_block_offset=0, per_token_len=True,
                         native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
                         native_dsv41_fp8=False, vector_q=True, zero_masked_v=True,
-                        min_blocks_per_mp=min_blk_c, preferred_smem_carveout=carve_c)
+                        min_blocks_per_mp=min_blk_c, preferred_smem_carveout=carve_c,
+                        skip_empty_context_split=True)
         self.decode = UnifiedDecodeKernel(
             traits, make_smem_layout(traits), self.page_rows, chunks,
             h_blocks=n // hpb, num_splits=s, num_heads=n, q_head_dim=self.qk,
@@ -624,7 +625,8 @@ class _Partial:
             valid_hpb=hpb, head_block_offset=0, per_token_len=True,
             native_glm_h8=False, native_dsv4_h8=False, native_dsv4_h16=False,
             native_dsv41_fp8=False, vector_q=True,
-            zero_masked_v=(not self.v4 and precision == "bf16"))
+            zero_masked_v=(not self.v4 and precision == "bf16"),
+            skip_empty_context_split=(precision == "bf16"))
         self.merge = _PartialMergeBf16(n, s) if precision == "bf16" else _PartialMerge(n, s)
 
     def scratch_bytes(self, rows):
