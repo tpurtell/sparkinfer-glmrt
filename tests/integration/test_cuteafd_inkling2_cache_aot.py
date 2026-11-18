@@ -294,12 +294,12 @@ def test_exported_half_heads_match_whole_cache_and_attention(tmp_path, route, ki
         slots = torch.arange(len(k), device="cuda", dtype=torch.int64)
         cache = torch.empty((len(k), record_bytes(g, kv_format)), device="cuda", dtype=torch.uint8)
         pack = compile_inkling2_kv_pack_aot(heads=heads, kv_format=kv_format)
-        ExportedProgram(pack, tmp_path, f"head-pack-{index}").launch(k, v, slots, cache, scalars=(len(k),))
+        ExportedProgram(pack, tmp_path, f"head_pack_{index}").launch(k, v, slots, cache, scalars=(len(k),))
         local_q, local_rel, local_sinks = [tensor[:, q_window].contiguous() for tensor in (q, rel, sinks)]
         out = torch.empty_like(local_q)
         scratch = torch.empty(64 * 32 * g.heads * 516, dtype=torch.uint8, device="cuda")
         prog = compile_inkling2_attention_aot(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
-        launch = ExportedProgram(prog, tmp_path, f"head-attention-{index}")
+        launch = ExportedProgram(prog, tmp_path, f"head_attention_{index}")
         if kind == "global":
             scalars = (rows, len(tables), len(tiles)) + ((8,) if route == "decode" else ())
             launch.launch(local_q, cache, positions, tables, first, first, tiles, local_rel, local_sinks, out, scratch, scalars=scalars)
