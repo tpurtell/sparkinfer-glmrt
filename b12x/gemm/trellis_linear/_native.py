@@ -53,6 +53,17 @@ _K6_NARROW_ROWS = 8
 _K6_DECODE_ROWS = 16
 _K6_WIDE2_ROWS = 32
 _K6_WIDE3_ROWS = 48
+# Three splits fold in one 192-thread CTA per 16 columns; three per SM keep N/16 of them
+# resident on a 160-SM card up to this N.
+_K6_FUSED3_N = 7680
+# Five to seven splits fold in one CTA of at most 448 threads per 16 columns: one per SM
+# up to the first N, two per SM (a 73-register budget at seven splits) up to the second.
+_K6_FUSED_ONE_N = 2560
+_K6_FUSED_N = 5120
+# 128-column tile counts up to which the one-block wide tile replaces the generic 16-row
+# tile: at rows 1..8 (at most 1.5 tiles per SM) and at rows 9..decode_rows.
+_K6_WIDE1_LOW_TILES = 288
+_K6_WIDE1_TILES = 720
 _GROUPED_DECODE_ROWS = 16
 _GROUPED_WIDE2_ROWS = 32
 
@@ -134,18 +145,22 @@ def decode_route_thresholds(g):
     if g.get("groups", 1) == 4:
         edges = [] if bits < 5 else [_GROUPED_DECODE_ROWS, _GROUPED_WIDE2_ROWS, 48]
     elif bits == 6:
-        folded = k & (k - 1) != 0 and ((2 < splits <= 6 and n <= 4096) or (2 < splits <= 8 and n <= 1536))
-        narrow = False
-        if not folded and n <= 65536:
-            if splits == 1 or n <= 1536:
+        # narrow: rows 1..8 and rows 9..decode_rows launch different kernels.
+        if splits == 1 or n <= 1536 or (splits == 3 and n <= _K6_FUSED3_N):
+            narrow = True
+        elif 5 <= splits <= 7 and n <= _K6_FUSED_N:
+            narrow = True
+        elif n > 65536:
+            narrow = False
+        elif k & (k - 1):
+            if splits == 2 and n <= 9216:
+                narrow = not (k == 1536 and n == 8192)
+            elif (splits == 4 and n <= 8192) or (8 < splits <= 12 and n <= 4096):
                 narrow = True
-            elif k & (k - 1):
-                if splits == 2 and n <= 9216:
-                    narrow = not (k == 1536 and n == 8192)
-                else:
-                    narrow = (splits == 4 and n <= 8192) or (8 < splits <= 12 and n <= 4096)
             else:
-                narrow = splits in (2, 4, 8)
+                narrow = _K6_WIDE1_LOW_TILES < (n // 128) * splits <= _K6_WIDE1_TILES
+        else:
+            narrow = splits in (2, 4, 8)
         edge = decode_rows(g)
         edges = [edge, _K6_WIDE2_ROWS, _K6_WIDE3_ROWS]
         if narrow and _K6_NARROW_ROWS < edge:
@@ -1535,86 +1550,6 @@ class NativeTrellisLinear:
                         for v in cutlass.range_constexpr(4):
                             result[v] += ld_shared_f32(fold + (Int32(sp*512+n*128+v*32) + lane) * Int32(4))
                     col = nb * Int32(32) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
-                    if row0 < rows:
-                        base = row0.to(Int64) * Int64(self.n) + col.to(Int64)
-                        output[base], output[base+Int64(1)] = result[0], result[1]
-                    if row1 < rows:
-                        base = row1.to(Int64) * Int64(self.n) + col.to(Int64)
-                        output[base], output[base+Int64(1)] = result[2], result[3]
-            cute.arch.sync_threads()
-            task += step
-
-    @cute.kernel
-    def multiply_k6_folded(self, inputs: cute.Tensor, payload: cute.Tensor,
-                        scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
-                        rows: Int32, rotation_id: Int32):
-        """Keep original split partials, then fold them in-CTA in split order."""
-        tid, _, _ = cute.arch.thread_idx()
-        task, _, _ = cute.arch.block_idx()
-        step, _, _ = cute.arch.grid_dim()
-        lane, split = Int32(tid) & Int32(31), Int32(tid) >> Int32(5)
-        storage = cutlass_utils.SmemAllocator().allocate(self._fold_storage())
-        fold = shared_ptr_to_u32(storage.fold.data_ptr())
-        x = inputs[rotation_id]
-        while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 16):
-            nb = task % Int32(self.n // 16)
-            group = task // Int32(self.n // 16)
-            policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
-            row0 = group * Int32(16) + lane // Int32(4)
-            row1 = row0 + Int32(8)
-            total = cute.make_rmem_tensor((2, 4), Float32)
-            total.fill(Float32(0.0))
-            for block in cutlass.range(8):
-                kb = split * Int32(8) + block
-                if kb < Int32(self.k // 128):
-                    acc = cute.make_rmem_tensor((2, 4), Float32)
-                    acc.fill(Float32(0.0))
-                    for k16 in cutlass.range_constexpr(8):
-                        k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
-                        a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                        if row0 < rows:
-                            addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
-                            a0, a2 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
-                        if row1 < rows:
-                            addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
-                            a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
-                        for n16 in cutlass.range_constexpr(1):
-                            tile = (nb // Int32(8)) * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + (nb % Int32(8)) + Int32(n16)
-                            if cutlass.const_expr(self.input_units):
-                                tile = kb * Int32(self.n // 16 * 8) + (nb // Int32(8)) * Int32(64) + Int32(k16 * 8) + (nb % Int32(8)) + Int32(n16)
-                            b0, b1, b2, b3 = decode_k6_pair(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
-                            d0, d1, d2, d3 = self.mma(
-                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
-                                a0, a1, a2, a3, b0, b1)
-                            acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = self.mma(
-                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
-                                a0, a1, a2, a3, b2, b3)
-                            acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
-                    scale = _side_value(scales.iterator.toint(), kb)
-                    for n in cutlass.range_constexpr(2):
-                        for v in cutlass.range_constexpr(4):
-                            total[n, v] = total[n, v] + acc[n, v] * scale
-            for n in cutlass.range_constexpr(2):
-                for v in cutlass.range_constexpr(4):
-                    st_shared_f32(fold + (split * Int32(512) + Int32(n*128+v*32) + lane) * Int32(4), total[n,v])
-            for n in cutlass.range_constexpr(2):
-                col = nb * Int32(16) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
-                base = (row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n) + col.to(Int64)
-                if row0 < rows:
-                    partial[base], partial[base+Int64(1)] = total[n, 0], total[n, 1]
-                if row1 < rows:
-                    base += Int64(8 * self.splits * self.n)
-                    partial[base], partial[base+Int64(1)] = total[n, 2], total[n, 3]
-            cute.arch.sync_threads()
-            if split == Int32(0):
-                for n in cutlass.range_constexpr(2):
-                    result = cute.make_rmem_tensor((4,), Float32)
-                    result.fill(Float32(0.0))
-                    for sp in cutlass.range_constexpr(self.splits):
-                        for v in cutlass.range_constexpr(4):
-                            result[v] += ld_shared_f32(fold + (Int32(sp*512+n*128+v*32) + lane) * Int32(4))
-                    col = nb * Int32(16) + Int32(n*8) + (lane & Int32(3)) * Int32(2)
                     if row0 < rows:
                         base = row0.to(Int64) * Int64(self.n) + col.to(Int64)
                         output[base], output[base+Int64(1)] = result[0], result[1]
@@ -5376,6 +5311,57 @@ class NativeTrellisLinear:
                     block=(128, 1, 1), stream=stream)
 
     @cute.jit
+    def _launch_k6_wide1(self, inputs: cute.Tensor, payload: cute.Tensor,
+                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        """The wide tile with one 16-row block: every input load and partial store is row-guarded."""
+        tiles = Int32(self.n // 128 * self.splits)
+        self.multiply_k6_wide(inputs, payload, scales, partial, output, rows, rotation_id, 1, 8).launch(
+            grid=(min(tiles, cta_limit), 1, 1),
+            block=(128, 1, 1), min_blocks_per_mp=self.min_blocks_per_mp, stream=stream)
+        self.reduce(partial, output, rows).launch(
+            grid=(min(rows * Int32(self.n // 128), cta_limit), 1, 1),
+            block=(128, 1, 1), stream=stream)
+
+    @cute.jit
+    def _launch_k6_upper(self, inputs: cute.Tensor, payload: cute.Tensor,
+                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream,
+                         pair: cutlass.Constexpr):
+        """Rows 9..decode_rows where rows 1..8 take another kernel; absent when decode_rows is 8."""
+        if cutlass.const_expr(self.decode_rows > _K6_NARROW_ROWS):
+            if cutlass.const_expr((self.n // 128) * self.splits <= _K6_WIDE1_TILES):
+                self._launch_k6_wide1(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            elif cutlass.const_expr(pair):
+                self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            else:
+                self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+
+    @cute.jit
+    def _launch_k6_fused(self, inputs: cute.Tensor, payload: cute.Tensor,
+                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
+                         rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
+        """Five to seven splits: two warps share each split's K128 blocks, the CTA folds the splits."""
+        one_per_sm = self.n <= _K6_FUSED_ONE_N
+        if rows <= Int32(_K6_NARROW_ROWS):
+            self.multiply_k6_opt_narrow(
+                inputs, payload, scales, partial, output, rows, rotation_id, 1, True, 2
+            ).launch(
+                grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
+                block=(64 * self.splits, 1, 1),
+                min_blocks_per_mp=1 if one_per_sm else 2, stream=stream)
+        elif cutlass.const_expr(self.decode_rows <= _K6_NARROW_ROWS):
+            pass
+        elif cutlass.const_expr(one_per_sm):
+            self.multiply_k6_opt_16(
+                inputs, payload, scales, partial, output, rows, rotation_id, 1, True, 2
+            ).launch(
+                grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
+                block=(64 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
+        else:
+            self._launch_k6_upper(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, False)
+
+    @cute.jit
     def _launch_k6_pair(self, inputs: cute.Tensor, payload: cute.Tensor,
                        scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                        rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
@@ -5393,19 +5379,14 @@ class NativeTrellisLinear:
                 scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                 rows: Int32, rotation_id: Int32, cta_limit: Int32, stream: cuda.CUstream):
         if rows <= Int32(self.decode_rows):
-            if cutlass.const_expr((self.k & (self.k - 1)) != 0 and
-                                  ((2 < self.splits <= 6 and self.n <= 4096) or
-                                   (2 < self.splits <= 8 and self.n <= 1536))):
-                self.multiply_k6_folded(inputs, payload, scales, partial, output, rows, rotation_id).launch(
-                    grid=(min(Int32(self.n // 16), cta_limit), 1, 1),
-                    block=(32 * self.splits, 1, 1), min_blocks_per_mp=1, stream=stream)
-            elif cutlass.const_expr(self.splits == 1):
+            if cutlass.const_expr(self.splits == 1):
                 self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 4, 1, True, 2)
-            elif cutlass.const_expr(self.n <= 1536):
+            elif cutlass.const_expr(5 <= self.splits <= 7 and self.n <= _K6_FUSED_N):
+                self._launch_k6_fused(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            elif cutlass.const_expr(self.n <= 1536 or (self.splits == 3 and self.n <= _K6_FUSED3_N)):
                 self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
             elif cutlass.const_expr(self.n > 65536):
                 self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-            # Ragged K keeps the existing route outside measured winning classes.
             elif cutlass.const_expr((self.k & (self.k - 1)) != 0):
                 if cutlass.const_expr(self.splits == 2 and self.n <= 9216):
                     if cutlass.const_expr(self.k == 1536 and self.n == 8192):
@@ -5422,9 +5403,14 @@ class NativeTrellisLinear:
                     if rows <= Int32(_K6_NARROW_ROWS):
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2 if self.splits == 4 else 1, 1, True, 1)
                     else:
-                        self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                        self._launch_k6_upper(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, False)
+                elif cutlass.const_expr((self.n // 128) * self.splits <= _K6_WIDE1_LOW_TILES):
+                    self._launch_k6_wide1(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
                 else:
-                    self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                    if rows <= Int32(_K6_NARROW_ROWS):
+                        self._decode_existing(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                    else:
+                        self._launch_k6_upper(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, False)
             elif cutlass.const_expr(self.splits == 2):
                 if cutlass.const_expr(self.n > 8192):
                     if rows <= Int32(_K6_NARROW_ROWS):
@@ -5433,13 +5419,11 @@ class NativeTrellisLinear:
                         self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
                 else:
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 2)
-            elif cutlass.const_expr(self.splits == 4 and self.n > 1536):
+            elif cutlass.const_expr(self.splits == 4):
                 if rows <= Int32(_K6_NARROW_ROWS):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
                 else:
-                    self._launch_k6_pair(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
-            elif cutlass.const_expr(self.splits == 4):
-                self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 2, 1, True, 1)
+                    self._launch_k6_upper(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, True)
             elif cutlass.const_expr(self.splits == 8):
                 if rows <= Int32(_K6_NARROW_ROWS):
                     self._launch_k6_opt(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream, 1, True, 1, 1, True, 1)
