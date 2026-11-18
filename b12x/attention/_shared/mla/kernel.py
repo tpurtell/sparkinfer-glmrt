@@ -34,65 +34,44 @@ from b12x._lib.compiler import (
     run_compiled,
 )
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import (
-    ld_shared_f32,
-    shared_ptr_to_u32,
-    st_shared_u32,
-    st_shared_v4_u32,
-)
+from b12x._lib.intrinsics import shared_ptr_to_u32, st_shared_u32
 
 from .decode_math import (
-    _ldmatrix_m8n8x4_b16_disp,
-    decode_pv_bf16_slice_to_smem,
-    load_pv_p_frags_bf16,
-    load_q_slice_bf16_pv,
+    apply_glm_pv,
+    expand_v4_tile,
+    load_glm_q_prefix,
     s0_load_q_bf16_to_smem,
     s0_normalize_dsv41_kv_to_fp8,
     s0_quantize_q_to_smem,
     s0_quantize_q_vec,
     s1_qk_nope_block_scaled,
     s1_qk_nope_bf16_mg2,
-    s1_qk_pv_bf16_slice_from_frags,
-    s1_qk_pv_bf16_slice_from_gmem,
-    s1_qk_pv_bf16_slice_from_qp,
-    s6_xv_nope_nvfp4_bf16,
     s1_qk_nope_block_scaled_dsv4_h8_swap_ab,
     s1_qk_nope_block_scaled_glm_h8_swap_ab,
     s2_qk_rope_bf16,
     s2_qk_rope_bf16_glm_h8_swap_ab,
-    s2_qk_rope_from_frags,
-    s2_qk_rope_from_qp,
     s3_mask_and_scale,
     s3_mask_and_scale_glm_h8_swap_ab,
     s4_online_softmax,
     s4_online_softmax_glm_h8_swap_ab,
-    s5_fill_sm_p_bf16_glm_pv,
-    s5_fill_sm_p_bf16_pv,
     s5_fill_sm_p_full,
-    s6_pv_bf16_slice_from_p_frags,
-    s6_pv_bf16_slice_from_qp,
     s6_xv_nope,
     s6_xv_nope_dsv4_h8_swap_ab,
     s6_xv_nope_glm_h8_swap_ab,
     s6b_xv_rope,
-    s6b_xv_rope_from_p_frags,
     s6b_xv_rope_h8_swap_ab,
     s7_epilogue,
-    s7_epilogue_pv_bf16,
+    snapshot_glm_scales,
+    stage_decode_q_bf16_vec,
 )
-from .io import (
-    io_issue_gather,
-    io_issue_gather_glm_split_rope,
-    io_issue_gather_packed,
-    io_issue_packed_payload,
-    io_issue_split_glm_payload,
-)
+from .io import io_issue_gather, io_issue_gather_packed, io_issue_packed_payload
 from .native_v41_records import (
     DSV41_BF16_RAW_ROW_OFFSET,
     DSV41_BF16_TILE_ROW_STRIDE,
     DSV41_COMPACT_QP_STRIDE,
     DSV41_COMPACT_RAW_STRIDE,
     DSV41_COMPACT_SLICE_STRIDE,
+    apply_v4_pv,
     decode_dsv41_kv_to_bf16_smem,
     decode_dsv41_slice_to_bf16_smem,
     issue_native_v41_gather,
@@ -105,14 +84,12 @@ from .native_v41_records import (
     s5_fill_sm_p_bf16,
     s6_pv_dsv41_bf16_smem,
     s6_s7_pv_epilogue_dsv41_bf16_slice,
+    snapshot_v4_pv_fragments,
     load_dsv41_p_frags_bf16,
     write_dsv41_split_lse,
 )
 from .smem import (
-    PV_BF16_QP_STRIDE,
-    PV_BF16_SLICE_STRIDE,
     get_native_v41_compact_shared_storage_cls,
-    get_pv_bf16_shared_storage_cls,
     get_unified_shared_storage_cls,
     make_smem_layout,
 )
@@ -469,14 +446,11 @@ class UnifiedDecodeKernel:
         native_v41_2cta=False,
         min_blocks_per_mp=1,
         preferred_smem_carveout=None,
-        pv_bf16_2cta=False,
     ):
         if single_split_partial_bf16 is not None and (num_splits != 1 or traits.v_has_rope):
             raise ValueError("direct single-split output requires one split and no V RoPE")
         self.single_split_partial_bf16 = single_split_partial_bf16
         self.native_v41_2cta = bool(native_v41_2cta)
-        self.pv_bf16_2cta = bool(pv_bf16_2cta)
-        self.pv_bf16_vec_q = bool(vector_q and traits.pv_bf16)
         self.min_blocks_per_mp = int(min_blocks_per_mp)
         self.preferred_smem_carveout = (
             None if preferred_smem_carveout is None else int(preferred_smem_carveout)
@@ -547,8 +521,11 @@ class UnifiedDecodeKernel:
             and not self.native_glm_h8
         )
         self.packed_io = (
-            self.native_glm_h8 or self.native_dsv4_h8
-            or self.packed_glm_next or self.packed_glm_generic
+            self.native_glm_h8
+            or self.native_dsv4_h8
+            or self.packed_glm_next
+            or self.packed_glm_generic
+            or traits.packed_bf16_decode
         )
         # First-chunk copies may be issued before the per-token length is
         # known only when the first active chunk is fixed (no extra section).
@@ -576,6 +553,15 @@ class UnifiedDecodeKernel:
             and not self.native_h16
             and int(traits.d_rope) == 0
         )
+        self.glm_bf16 = bool(
+            traits.pv_bf16 and int(traits.scale_format) == int(ScaleFormat.ARBITRARY_FP32)
+        )
+        self.single_chunk_bf16 = bool(
+            traits.pv_bf16
+            and int(chunks_per_split) == 1
+            and (self.glm_bf16 or traits.packed_bf16_decode)
+        )
+        self.vector_decode_bf16 = bool(vector_q and traits.pv_bf16)
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
         # A masked candidate stages record slot 0 (the producer copies row 0
         # for a negative index), and S6 multiplies its zero weight by that
@@ -640,25 +626,6 @@ class UnifiedDecodeKernel:
         # SINGLE-CACHE entry: the deployed eight data args plus the runtime
         # latent_scale (and stream). The dispatcher selects this (func=kernel ->
         # __call__) when has_extra=False; extra-section args never enter it.
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self.kernel(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                section_len,
-                stride_kv_block,
-            ).launch(
-                grid=(num_tokens, self.h_blocks, self.num_splits),
-                block=[self.block_threads, 1, 1],
-                min_blocks_per_mp=self.min_blocks_per_mp,
-                preferred_smem_carveout=self.preferred_smem_carveout,
-                stream=stream,
-            )
-            return
         self.kernel(
             q_all,
             kv_cache_u8,
@@ -705,30 +672,6 @@ class UnifiedDecodeKernel:
         # never collides with the single-cache __call__. It launches
         # the 14-param @cute.kernel (self.kernel_extra), which shares the body via
         # _kernel_body(has_extra=True).
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self.kernel_extra(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                section_len,
-                stride_kv_block,
-                extra_kv_cache_u8,
-                extra_indices,
-                extra_section_len,
-                num_main_chunks,
-                stride_extra_kv_block,
-            ).launch(
-                grid=(num_tokens, self.h_blocks, self.num_splits),
-                block=[self.block_threads, 1, 1],
-                min_blocks_per_mp=self.min_blocks_per_mp,
-                preferred_smem_carveout=self.preferred_smem_carveout,
-                stream=stream,
-            )
-            return
         self.kernel_extra(
             q_all,
             kv_cache_u8,
@@ -773,7 +716,7 @@ class UnifiedDecodeKernel:
         # per-token section bound; over-allocated chunks for short tokens are fully
         # masked (idx<0 + section bound) so their partials are -inf and the merge
         # ignores them.
-        if cutlass.const_expr(self.traits.pv_bf16):
+        if cutlass.const_expr(self.traits.glm_compact_2cta):
             self.kernel_pertok(
                 q_all,
                 kv_cache_u8,
@@ -791,23 +734,23 @@ class UnifiedDecodeKernel:
                 preferred_smem_carveout=self.preferred_smem_carveout,
                 stream=stream,
             )
-            return
-        self.kernel_pertok(
-            q_all,
-            kv_cache_u8,
-            swa_indices,
-            mid_out,
-            mid_lse,
-            sm_scale_log2,
-            latent_scale,
-            topk_length,
-            stride_kv_block,
-        ).launch(
-            grid=(num_tokens, self.h_blocks, self.num_splits),
-            block=[self.block_threads, 1, 1],
-            min_blocks_per_mp=1,
-            stream=stream,
-        )
+        else:
+            self.kernel_pertok(
+                q_all,
+                kv_cache_u8,
+                swa_indices,
+                mid_out,
+                mid_lse,
+                sm_scale_log2,
+                latent_scale,
+                topk_length,
+                stride_kv_block,
+            ).launch(
+                grid=(num_tokens, self.h_blocks, self.num_splits),
+                block=[self.block_threads, 1, 1],
+                min_blocks_per_mp=1,
+                stream=stream,
+            )
 
     @cute.jit
     def call_extra_pertok(
@@ -833,30 +776,6 @@ class UnifiedDecodeKernel:
         # are read per-token (topk_length / extra_topk_length at t=blockIdx.x). The
         # main/extra chunk split (num_main_chunks) stays UNIFORM (workspace geometry
         # over the MAX topk); per-token clamping zeroes the over-allocated chunks.
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self.kernel_extra_pertok(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                topk_length,
-                stride_kv_block,
-                extra_kv_cache_u8,
-                extra_indices,
-                extra_topk_length,
-                num_main_chunks,
-                stride_extra_kv_block,
-            ).launch(
-                grid=(num_tokens, self.h_blocks, self.num_splits),
-                block=[self.block_threads, 1, 1],
-                min_blocks_per_mp=self.min_blocks_per_mp,
-                preferred_smem_carveout=self.preferred_smem_carveout,
-                stream=stream,
-            )
-            return
         self.kernel_extra_pertok(
             q_all,
             kv_cache_u8,
@@ -896,47 +815,26 @@ class UnifiedDecodeKernel:
         # the body with the other entries (has_extra=False, per_token_len=False);
         # the extra-section and length-tensor slots alias main tensors and are
         # never read.
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self._kernel_body_pv_bf16(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                section_len,
-                stride_kv_block,
-                kv_cache_u8,
-                swa_indices,
-                Int32(0),
-                Int32(0),
-                stride_kv_block,
-                swa_indices,
-                swa_indices,
-                has_extra=False,
-                per_token_len=False,
-            )
-        else:
-            self._kernel_body(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                section_len,
-                stride_kv_block,
-                kv_cache_u8,
-                swa_indices,
-                Int32(0),
-                Int32(0),
-                stride_kv_block,
-                swa_indices,
-                swa_indices,
-                has_extra=False,
-                per_token_len=False,
-            )
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            section_len,
+            stride_kv_block,
+            kv_cache_u8,
+            swa_indices,
+            Int32(0),
+            Int32(0),
+            stride_kv_block,
+            swa_indices,
+            swa_indices,
+            has_extra=False,
+            per_token_len=False,
+        )
 
     @cute.jit
     def call_native_v41(self, q: cute.Tensor, descriptors: cute.Tensor,
@@ -1241,47 +1139,26 @@ class UnifiedDecodeKernel:
     ):
         # DUAL-CACHE @cute.kernel: 14 device params; threads the real extra-section
         # args into the shared body (has_extra=True).
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self._kernel_body_pv_bf16(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                section_len,
-                stride_kv_block,
-                extra_kv_cache_u8,
-                extra_indices,
-                extra_section_len,
-                num_main_chunks,
-                stride_extra_kv_block,
-                swa_indices,
-                extra_indices,
-                has_extra=True,
-                per_token_len=False,
-            )
-        else:
-            self._kernel_body(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                section_len,
-                stride_kv_block,
-                extra_kv_cache_u8,
-                extra_indices,
-                extra_section_len,
-                num_main_chunks,
-                stride_extra_kv_block,
-                swa_indices,
-                extra_indices,  # length tensors unused (per_token_len=False)
-                has_extra=True,
-                per_token_len=False,
-            )
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            section_len,
+            stride_kv_block,
+            extra_kv_cache_u8,
+            extra_indices,
+            extra_section_len,
+            num_main_chunks,
+            stride_extra_kv_block,
+            swa_indices,
+            extra_indices,  # length tensors unused (per_token_len=False)
+            has_extra=True,
+            per_token_len=False,
+        )
 
     @cute.kernel
     def kernel_pertok(
@@ -1302,47 +1179,26 @@ class UnifiedDecodeKernel:
         # section_len/extra_section_len/num_main_chunks args are dummies (elided by
         # per_token_len/has_extra const_expr); the extra tensor slots alias
         # swa_indices (never read when has_extra=False).
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self._kernel_body_pv_bf16(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                Int32(0),
-                stride_kv_block,
-                kv_cache_u8,
-                swa_indices,
-                Int32(0),
-                Int32(0),
-                stride_kv_block,
-                topk_length,
-                swa_indices,
-                has_extra=False,
-                per_token_len=True,
-            )
-        else:
-            self._kernel_body(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                Int32(0),
-                stride_kv_block,
-                kv_cache_u8,
-                swa_indices,
-                Int32(0),
-                Int32(0),
-                stride_kv_block,
-                topk_length,
-                swa_indices,
-                has_extra=False,
-                per_token_len=True,
-            )
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            Int32(0),
+            stride_kv_block,
+            kv_cache_u8,
+            swa_indices,
+            Int32(0),
+            Int32(0),
+            stride_kv_block,
+            topk_length,
+            swa_indices,
+            has_extra=False,
+            per_token_len=True,
+        )
 
     @cute.kernel
     def kernel_extra_pertok(
@@ -1366,1091 +1222,244 @@ class UnifiedDecodeKernel:
         # lengths are read per-token (topk_length / extra_topk_length at
         # t=blockIdx.x). num_main_chunks (the uniform main/extra chunk split) stays
         # a scalar; per-token clamping masks the over-allocated chunks.
-        if cutlass.const_expr(self.traits.pv_bf16):
-            self._kernel_body_pv_bf16(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                Int32(0),
-                stride_kv_block,
-                extra_kv_cache_u8,
-                extra_indices,
-                Int32(0),
-                num_main_chunks,
-                stride_extra_kv_block,
-                topk_length,
-                extra_topk_length,
-                has_extra=True,
-                per_token_len=True,
-            )
-        else:
-            self._kernel_body(
-                q_all,
-                kv_cache_u8,
-                swa_indices,
-                mid_out,
-                mid_lse,
-                sm_scale_log2,
-                latent_scale,
-                Int32(0),
-                stride_kv_block,
-                extra_kv_cache_u8,
-                extra_indices,
-                Int32(0),
-                num_main_chunks,
-                stride_extra_kv_block,
-                topk_length,
-                extra_topk_length,
-                has_extra=True,
-                per_token_len=True,
-            )
+        self._kernel_body(
+            q_all,
+            kv_cache_u8,
+            swa_indices,
+            mid_out,
+            mid_lse,
+            sm_scale_log2,
+            latent_scale,
+            Int32(0),
+            stride_kv_block,
+            extra_kv_cache_u8,
+            extra_indices,
+            Int32(0),
+            num_main_chunks,
+            stride_extra_kv_block,
+            topk_length,
+            extra_topk_length,
+            has_extra=True,
+            per_token_len=True,
+        )
 
     @cute.jit
-    def _kernel_body_pv_bf16(
+    def _consume_single_chunk_bf16(
         self,
-        q_all: cute.Tensor,
-        kv_cache_u8: cute.Tensor,
-        swa_indices: cute.Tensor,
-        mid_out: cute.Tensor,
-        mid_lse: cute.Tensor,
-        sm_scale_log2: Float32,
-        section_len: Int32,
-        stride_kv_block: Int64,
-        extra_kv_cache_u8: cute.Tensor,
-        extra_indices: cute.Tensor,
-        extra_section_len: Int32,
+        q_token: cute.Tensor,
+        head_base: Int32,
+        q_fp8_addr: Int32,
+        q_rope_addr: Int32,
+        kv_fp8_addr: Int32,
+        kv_rope_addr: Int32,
+        kv_sc_addr: Int32,
+        w_fp8_addr: Int32,
+        reduce_max_addr: Int32,
+        reduce_sum_addr: Int32,
+        sm_p_full_addr: Int32,
+        token_idx_view: cute.Tensor,
+        mbar_base,
+        split_first_chunk: Int32,
+        main_chunk_count: Int32,
+        extra_first_chunk: Int32,
         num_main_chunks: Int32,
-        stride_extra_kv_block: Int64,
-        topk_length: cute.Tensor,
-        extra_topk_length: cute.Tensor,
+        section_len: Int32,
+        extra_section_len: Int32,
+        sm_scale_log2: Float32,
+        warp_id: Int32,
+        warp_first_cand: Int32,
+        lane: Int32,
+        tid: Int32,
         *,
         has_extra: cutlass.Constexpr,
-        per_token_len: cutlass.Constexpr,
+        staged_kv_stride: cutlass.Constexpr,
+        n_acc_tiles: cutlass.Constexpr,
+        rope_acc_elems: cutlass.Constexpr,
     ):
         t = self.traits
         L = self.layout
-        tid = Int32(cute.arch.thread_idx()[0])
-        lane = cute.arch.lane_idx()
-        warp_id = tid >> Int32(5)
-
-        token_idx, head_block, split_idx = cute.arch.block_idx()
-        token_idx = Int32(token_idx)
-        head_block = Int32(head_block)
-        split_idx = Int32(split_idx)
-        if cutlass.const_expr(self.head_block_offset != 0):
-            head_block = head_block + Int32(self.head_block_offset)
-        head_base = head_block * Int32(t.hpb)
-
-        if cutlass.const_expr(per_token_len):
-            topk_total = Int32(self.topk)
-            section_len = Int32(topk_length[token_idx])
-            if section_len < Int32(0):
-                section_len = Int32(0)
-            if section_len > topk_total:
-                section_len = topk_total
-            if cutlass.const_expr(has_extra):
-                extra_total = Int32(self.extra_topk)
-                extra_section_len = Int32(extra_topk_length[token_idx])
-                if extra_section_len < Int32(0):
-                    extra_section_len = Int32(0)
-                if extra_section_len > extra_total:
-                    extra_section_len = extra_total
-
-        smem = cutlass_utils.SmemAllocator()
-        SharedStorage = get_pv_bf16_shared_storage_cls(t, compact_2cta=self.pv_bf16_2cta)
-        st = smem.allocate(SharedStorage)
-
-        kv_raw_addr = shared_ptr_to_u32(st.kv_raw.data_ptr())
-        if cutlass.const_expr(t.scale_format == ScaleFormat.UE8M0_BYTE):
-            kv_sc_addr = shared_ptr_to_u32(st.kv_sc.data_ptr())
-        else:
-            kv_sc_addr = Int32(0)
-        kv_slice_addr = shared_ptr_to_u32(st.kv_bf16_slice.data_ptr())
-        qp_addr = shared_ptr_to_u32(st.q_or_p.data_ptr())
-        reduce_max_addr = shared_ptr_to_u32(st.reduce.data_ptr())
-        reduce_sum_addr = reduce_max_addr + Int32(L.reduce_warp_sum_off - L.reduce_off)
-        token_idx_view = st.token_idx.get_tensor(
-            cute.make_layout(int(L.token_idx_buf_bytes * L.token_idx_bufs // 4))
-        )
-        mbar_base = st.mbar.data_ptr()
-
-        n_buf = int(L.kv_bufs)
-        staged_kv_stride = int(L.kv_smem_stride)
-        kv_raw_buf = Int32(L.kv_fp8_buf_bytes)
-        kv_sc_buf = Int32(L.kv_sc_buf_bytes)
-        tok_buf_elems = Int32(L.token_idx_buf_bytes // 4)
-
-        is_dsv4 = t.scale_format == ScaleFormat.UE8M0_BYTE
-        split_glm_rope = bool(
-            self.pv_bf16_2cta
-            and t.scale_format == ScaleFormat.ARBITRARY_FP32
-            and t.d_rope > 0
-        )
-        record_bytes = _DSV4_IO_STRIDE if is_dsv4 else int(t.kv_gmem_stride)
-        spec_first = not bool(has_extra)
-
-        if cutlass.const_expr(self.topk == 0):
-            topk_row = cute.make_tensor(
-                swa_indices.iterator
-                + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
-                cute.make_layout(1),
+        q_prefix = None
+        if cutlass.const_expr(t.glm_compact_2cta):
+            q_prefix = load_glm_q_prefix(
+                q_token, head_base, lane, n_tiles=12, valid_hpb=self.valid_hpb
             )
-        else:
-            topk_row = cute.make_tensor(
-                swa_indices.iterator
-                + token_idx.to(Int64) * Int64(self.swa_indices_stride_row),
-                cute.make_layout(self.topk),
-            )
+        ci = split_first_chunk
         if cutlass.const_expr(has_extra):
-            extra_row = cute.make_tensor(
-                extra_indices.iterator
-                + token_idx.to(Int64) * Int64(self.extra_indices_stride_row),
-                cute.make_layout(self.extra_topk),
-            )
-        else:
-            extra_row = topk_row
-
-        if tid == Int32(0):
-            for s in cutlass.range_constexpr(n_buf):
-                cute.arch.mbarrier_init(mbar_base + s, Int32(1))
-                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))
-        cute.arch.barrier()
-
-        is_io = warp_id >= Int32(self.math_threads // 32)
-        pre_idx0 = Int32(-1)
-        pre_idx1 = Int32(-1)
-        pre_ci = Int32(-1)
-        if is_io:
-            io_lane_pre = tid - Int32(self.math_threads)
-            pre_ci = split_idx * Int32(self.chunks_per_split)
-            main_cap = Int32(self.topk if self.topk > 0 else 1)
-            if cutlass.const_expr(has_extra):
-                if pre_ci >= num_main_chunks:
-                    pc = (pre_ci - num_main_chunks) * Int32(_CAND_WINDOW) + io_lane_pre
-                    if pc < Int32(self.extra_topk):
-                        pre_idx0 = Int32(extra_row[pc])
-                    if pc + Int32(32) < Int32(self.extra_topk):
-                        pre_idx1 = Int32(extra_row[pc + Int32(32)])
-                else:
-                    pc = pre_ci * Int32(_CAND_WINDOW) + io_lane_pre
-                    if pc < main_cap:
-                        pre_idx0 = Int32(topk_row[pc])
-                    if pc + Int32(32) < main_cap:
-                        pre_idx1 = Int32(topk_row[pc + Int32(32)])
-            else:
-                pc = pre_ci * Int32(_CAND_WINDOW) + io_lane_pre
-                if pc < main_cap:
-                    pre_idx0 = Int32(topk_row[pc])
-                if pc + Int32(32) < main_cap:
-                    pre_idx1 = Int32(topk_row[pc + Int32(32)])
-                if cutlass.const_expr(spec_first):
-                    spec_valid_chunks = (
-                        section_len + Int32(_CAND_WINDOW - 1)
-                    ) // Int32(_CAND_WINDOW)
-                    max_mc = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
-                    if spec_valid_chunks > max_mc:
-                        spec_valid_chunks = max_mc
-                    if pre_ci < spec_valid_chunks:
-                        if cutlass.const_expr(split_glm_rope):
-                            io_issue_split_glm_payload(
-                                kv_cache_u8,
-                                kv_raw_addr,
-                                kv_slice_addr,
-                                mbar_base,
-                                pre_idx0,
-                                pre_idx1,
-                                Int32(self.page_block_size),
-                                stride_kv_block,
-                                io_lane_pre,
-                                bulk_tx_bytes=t.bulk_tx_bytes,
-                            )
-                        else:
-                            io_issue_packed_payload(
-                                kv_cache_u8,
-                                kv_raw_addr,
-                                mbar_base,
-                                pre_idx0,
-                                pre_idx1,
-                                Int32(self.page_block_size),
-                                stride_kv_block,
-                                io_lane_pre,
-                                kv_smem_stride=staged_kv_stride,
-                                record_bytes=record_bytes,
-                                bulk_tx_bytes=t.bulk_tx_bytes,
-                            )
-
-        cps = Int32(self.chunks_per_split)
-        split_first_chunk = split_idx * cps
-        split_last_chunk = split_first_chunk + cps
-
-        main_valid_chunks = (section_len + Int32(_CAND_WINDOW - 1)) // Int32(
-            _CAND_WINDOW
+            if Int32(0) >= main_chunk_count:
+                ci = extra_first_chunk
+        split_cand_start = ci * Int32(_CAND_WINDOW)
+        tok_buf_view = cute.make_tensor(
+            token_idx_view.iterator,
+            cute.make_layout(int(L.token_idx_buf_bytes // 4)),
         )
-        if main_valid_chunks < Int32(0):
-            main_valid_chunks = Int32(0)
-        max_main_chunks = Int32((self.topk + _CAND_WINDOW - 1) // _CAND_WINDOW)
-        if main_valid_chunks > max_main_chunks:
-            main_valid_chunks = max_main_chunks
-        main_chunk_end = split_last_chunk
-        if main_chunk_end > main_valid_chunks:
-            main_chunk_end = main_valid_chunks
-        main_chunk_count = main_chunk_end - split_first_chunk
-        if main_chunk_count < Int32(0):
-            main_chunk_count = Int32(0)
+        cute.arch.mbarrier_wait(mbar_base, phase=0)
 
-        extra_first_chunk = split_first_chunk
-        extra_chunk_count = Int32(0)
-        if cutlass.const_expr(has_extra):
-            extra_valid_chunks = (extra_section_len + Int32(_CAND_WINDOW - 1)) // Int32(
-                _CAND_WINDOW
-            )
-            if extra_valid_chunks < Int32(0):
-                extra_valid_chunks = Int32(0)
-            max_extra_chunks = Int32(
-                (self.extra_topk + _CAND_WINDOW - 1) // _CAND_WINDOW
-            )
-            if extra_valid_chunks > max_extra_chunks:
-                extra_valid_chunks = max_extra_chunks
-            if extra_first_chunk < num_main_chunks:
-                extra_first_chunk = num_main_chunks
-            extra_chunk_end = split_last_chunk
-            extra_valid_end = num_main_chunks + extra_valid_chunks
-            if extra_chunk_end > extra_valid_end:
-                extra_chunk_end = extra_valid_end
-            extra_chunk_count = extra_chunk_end - extra_first_chunk
-            if extra_chunk_count < Int32(0):
-                extra_chunk_count = Int32(0)
-
-        active_chunks = main_chunk_count + extra_chunk_count
-        if active_chunks == Int32(0):
-            if tid < Int32(self.valid_hpb):
-                mid_lse[token_idx, head_base + tid, split_idx] = Float32(-Float32.inf)
-            if cutlass.const_expr(self.single_split_partial_bf16 is not None):
-                for index in cutlass.range(tid, self.valid_hpb * t.d_nope, self.block_threads):
-                    mid_out[
-                        token_idx,
-                        head_base + index // Int32(t.d_nope),
-                        split_idx,
-                        index % Int32(t.d_nope),
-                    ] = cutlass.BFloat16(0)
-            if cutlass.const_expr(spec_first):
-                if is_io:
-                    if tid == Int32(self.math_threads):
-                        cute.arch.mbarrier_arrive(mbar_base)
-                    cute.arch.mbarrier_wait(mbar_base, phase=0)
-            _exit_thread()
-
-        if is_io:
-            io_lane = tid - Int32(self.math_threads)
-            prod_phase = Int32(1)
-            prod_idx = Int32(0)
-            packed_kw = dict(
-                kv_smem_stride=staged_kv_stride,
-                record_bytes=record_bytes,
-                bulk_tx_bytes=t.bulk_tx_bytes,
-                dsv4_footer=is_dsv4,
-            )
-            for lc in cutlass.range(active_chunks, unroll=1):
-                active_idx = Int32(lc)
-                ci = split_first_chunk + active_idx
-                if cutlass.const_expr(has_extra):
-                    if active_idx >= main_chunk_count:
-                        ci = extra_first_chunk + active_idx - main_chunk_count
-                buf = Int32(0) if cutlass.const_expr(n_buf == 1) else (Int32(lc) & Int32(1))
-
-                cute.arch.mbarrier_wait(mbar_base + n_buf + prod_idx, phase=prod_phase)
-                tok_buf_view = cute.make_tensor(
-                    token_idx_view.iterator + buf * tok_buf_elems,
-                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
-                )
-                pre_ok = Int32(0)
-                if active_idx == Int32(0):
-                    if ci == pre_ci:
-                        pre_ok = Int32(1)
-                        if cutlass.const_expr(spec_first):
-                            pre_ok = Int32(2)
-
-                if cutlass.const_expr(has_extra):
-                    if ci >= num_main_chunks:
-                        cis = ci - num_main_chunks
-                        g_start = cis * Int32(_CAND_WINDOW)
-                        g_end = g_start + Int32(_CAND_WINDOW)
-                        if g_end > extra_section_len:
-                            g_end = extra_section_len
-                        io_issue_gather_packed(
-                            extra_kv_cache_u8,
-                            extra_row,
-                            kv_raw_addr + buf * kv_raw_buf,
-                            kv_sc_addr + buf * kv_sc_buf,
-                            tok_buf_view,
-                            mbar_base + buf,
-                            g_start,
-                            g_end,
-                            Int32(self.pbs_extra),
-                            stride_extra_kv_block,
-                            io_lane,
-                            pre_ok,
-                            pre_idx0,
-                            pre_idx1,
-                            index_capacity=self.extra_topk,
-                            **packed_kw,
-                        )
-                    else:
-                        g_start = ci * Int32(_CAND_WINDOW)
-                        g_end = g_start + Int32(_CAND_WINDOW)
-                        if g_end > section_len:
-                            g_end = section_len
-                        io_issue_gather_packed(
-                            kv_cache_u8,
-                            topk_row,
-                            kv_raw_addr + buf * kv_raw_buf,
-                            kv_sc_addr + buf * kv_sc_buf,
-                            tok_buf_view,
-                            mbar_base + buf,
-                            g_start,
-                            g_end,
-                            Int32(self.page_block_size),
-                            stride_kv_block,
-                            io_lane,
-                            pre_ok,
-                            pre_idx0,
-                            pre_idx1,
-                            index_capacity=(self.topk if self.topk > 0 else 1),
-                            **packed_kw,
-                        )
-                else:
-                    g_start = ci * Int32(_CAND_WINDOW)
-                    g_end = g_start + Int32(_CAND_WINDOW)
-                    if g_end > section_len:
-                        g_end = section_len
-                    if cutlass.const_expr(split_glm_rope):
-                        io_issue_gather_glm_split_rope(
-                            kv_cache_u8,
-                            topk_row,
-                            kv_raw_addr,
-                            kv_slice_addr,
-                            tok_buf_view,
-                            mbar_base,
-                            g_start,
-                            g_end,
-                            Int32(self.page_block_size),
-                            stride_kv_block,
-                            io_lane,
-                            pre_ok,
-                            pre_idx0,
-                            pre_idx1,
-                            bulk_tx_bytes=t.bulk_tx_bytes,
-                            index_capacity=(self.topk if self.topk > 0 else 1),
-                        )
-                    else:
-                        io_issue_gather_packed(
-                            kv_cache_u8,
-                            topk_row,
-                            kv_raw_addr + buf * kv_raw_buf,
-                            kv_sc_addr + buf * kv_sc_buf,
-                            tok_buf_view,
-                            mbar_base + buf,
-                            g_start,
-                            g_end,
-                            Int32(self.page_block_size),
-                            stride_kv_block,
-                            io_lane,
-                            pre_ok,
-                            pre_idx0,
-                            pre_idx1,
-                            index_capacity=(self.topk if self.topk > 0 else 1),
-                            **packed_kw,
-                        )
-
-                prod_idx += Int32(1)
-                if prod_idx == Int32(n_buf):
-                    prod_idx = Int32(0)
-                    prod_phase ^= Int32(1)
-        else:
-            q_token = cute.make_tensor(
-                q_all.iterator + token_idx.to(Int64) * Int64(self.q_stride_row),
-                cute.make_layout(
-                    (self.num_heads, self.q_head_dim),
-                    stride=(self.q_stride_head, self.q_stride_dim),
-                ),
-            )
-            n_slices = int(t.d_nope // 64)
-            n_acc_tiles = int(t.n_v_chunks) * int(t.nt_per_warp_xv)
-            rope_acc_elems = 4 if t.v_has_rope else 0
-            q_stage_slices = int(L.q_sc_bytes)
-            q_stage_slice_bytes = int(t.hpb * PV_BF16_QP_STRIDE * 2)
-            reg_start = n_slices - 2
-            smem_start = reg_start - q_stage_slices
-            warp_first_cand = warp_id * Int32(8)
-
-            a_row = (lane & Int32(7)) + ((lane >> Int32(3)) & Int32(1)) * Int32(8)
-            a_col = (lane >> Int32(4)) * Int32(8)
-            a_elem_off = (a_row * Int32(PV_BF16_QP_STRIDE) + a_col) * Int32(2)
-            qp_a_base = qp_addr + a_elem_off
-            if cutlass.const_expr(q_stage_slices > 0):
-                q_stage_addr = shared_ptr_to_u32(st.q_stage.data_ptr())
-            else:
-                q_stage_addr = Int32(0)
-            q_stage_a_base = q_stage_addr + a_elem_off
-
-            lane_r = lane & Int32(7)
-            lane_sub = (lane >> Int32(3)) & Int32(1)
-            b_row_base = kv_slice_addr + (warp_first_cand + lane_r) * Int32(
-                PV_BF16_SLICE_STRIDE
-            )
-            swz_base = lane_sub ^ lane_r
-            b_ptr0 = b_row_base + swz_base * Int32(16)
-
-            q_nope_frags = []
-            q_rope_frags = []
-            if cutlass.const_expr(not self.pv_bf16_2cta):
-                for si in cutlass.range_constexpr(q_stage_slices):
-                    load_q_slice_bf16_pv(
-                        q_token,
-                        q_stage_addr + Int32(si * q_stage_slice_bytes),
-                        head_base,
-                        Int32((smem_start + si) * 64),
-                        tid,
-                        hpb=t.hpb,
-                        valid_hpb=self.valid_hpb,
-                        vector_q=self.pv_bf16_vec_q,
-                        qp_stride=PV_BF16_QP_STRIDE,
-                    )
-                for r_idx in cutlass.range_constexpr(2):
-                    if cutlass.const_expr(r_idx > 0):
-                        cute.arch.barrier(
-                            barrier_id=2, number_of_threads=self.math_threads
-                        )
-                    load_q_slice_bf16_pv(
-                        q_token,
-                        qp_addr,
-                        head_base,
-                        Int32((reg_start + r_idx) * 64),
-                        tid,
-                        hpb=t.hpb,
-                        valid_hpb=self.valid_hpb,
-                        vector_q=self.pv_bf16_vec_q,
-                        qp_stride=PV_BF16_QP_STRIDE,
-                    )
-                    cute.arch.barrier(
-                        barrier_id=2, number_of_threads=self.math_threads
-                    )
-                    q_nope_frags.append(
-                        [
-                            _ldmatrix_m8n8x4_b16_disp(qp_a_base, sub * 32)
-                            for sub in range(4)
-                        ]
-                    )
-                if cutlass.const_expr(t.d_rope > 0):
-                    cute.arch.barrier(
-                        barrier_id=2, number_of_threads=self.math_threads
-                    )
-                    load_q_slice_bf16_pv(
-                        q_token,
-                        qp_addr,
-                        head_base,
-                        Int32(t.d_nope),
-                        tid,
-                        hpb=t.hpb,
-                        valid_hpb=self.valid_hpb,
-                        vector_q=self.pv_bf16_vec_q,
-                        qp_stride=PV_BF16_QP_STRIDE,
-                    )
-                    cute.arch.barrier(
-                        barrier_id=2, number_of_threads=self.math_threads
-                    )
-                    q_rope_frags = [
-                        _ldmatrix_m8n8x4_b16_disp(qp_a_base, sub * 32)
-                        for sub in range(4)
-                    ]
-                cute.arch.barrier(
-                    barrier_id=2, number_of_threads=self.math_threads
-                )
-
-            accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
-            accr_frag = cute.make_rmem_tensor(max(rope_acc_elems, 1), Float32)
-            gmax_frag = cute.make_rmem_tensor(2, Float32)
-            gsum_frag = cute.make_rmem_tensor(2, Float32)
-            for k in cutlass.range_constexpr(n_acc_tiles * 4):
-                accn_frag[k] = Float32(0.0)
-            for k in cutlass.range_constexpr(rope_acc_elems):
-                accr_frag[k] = Float32(0.0)
-            gmax_frag[0] = Float32(-1e30)
-            gmax_frag[1] = Float32(-1e30)
-            gsum_frag[0] = Float32(0.0)
-            gsum_frag[1] = Float32(0.0)
-
-            cons_phase = Int32(0)
-            cons_idx = Int32(0)
-
-            for lc in cutlass.range(active_chunks, unroll=1):
-                active_idx = Int32(lc)
-                ci = split_first_chunk + active_idx
-                if cutlass.const_expr(has_extra):
-                    if active_idx >= main_chunk_count:
-                        ci = extra_first_chunk + active_idx - main_chunk_count
-                split_cand_start = ci * Int32(_CAND_WINDOW)
-                buf = Int32(0) if cutlass.const_expr(n_buf == 1) else (Int32(lc) & Int32(1))
-
-                kv_raw_b = kv_raw_addr + buf * kv_raw_buf
-                kv_sc_b = kv_sc_addr + buf * kv_sc_buf
-                tok_buf_view = cute.make_tensor(
-                    token_idx_view.iterator + buf * tok_buf_elems,
-                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
-                )
-
-                acc_nope = [
-                    [
-                        accn_frag[at * 4 + 0],
-                        accn_frag[at * 4 + 1],
-                        accn_frag[at * 4 + 2],
-                        accn_frag[at * 4 + 3],
-                    ]
-                    for at in range(n_acc_tiles)
-                ]
-                acc_rope = (
-                    [accr_frag[k] for k in range(4)]
-                    if rope_acc_elems
-                    else [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                )
-                global_max = [gmax_frag[0], gmax_frag[1]]
-                global_sum = [gsum_frag[0], gsum_frag[1]]
-
-                if cutlass.const_expr(self.pv_bf16_2cta):
-                    # Overlap first Q slice copy into q_or_p with producer KV DMA.
-                    first_q_col = Int32(t.d_nope if t.d_rope > 0 else 0)
-                    load_q_slice_bf16_pv(
-                        q_token,
-                        qp_addr,
-                        head_base,
-                        first_q_col,
-                        tid,
-                        hpb=t.hpb,
-                        valid_hpb=self.valid_hpb,
-                        vector_q=self.pv_bf16_vec_q,
-                        qp_stride=PV_BF16_QP_STRIDE,
-                    )
-
-                cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
-
-                qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-
-                # S2: QK-RoPE runs FIRST in both Full and Compact so FP32 addition
-                # order is bit-identical across runtime live-row switches.
-                if cutlass.const_expr(t.d_rope > 0):
-                    if cutlass.const_expr(self.pv_bf16_2cta):
-                        cute.arch.barrier(
-                            barrier_id=2, number_of_threads=self.math_threads
-                        )
-                        if cutlass.const_expr(split_glm_rope):
-                            qk = s2_qk_rope_from_qp(
-                                qk,
-                                qp_a_base,
-                                kv_slice_addr,
-                                warp_first_cand,
-                                lane,
-                                kv_rope_stride_bytes=128,
-                            )
-                        else:
-                            qk = s2_qk_rope_from_qp(
-                                qk,
-                                qp_a_base,
-                                kv_raw_b + Int32(_DSV4_PACKED_ROPE_OFFSET),
-                                warp_first_cand,
-                                lane,
-                                kv_rope_stride_bytes=staged_kv_stride,
-                            )
-                        cute.arch.barrier(
-                            barrier_id=2, number_of_threads=self.math_threads
-                        )
-                    else:
-                        rope_off = (
-                            _DSV4_PACKED_ROPE_OFFSET
-                            if is_dsv4
-                            else (t.d_nope + 16)
-                        )
-                        qk = s2_qk_rope_from_frags(
-                            qk,
-                            q_rope_frags,
-                            kv_raw_b + Int32(rope_off),
-                            warp_first_cand,
-                            lane,
-                            kv_rope_stride_bytes=staged_kv_stride,
-                        )
-
-                # S1: QK-NoPE over swizzled [64, 64] BF16 slices.
-                if cutlass.const_expr(is_dsv4):
-                    for seg in cutlass.range_constexpr(n_slices):
-                        if cutlass.const_expr(self.pv_bf16_2cta):
-                            if cutlass.const_expr(seg > 0):
-                                cute.arch.barrier(
-                                    barrier_id=2, number_of_threads=self.math_threads
-                                )
-                            load_q_slice_bf16_pv(
-                                q_token,
-                                qp_addr,
-                                head_base,
-                                Int32(seg * 64),
-                                tid,
-                                hpb=t.hpb,
-                                valid_hpb=self.valid_hpb,
-                                vector_q=self.pv_bf16_vec_q,
-                                qp_stride=PV_BF16_QP_STRIDE,
-                            )
-                            decode_pv_bf16_slice_to_smem(
-                                kv_raw_b,
-                                kv_sc_b,
-                                kv_slice_addr,
-                                tok_buf_view,
-                                Int32(seg),
-                                warp_id,
-                                lane,
-                                raw_stride=staged_kv_stride,
-                                ue8m0_scales=True,
-                                mask_invalid=True,
-                            )
-                            cute.arch.barrier(
-                                barrier_id=2, number_of_threads=self.math_threads
-                            )
-                            qk = s1_qk_pv_bf16_slice_from_qp(
-                                qk, qp_a_base, b_ptr0
-                            )
-                        else:
-                            decode_pv_bf16_slice_to_smem(
-                                kv_raw_b,
-                                kv_sc_b,
-                                kv_slice_addr,
-                                tok_buf_view,
-                                Int32(seg),
-                                warp_id,
-                                lane,
-                                raw_stride=staged_kv_stride,
-                                ue8m0_scales=True,
-                                mask_invalid=True,
-                            )
-                            cute.arch.sync_warp()
-                            if cutlass.const_expr(seg >= reg_start):
-                                qk = s1_qk_pv_bf16_slice_from_frags(
-                                    qk,
-                                    q_nope_frags[seg - reg_start],
-                                    b_ptr0,
-                                )
-                            else:
-                                qk = s1_qk_pv_bf16_slice_from_qp(
-                                    qk,
-                                    q_stage_a_base
-                                    + Int32((seg - smem_start) * q_stage_slice_bytes),
-                                    b_ptr0,
-                                )
-                else:
-                    c0_qk = warp_first_cand + (lane & Int32(3)) * Int32(2)
-                    for grp in cutlass.range_constexpr(4):
-                        t_acc = [
-                            Float32(0.0),
-                            Float32(0.0),
-                            Float32(0.0),
-                            Float32(0.0),
-                        ]
-                        for sub_s in cutlass.range_constexpr(2):
-                            seg = 2 * grp + sub_s
-                            if cutlass.const_expr(self.pv_bf16_2cta):
-                                if cutlass.const_expr(seg > 0):
-                                    cute.arch.barrier(
-                                        barrier_id=2,
-                                        number_of_threads=self.math_threads,
-                                    )
-                                if cutlass.const_expr(t.d_rope > 0 or seg > 0):
-                                    load_q_slice_bf16_pv(
-                                        q_token,
-                                        qp_addr,
-                                        head_base,
-                                        Int32(seg * 64),
-                                        tid,
-                                        hpb=t.hpb,
-                                        valid_hpb=self.valid_hpb,
-                                        vector_q=self.pv_bf16_vec_q,
-                                        qp_stride=PV_BF16_QP_STRIDE,
-                                    )
-                                decode_pv_bf16_slice_to_smem(
-                                    kv_raw_b,
-                                    Int32(0),
-                                    kv_slice_addr,
-                                    tok_buf_view,
-                                    Int32(seg),
-                                    warp_id,
-                                    lane,
-                                    raw_stride=staged_kv_stride,
-                                    ue8m0_scales=False,
-                                    mask_invalid=self.zero_masked_v,
-                                )
-                                cute.arch.barrier(
-                                    barrier_id=2,
-                                    number_of_threads=self.math_threads,
-                                )
-                                t_acc = s1_qk_pv_bf16_slice_from_qp(
-                                    t_acc,
-                                    qp_a_base,
-                                    b_ptr0,
-                                )
-                            else:
-                                decode_pv_bf16_slice_to_smem(
-                                    kv_raw_b,
-                                    Int32(0),
-                                    kv_slice_addr,
-                                    tok_buf_view,
-                                    Int32(seg),
-                                    warp_id,
-                                    lane,
-                                    raw_stride=staged_kv_stride,
-                                    ue8m0_scales=False,
-                                    mask_invalid=self.zero_masked_v,
-                                )
-                                cute.arch.sync_warp()
-                                if cutlass.const_expr(seg >= reg_start):
-                                    t_acc = s1_qk_pv_bf16_slice_from_frags(
-                                        t_acc,
-                                        q_nope_frags[seg - reg_start],
-                                        b_ptr0,
-                                    )
-                                elif cutlass.const_expr(seg >= smem_start):
-                                    t_acc = s1_qk_pv_bf16_slice_from_qp(
-                                        t_acc,
-                                        q_stage_a_base
-                                        + Int32(
-                                            (seg - smem_start) * q_stage_slice_bytes
-                                        ),
-                                        b_ptr0,
-                                    )
-                                else:
-                                    t_acc = s1_qk_pv_bf16_slice_from_gmem(
-                                        t_acc,
-                                        q_token,
-                                        head_base,
-                                        Int32(seg * 64),
-                                        lane,
-                                        b_ptr0,
-                                        valid_hpb=self.valid_hpb,
-                                        vector_q=self.pv_bf16_vec_q,
-                                    )
-                        sc_at = kv_raw_b + Int32(t.d_nope + grp * 4)
-                        ks0 = Float32(0.0)
-                        ks1 = Float32(0.0)
-                        if cutlass.const_expr(self.zero_masked_v):
-                            if tok_buf_view[c0_qk] >= Int32(0):
-                                ks0 = ld_shared_f32(
-                                    sc_at + c0_qk * Int32(staged_kv_stride)
-                                )
-                            if tok_buf_view[c0_qk + Int32(1)] >= Int32(0):
-                                ks1 = ld_shared_f32(
-                                    sc_at
-                                    + (c0_qk + Int32(1))
-                                    * Int32(staged_kv_stride)
-                                )
-                        else:
-                            ks0 = ld_shared_f32(
-                                sc_at + c0_qk * Int32(staged_kv_stride)
-                            )
-                            ks1 = ld_shared_f32(
-                                sc_at
-                                + (c0_qk + Int32(1)) * Int32(staged_kv_stride)
-                            )
-                        qk[0] = qk[0] + t_acc[0] * ks0
-                        qk[1] = qk[1] + t_acc[1] * ks1
-                        qk[2] = qk[2] + t_acc[2] * ks0
-                        qk[3] = qk[3] + t_acc[3] * ks1
-
-                # S3: mask and scale.
-                if cutlass.const_expr(has_extra):
-                    sc_start = split_cand_start
-                    sec_len = section_len
-                    if ci >= num_main_chunks:
-                        sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
-                        sec_len = extra_section_len
-                    sc_end = sc_start + Int32(_CAND_WINDOW)
-                    if sc_end > sec_len:
-                        sc_end = sec_len
-                    qk = s3_mask_and_scale(
-                        qk,
-                        tok_buf_view,
-                        warp_first_cand,
-                        sc_start,
-                        sc_end,
-                        sec_len,
-                        sm_scale_log2,
-                        lane,
-                    )
-                else:
-                    split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
-                    if split_cand_end > section_len:
-                        split_cand_end = section_len
-                    qk = s3_mask_and_scale(
-                        qk,
-                        tok_buf_view,
-                        warp_first_cand,
-                        split_cand_start,
-                        split_cand_end,
-                        section_len,
-                        sm_scale_log2,
-                        lane,
-                    )
-
-                # S4: online softmax (its internal barrier also publishes the
-                # last QK slice in kv_bf16_slice across all 8 math warps).
-                p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                p, wr0, wr1 = s4_online_softmax(
-                    qk,
-                    p,
-                    acc_nope,
-                    acc_rope,
-                    global_max,
-                    global_sum,
-                    reduce_max_addr,
-                    reduce_sum_addr,
-                    False,
-                    warp_id,
-                    lane,
-                    tid,
-                    n_v_chunks=t.n_v_chunks,
-                    hpb=t.hpb,
-                    n_warps=8,
-                    valid_hpb=self.valid_hpb,
-                    num_threads=self.math_threads,
-                    barrier_id=3,
-                    n_acc_tiles=n_acc_tiles,
-                )
-                w_pre = [
-                    p[0] * wr0,
-                    p[1] * wr0,
-                    p[2] * wr1,
-                    p[3] * wr1,
-                ]
-
-                # S5 + S6 (+ S6b): BF16 PV reusing the last QK slice first.
-                v_base = (
-                    kv_slice_addr
-                    + (((lane >> Int32(3)) & Int32(1)) * Int32(8) + (lane & Int32(7)))
-                    * Int32(PV_BF16_SLICE_STRIDE)
-                    + (warp_id ^ (lane & Int32(7))) * Int32(16)
-                )
-                if cutlass.const_expr(is_dsv4):
-                    s5_fill_sm_p_bf16_pv(
-                        w_pre,
-                        qp_addr,
-                        warp_id,
-                        lane,
-                        sm_p_stride=PV_BF16_QP_STRIDE,
-                    )
-                    if cutlass.const_expr(t.v_has_rope):
-                        ent_z = tid >> Int32(2)
-                        if tok_buf_view[ent_z] < Int32(0):
-                            z_off = (
-                                ent_z * Int32(staged_kv_stride)
-                                + Int32(_DSV4_PACKED_ROPE_OFFSET)
-                                + (tid & Int32(3)) * Int32(32)
-                            )
-                            st_shared_v4_u32(
-                                kv_raw_b + z_off,
-                                Uint32(0),
-                                Uint32(0),
-                                Uint32(0),
-                                Uint32(0),
-                            )
-                            st_shared_v4_u32(
-                                kv_raw_b + z_off + Int32(16),
-                                Uint32(0),
-                                Uint32(0),
-                                Uint32(0),
-                                Uint32(0),
-                            )
-                    cute.arch.barrier(
-                        barrier_id=3, number_of_threads=self.math_threads
-                    )
-                    p_frags = load_pv_p_frags_bf16(qp_a_base, bi=t.bi)
-                    acc_nope[n_slices - 1] = s6_pv_bf16_slice_from_p_frags(
-                        acc_nope[n_slices - 1],
-                        p_frags,
-                        v_base,
-                        bi=t.bi,
-                        slice_stride=PV_BF16_SLICE_STRIDE,
-                    )
-                    if cutlass.const_expr(t.v_has_rope):
-                        acc_rope = s6b_xv_rope_from_p_frags(
-                            acc_rope,
-                            p_frags,
-                            kv_raw_b + Int32(_DSV4_PACKED_ROPE_OFFSET),
-                            warp_id,
-                            lane,
-                            bi=t.bi,
-                            d_rope=t.d_rope,
-                            n_warps=8,
-                            kv_rope_stride_bytes=staged_kv_stride,
-                        )
-                    for st_i in cutlass.range_constexpr(1, n_slices):
-                        vc = (n_slices - 1) - st_i
-                        cute.arch.barrier(
-                            barrier_id=3, number_of_threads=self.math_threads
-                        )
-                        decode_pv_bf16_slice_to_smem(
-                            kv_raw_b,
-                            kv_sc_b,
-                            kv_slice_addr,
-                            tok_buf_view,
-                            Int32(vc),
-                            warp_id,
-                            lane,
-                            raw_stride=staged_kv_stride,
-                            ue8m0_scales=True,
-                            mask_invalid=True,
-                        )
-                        cute.arch.barrier(
-                            barrier_id=3, number_of_threads=self.math_threads
-                        )
-                        acc_nope[vc] = s6_pv_bf16_slice_from_qp(
-                            acc_nope[vc],
-                            qp_a_base,
-                            v_base,
-                            bi=t.bi,
-                            slice_stride=PV_BF16_SLICE_STRIDE,
-                        )
-                else:
-                    for g_step in cutlass.range_constexpr(4):
-                        grp = 3 - g_step
-                        if cutlass.const_expr(g_step > 0):
-                            cute.arch.barrier(
-                                barrier_id=3,
-                                number_of_threads=self.math_threads,
-                            )
-                            decode_pv_bf16_slice_to_smem(
-                                kv_raw_b,
-                                Int32(0),
-                                kv_slice_addr,
-                                tok_buf_view,
-                                Int32(2 * grp + 1),
-                                warp_id,
-                                lane,
-                                raw_stride=staged_kv_stride,
-                                ue8m0_scales=False,
-                                mask_invalid=self.zero_masked_v,
-                            )
-                        s5_fill_sm_p_bf16_glm_pv(
-                            w_pre,
-                            qp_addr,
-                            kv_raw_b,
-                            tok_buf_view,
-                            Int32(grp),
-                            warp_id,
-                            lane,
-                            raw_stride=staged_kv_stride,
-                            scale_offset=t.d_nope,
-                            sm_p_stride=PV_BF16_QP_STRIDE,
-                            mask_invalid=self.zero_masked_v,
-                        )
-                        cute.arch.barrier(
-                            barrier_id=3, number_of_threads=self.math_threads
-                        )
-                        acc_nope[2 * grp + 1] = s6_pv_bf16_slice_from_qp(
-                            acc_nope[2 * grp + 1],
-                            qp_a_base,
-                            v_base,
-                            bi=t.bi,
-                            slice_stride=PV_BF16_SLICE_STRIDE,
-                        )
-                        cute.arch.barrier(
-                            barrier_id=3, number_of_threads=self.math_threads
-                        )
-                        decode_pv_bf16_slice_to_smem(
-                            kv_raw_b,
-                            Int32(0),
-                            kv_slice_addr,
-                            tok_buf_view,
-                            Int32(2 * grp),
-                            warp_id,
-                            lane,
-                            raw_stride=staged_kv_stride,
-                            ue8m0_scales=False,
-                            mask_invalid=self.zero_masked_v,
-                        )
-                        cute.arch.barrier(
-                            barrier_id=3, number_of_threads=self.math_threads
-                        )
-                        acc_nope[2 * grp] = s6_pv_bf16_slice_from_qp(
-                            acc_nope[2 * grp],
-                            qp_a_base,
-                            v_base,
-                            bi=t.bi,
-                            slice_stride=PV_BF16_SLICE_STRIDE,
-                        )
-
-                for at in cutlass.range_constexpr(n_acc_tiles):
-                    accn_frag[at * 4 + 0] = acc_nope[at][0]
-                    accn_frag[at * 4 + 1] = acc_nope[at][1]
-                    accn_frag[at * 4 + 2] = acc_nope[at][2]
-                    accn_frag[at * 4 + 3] = acc_nope[at][3]
-                for k in cutlass.range_constexpr(rope_acc_elems):
-                    accr_frag[k] = acc_rope[k]
-                gmax_frag[0] = global_max[0]
-                gmax_frag[1] = global_max[1]
-                gsum_frag[0] = global_sum[0]
-                gsum_frag[1] = global_sum[1]
-
-                cute.arch.barrier(
-                    barrier_id=3, number_of_threads=self.math_threads
-                )
-                if tid == Int32(0):
-                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
-                cons_idx += Int32(1)
-                if cons_idx == Int32(n_buf):
-                    cons_idx = Int32(0)
-                    cons_phase ^= Int32(1)
-
-            fin_acc_nope = [
-                [
-                    accn_frag[at * 4 + 0],
-                    accn_frag[at * 4 + 1],
-                    accn_frag[at * 4 + 2],
-                    accn_frag[at * 4 + 3],
-                ]
-                for at in range(n_acc_tiles)
-            ]
-            fin_acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
-            fin_gmax = [gmax_frag[0], gmax_frag[1]]
-            fin_gsum = [gsum_frag[0], gsum_frag[1]]
-
-            out_o = cute.make_tensor(
-                mid_out.iterator
-                + token_idx.to(Int64) * Int64(self.mid_out_stride_row)
-                + head_base.to(Int64) * Int64(self.mid_out_stride_head)
-                + split_idx.to(Int64) * Int64(self.mid_out_stride_split),
-                cute.make_layout(
-                    (t.hpb, t.d_v),
-                    stride=(self.mid_out_stride_head, self.mid_out_stride_dim),
-                ),
-            )
-            out_lse = cute.make_tensor(
-                mid_lse.iterator
-                + token_idx.to(Int64) * Int64(self.mid_lse_stride_row)
-                + head_base.to(Int64) * Int64(self.mid_lse_stride_head)
-                + split_idx.to(Int64) * Int64(self.mid_lse_stride_split),
-                cute.make_layout((t.hpb,), stride=(self.mid_lse_stride_head,)),
-            )
-            s7_epilogue_pv_bf16(
-                fin_acc_nope,
-                fin_acc_rope,
-                fin_gmax,
-                fin_gsum,
-                out_o,
-                out_lse,
+        qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+        if cutlass.const_expr(t.packed_bf16_decode):
+            expand_v4_tile(
+                kv_fp8_addr,
+                kv_sc_addr,
+                tok_buf_view,
                 warp_id,
                 lane,
-                n_slices=n_slices,
-                d_nope=t.d_nope,
-                valid_hpb=self.valid_hpb,
-                v_has_rope=t.v_has_rope,
-                single_split_partial_bf16=self.single_split_partial_bf16,
+                row_stride=staged_kv_stride,
+                packed=True,
             )
+            cute.arch.sync_warp()
+            qk = s1_qk_dsv41_bf16_smem(
+                qk,
+                q_fp8_addr,
+                kv_fp8_addr,
+                warp_first_cand,
+                lane,
+                d_nope=512,
+                q_nope_bf16_stride=t.q_nope_stride,
+                kv_bf16_stride=staged_kv_stride,
+            )
+        else:
+            qk, _unused = s1_qk_nope_bf16_mg2(
+                qk,
+                [Float32(0.0)] * 4,
+                q_fp8_addr,
+                q_fp8_addr,
+                kv_fp8_addr,
+                kv_sc_addr,
+                warp_first_cand,
+                lane,
+                num_scales=t.num_scales,
+                quant_tile=t.quant_tile,
+                q_nope_bf16_stride=t.q_nope_stride,
+                kv_smem_stride=staged_kv_stride,
+                scale_bytes_per_token=8,
+                n_hg=1,
+                inline_fp32_scale_offset=t.d_nope,
+                reg_prefix=q_prefix,
+                q_token=q_token,
+                head_base=head_base,
+                gmem_q_tail=bool(t.glm_compact_2cta and t.d_rope),
+                valid_hpb=self.valid_hpb,
+            )
+            qk = s2_qk_rope_bf16(
+                qk,
+                q_rope_addr,
+                kv_rope_addr,
+                warp_first_cand,
+                lane,
+                d_rope=t.d_rope,
+                q_rope_stride=L.q_rope_stride,
+                fp8_rope=t.fp8_rope,
+                kv_rope_stride_bytes=(
+                    staged_kv_stride if self.packed_glm_generic else t.d_rope * 2
+                ),
+            )
+
+        if cutlass.const_expr(has_extra):
+            sc_start = split_cand_start
+            sec_len = section_len
+            if ci >= num_main_chunks:
+                sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                sec_len = extra_section_len
+            sc_end = sc_start + Int32(_CAND_WINDOW)
+            if sc_end > sec_len:
+                sc_end = sec_len
+            qk = s3_mask_and_scale(
+                qk,
+                tok_buf_view,
+                warp_first_cand,
+                sc_start,
+                sc_end,
+                sec_len,
+                sm_scale_log2,
+                lane,
+            )
+        else:
+            split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+            if split_cand_end > section_len:
+                split_cand_end = section_len
+            qk = s3_mask_and_scale(
+                qk,
+                tok_buf_view,
+                warp_first_cand,
+                split_cand_start,
+                split_cand_end,
+                section_len,
+                sm_scale_log2,
+                lane,
+            )
+
+        fin_gmax = [Float32(-1e30), Float32(-1e30)]
+        fin_gsum = [Float32(0.0), Float32(0.0)]
+        p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+        p, wr0, wr1 = s4_online_softmax(
+            qk,
+            p,
+            None,
+            None,
+            fin_gmax,
+            fin_gsum,
+            reduce_max_addr,
+            reduce_sum_addr,
+            True,
+            warp_id,
+            lane,
+            tid,
+            n_v_chunks=t.n_v_chunks,
+            hpb=t.hpb,
+            n_warps=8,
+            valid_hpb=self.valid_hpb,
+            num_threads=self.math_threads,
+            barrier_id=3,
+            n_acc_tiles=n_acc_tiles,
+            vector_fold=True,
+        )
+        w_pre = [p[0] * wr0, p[1] * wr0, p[2] * wr1, p[3] * wr1]
+        s5_fill_sm_p_bf16(
+            w_pre,
+            sm_p_full_addr,
+            warp_id,
+            lane,
+            sm_p_stride=L.sm_p_full_stride,
+        )
+        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+        fin_acc_nope = [
+            [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+            for _ in range(n_acc_tiles)
+        ]
+        fin_acc_rope = [Float32(0.0) for _ in range(rope_acc_elems)]
+        if cutlass.const_expr(t.packed_bf16_decode):
+            fin_acc_nope, fin_acc_rope = apply_v4_pv(
+                fin_acc_nope,
+                fin_acc_rope,
+                None,
+                sm_p_full_addr,
+                warp_id,
+                lane,
+                sm_p_stride=L.sm_p_full_stride,
+                kv_base=kv_fp8_addr,
+            )
+        else:
+            v_scales = snapshot_glm_scales(
+                kv_fp8_addr,
+                warp_id,
+                lane,
+                tok_buf_view,
+                stride=staged_kv_stride,
+                zero_masked_v=self.zero_masked_v,
+            )
+            fin_acc_nope = apply_glm_pv(
+                fin_acc_nope,
+                v_scales,
+                sm_p_full_addr,
+                warp_id,
+                lane,
+                kv_fp8_addr,
+                tok_buf_view,
+                w_fp8_addr,
+                pstride=L.sm_p_full_stride,
+                record_stride=staged_kv_stride,
+                zero_masked_v=self.zero_masked_v,
+            )
+        return fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum
 
     @cute.jit
     def _kernel_body(
@@ -2567,6 +1576,8 @@ class UnifiedDecodeKernel:
             staged_kv_stride = _GLM_KV_GMEM_STRIDE
         if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
             staged_kv_stride = _DSV4_PACKED_SMEM_STRIDE
+        if cutlass.const_expr(t.pv_bf16 and t.scale_format == ScaleFormat.UE8M0_BYTE):
+            staged_kv_stride = L.kv_smem_stride
         kv_fp8_buf = Int32(t.bi * staged_kv_stride)
         kv_rope_buf = Int32(L.kv_rope_buf_bytes)
         kv_sc_buf = Int32(L.kv_sc_buf_bytes)
@@ -2643,10 +1654,14 @@ class UnifiedDecodeKernel:
             warp_first_cand = warp_sel * Int32(16)
 
         full_arrivals = 2 if self.native_h16 else 1
+        empty_arrivals = 8 if (self.glm_bf16 or t.packed_bf16_decode) else 1
+        if cutlass.const_expr(self.glm_bf16 and self.zero_masked_v):
+            if tid < Int32(4):
+                st_shared_u32(w_fp8_addr + tid * Int32(4), Uint32(0))
         if tid == Int32(0):
             for s in cutlass.range_constexpr(n_buf):
                 cute.arch.mbarrier_init(mbar_base + s, Int32(full_arrivals))
-                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(1))  # empty[s]
+                cute.arch.mbarrier_init(mbar_base + n_buf + s, Int32(empty_arrivals))  # empty[s]
         cute.arch.barrier()  # Full-CTA structural fence.
 
         # ── Length-independent prologue work. The Q staging and the first
@@ -2673,6 +1688,31 @@ class UnifiedDecodeKernel:
                     num_threads=self.math_threads,
                     barrier_id=2,
                     hpb_local=self.vector_q_hpb,
+                )
+        elif cutlass.const_expr(self.vector_decode_bf16):
+            if not is_io:
+                stage_decode_q_bf16_vec(
+                    q_token,
+                    q_fp8_addr,
+                    q_rope_addr,
+                    head_base,
+                    tid,
+                    d_nope=(512 if t.packed_bf16_decode else t.d_nope),
+                    d_rope=(0 if t.packed_bf16_decode else t.d_rope),
+                    hpb=t.hpb,
+                    valid_hpb=self.valid_hpb,
+                    q_stride=t.q_nope_stride,
+                    rope_stride=L.q_rope_stride,
+                    threads=self.math_threads,
+                    skip=(
+                        512
+                        if (t.glm_compact_2cta and t.d_rope)
+                        else (
+                            192
+                            if (t.glm_compact_2cta or (t.glm_record_ring and t.d_rope))
+                            else 0
+                        )
+                    ),
                 )
         elif cutlass.const_expr(self.vector_q_bf16):
             if not is_io:
@@ -2862,7 +1902,7 @@ class UnifiedDecodeKernel:
                     kv_smem_stride=staged_kv_stride,
                     record_bytes=self.packed_record_bytes,
                     bulk_tx_bytes=t.bulk_tx_bytes,
-                    dsv4_footer=self.native_dsv4_h8,
+                    dsv4_footer=self.native_dsv4_h8 or t.packed_bf16_decode,
                 )
                 # The first active chunk reuses the indices preloaded before the
                 # length-dependent prologue when it is the chunk they came from.
@@ -3071,7 +2111,7 @@ class UnifiedDecodeKernel:
                     cute.make_layout(int(L.w_head_sc_bytes // 4)),
                 )
 
-            if cutlass.const_expr(self.vector_q or self.vector_q_bf16):
+            if cutlass.const_expr(self.vector_q or self.vector_q_bf16 or self.vector_decode_bf16):
                 pass
             elif cutlass.const_expr(
                 t.pv_bf16 or (t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8)
@@ -3099,67 +2139,117 @@ class UnifiedDecodeKernel:
                     packed_q_scale_words=self.native_h16 or self.native_dsv41_fp8,
                 )
 
-            accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
             rope_acc_elems = 8 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 4
-            accr_frag = cute.make_rmem_tensor(rope_acc_elems, Float32)
-            gmax_frag = cute.make_rmem_tensor(2, Float32)
-            gsum_frag = cute.make_rmem_tensor(2, Float32)
-            for k in cutlass.range_constexpr(n_acc_tiles * 4):
-                accn_frag[k] = Float32(0.0)
-            for k in cutlass.range_constexpr(rope_acc_elems):
-                accr_frag[k] = Float32(0.0)
-            gmax_frag[0] = Float32(-1e30)
-            gmax_frag[1] = Float32(-1e30)
-            gsum_frag[0] = Float32(0.0)
-            gsum_frag[1] = Float32(0.0)
-
-            cons_phase = Int32(0)
-            cons_idx = Int32(0)
-
-            for lc in cutlass.range(active_chunks, unroll=1):
-                active_idx = Int32(lc)
-                ci = split_first_chunk + active_idx
-                if cutlass.const_expr(has_extra):
-                    if active_idx >= main_chunk_count:
-                        ci = extra_first_chunk + active_idx - main_chunk_count
-                split_cand_start = ci * Int32(_CAND_WINDOW)
-                buf = Int32(0) if cutlass.const_expr(n_buf == 1) else (Int32(lc) & Int32(1))
-
-                kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
-                kv_rope_b = kv_rope_addr + buf * kv_rope_buf
-                kv_sc_b = kv_sc_addr + buf * kv_sc_buf
-                tok_buf_view = cute.make_tensor(
-                    token_idx_view.iterator + buf * tok_buf_elems,
-                    cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+            if cutlass.const_expr(self.single_chunk_bf16):
+                fin_acc_nope, fin_acc_rope, fin_gmax, fin_gsum = (
+                    self._consume_single_chunk_bf16(
+                        q_token,
+                        head_base,
+                        q_fp8_addr,
+                        q_rope_addr,
+                        kv_fp8_addr,
+                        kv_rope_addr,
+                        kv_sc_addr,
+                        w_fp8_addr,
+                        reduce_max_addr,
+                        reduce_sum_addr,
+                        sm_p_full_addr,
+                        token_idx_view,
+                        mbar_base,
+                        split_first_chunk,
+                        main_chunk_count,
+                        extra_first_chunk,
+                        num_main_chunks,
+                        section_len,
+                        extra_section_len,
+                        sm_scale_log2,
+                        warp_id,
+                        warp_first_cand,
+                        lane,
+                        tid,
+                        has_extra=has_extra,
+                        staged_kv_stride=staged_kv_stride,
+                        n_acc_tiles=n_acc_tiles,
+                        rope_acc_elems=rope_acc_elems,
+                    )
                 )
+            else:
+                q_prefix = None
+                if cutlass.const_expr(t.glm_record_ring and t.d_rope):
+                    q_prefix = load_glm_q_prefix(
+                        q_token, head_base, lane, n_tiles=12, valid_hpb=self.valid_hpb
+                    )
+                accn_frag = cute.make_rmem_tensor(n_acc_tiles * 4, Float32)
+                accr_frag = cute.make_rmem_tensor(rope_acc_elems, Float32)
+                gmax_frag = cute.make_rmem_tensor(2, Float32)
+                gsum_frag = cute.make_rmem_tensor(2, Float32)
+                for k in cutlass.range_constexpr(n_acc_tiles * 4):
+                    accn_frag[k] = Float32(0.0)
+                for k in cutlass.range_constexpr(rope_acc_elems):
+                    accr_frag[k] = Float32(0.0)
+                gmax_frag[0] = Float32(-1e30)
+                gmax_frag[1] = Float32(-1e30)
+                gsum_frag[0] = Float32(0.0)
+                gsum_frag[1] = Float32(0.0)
 
-                acc_nope = [
-                    [
-                        accn_frag[at * 4 + 0],
-                        accn_frag[at * 4 + 1],
-                        accn_frag[at * 4 + 2],
-                        accn_frag[at * 4 + 3],
-                    ]
-                    for at in range(n_acc_tiles)
-                ]
-                acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
-                global_max = [gmax_frag[0], gmax_frag[1]]
-                global_sum = [gsum_frag[0], gsum_frag[1]]
+                cons_phase = Int32(0)
+                cons_idx = Int32(0)
 
-                cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
-                if cutlass.const_expr(self.dsv41_bf16_tile):
+                for lc in cutlass.range(active_chunks, unroll=1):
+                    active_idx = Int32(lc)
+                    ci = split_first_chunk + active_idx
                     if cutlass.const_expr(has_extra):
-                        if ci >= num_main_chunks:
-                            decode_dsv41_kv_to_bf16_smem(
-                                kv_fp8_b,
-                                warp_id,
-                                lane,
-                                swa=False,
-                                bi=t.bi,
-                                row_stride=staged_kv_stride,
-                                raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
-                                math_warps=self.math_threads // 32,
-                            )
+                        if active_idx >= main_chunk_count:
+                            ci = extra_first_chunk + active_idx - main_chunk_count
+                    split_cand_start = ci * Int32(_CAND_WINDOW)
+                    buf = Int32(0) if cutlass.const_expr(n_buf == 1) else (Int32(lc) & Int32(1))
+
+                    kv_fp8_b = kv_fp8_addr + buf * kv_fp8_buf
+                    kv_rope_b = kv_rope_addr + buf * kv_rope_buf
+                    kv_sc_b = kv_sc_addr + buf * kv_sc_buf
+                    tok_buf_view = cute.make_tensor(
+                        token_idx_view.iterator + buf * tok_buf_elems,
+                        cute.make_layout(int(L.token_idx_buf_bytes // 4)),
+                    )
+
+                    acc_nope = [
+                        [
+                            accn_frag[at * 4 + 0],
+                            accn_frag[at * 4 + 1],
+                            accn_frag[at * 4 + 2],
+                            accn_frag[at * 4 + 3],
+                        ]
+                        for at in range(n_acc_tiles)
+                    ]
+                    acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
+                    global_max = [gmax_frag[0], gmax_frag[1]]
+                    global_sum = [gsum_frag[0], gsum_frag[1]]
+
+                    cute.arch.mbarrier_wait(mbar_base + cons_idx, phase=cons_phase)
+                    if cutlass.const_expr(self.dsv41_bf16_tile):
+                        if cutlass.const_expr(has_extra):
+                            if ci >= num_main_chunks:
+                                decode_dsv41_kv_to_bf16_smem(
+                                    kv_fp8_b,
+                                    warp_id,
+                                    lane,
+                                    swa=False,
+                                    bi=t.bi,
+                                    row_stride=staged_kv_stride,
+                                    raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                                    math_warps=self.math_threads // 32,
+                                )
+                            else:
+                                decode_dsv41_kv_to_bf16_smem(
+                                    kv_fp8_b,
+                                    warp_id,
+                                    lane,
+                                    swa=True,
+                                    bi=t.bi,
+                                    row_stride=staged_kv_stride,
+                                    raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                                    math_warps=self.math_threads // 32,
+                                )
                         else:
                             decode_dsv41_kv_to_bf16_smem(
                                 kv_fp8_b,
@@ -3171,283 +2261,124 @@ class UnifiedDecodeKernel:
                                 raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
                                 math_warps=self.math_threads // 32,
                             )
-                    else:
-                        decode_dsv41_kv_to_bf16_smem(
+                    if cutlass.const_expr(self.native_dsv41_fp8):
+                        s0_normalize_dsv41_kv_to_fp8(
                             kv_fp8_b,
+                            kv_fp8_b + Int32(544),
                             warp_id,
                             lane,
-                            swa=True,
                             bi=t.bi,
-                            row_stride=staged_kv_stride,
-                            raw_offset=DSV41_BF16_RAW_ROW_OFFSET,
+                            kv_smem_stride=staged_kv_stride,
+                            ratio_smem_stride=staged_kv_stride,
                             math_warps=self.math_threads // 32,
                         )
-                if cutlass.const_expr(self.native_dsv41_fp8):
-                    s0_normalize_dsv41_kv_to_fp8(
-                        kv_fp8_b,
-                        kv_fp8_b + Int32(544),
-                        warp_id,
-                        lane,
-                        bi=t.bi,
-                        kv_smem_stride=staged_kv_stride,
-                        ratio_smem_stride=staged_kv_stride,
-                        math_warps=self.math_threads // 32,
-                    )
-                    cute.arch.barrier(
-                        barrier_id=3, number_of_threads=self.math_threads
-                    )
-                if cutlass.const_expr(t.scale_format == 0):
-                    # Mask V itself: MMA still propagates NaNs when P is zero.
-                    for part in cutlass.range_constexpr(
-                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
-                    ):
-                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
-                        if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
-                            for chunk in cutlass.range_constexpr(448 // 16):
-                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
-                                st_shared_u32(
-                                    kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
-                                    Uint32(0),
-                                )
-                            rope_stride = Int32(t.d_rope * 2)
-                            if cutlass.const_expr(
-                                self.native_dsv4_h8 or self.native_dsv4_h16
-                            ):
-                                rope_stride = Int32(staged_kv_stride)
-                            for chunk in cutlass.range_constexpr(128 // 16):
-                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
-                                st_shared_u32(
-                                    kv_rope_b + entry * rope_stride + offset, Uint32(0)
-                                )
-                if cutlass.const_expr(self.zero_masked_v):
-                    # The same for GLM (opt-in): zero a masked candidate's E4M3 V
-                    # and its inline FP32 group scales, bytes [0, 528) of the
-                    # staged row. S3 replaces the masked score, so QK needs
-                    # nothing, and the RoPE that follows on GLM_NSA rows is QK's.
-                    for part in cutlass.range_constexpr(
-                        (t.bi * 4 + self.math_threads - 1) // self.math_threads
-                    ):
-                        entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
-                        if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
-                            for chunk in cutlass.range_constexpr(_GLM_V_STAGE_BYTES // 16):
-                                offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
-                                st_shared_u32(
-                                    kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
-                                    Uint32(0),
-                                )
-                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                        cute.arch.barrier(
+                            barrier_id=3, number_of_threads=self.math_threads
+                        )
+                    if cutlass.const_expr(t.scale_format == 0 and not t.packed_bf16_decode):
+                        # Mask V itself: MMA still propagates NaNs when P is zero.
+                        for part in cutlass.range_constexpr(
+                            (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                        ):
+                            entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                            if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
+                                for chunk in cutlass.range_constexpr(448 // 16):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                    st_shared_u32(
+                                        kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
+                                        Uint32(0),
+                                    )
+                                rope_stride = Int32(t.d_rope * 2)
+                                if cutlass.const_expr(
+                                    self.native_dsv4_h8 or self.native_dsv4_h16
+                                ):
+                                    rope_stride = Int32(staged_kv_stride)
+                                for chunk in cutlass.range_constexpr(128 // 16):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                    st_shared_u32(
+                                        kv_rope_b + entry * rope_stride + offset, Uint32(0)
+                                    )
+                    if cutlass.const_expr(self.zero_masked_v and not self.glm_bf16):
+                        # The same for GLM (opt-in): zero a masked candidate's E4M3 V
+                        # and its inline FP32 group scales, bytes [0, 528) of the
+                        # staged row. S3 replaces the masked score, so QK needs
+                        # nothing, and the RoPE that follows on GLM_NSA rows is QK's.
+                        for part in cutlass.range_constexpr(
+                            (t.bi * 4 + self.math_threads - 1) // self.math_threads
+                        ):
+                            entry = tid // Int32(4) + Int32(part * self.math_threads // 4)
+                            if entry < Int32(t.bi) and tok_buf_view[entry] < Int32(0):
+                                for chunk in cutlass.range_constexpr(_GLM_V_STAGE_BYTES // 16):
+                                    offset = (tid % Int32(4)) * Int32(4) + Int32(chunk * 16)
+                                    st_shared_u32(
+                                        kv_fp8_b + entry * Int32(staged_kv_stride) + offset,
+                                        Uint32(0),
+                                    )
+                    if cutlass.const_expr(not t.packed_bf16_decode and not self.glm_bf16):
+                        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
 
-                # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
-                # discarded the per-group e4m3 mantissa headroom and cost ~0.003
-                # cos). The arbitrary fp32 group scale is applied POST-MMA in S1
-                # (QK) / inline in S6 (V). DSV4 (UE8M0_BYTE) is unaffected (it never
-                # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
+                    # P10f: GLM keeps RAW e4m3 K/V (no S0b dequant+requant -- that
+                    # discarded the per-group e4m3 mantissa headroom and cost ~0.003
+                    # cos). The arbitrary fp32 group scale is applied POST-MMA in S1
+                    # (QK) / inline in S6 (V). DSV4 (UE8M0_BYTE) is unaffected (it never
+                    # ran S0b: scale_format==0), so its trace/PTX stay byte-identical.
 
-                qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                if cutlass.const_expr(self.native_h8 or self.native_h16):
-                    if cutlass.const_expr(self.native_glm_h8):
-                        qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
+                    qk = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                    if cutlass.const_expr(self.native_h8 or self.native_h16):
+                        if cutlass.const_expr(self.native_glm_h8):
+                            qk = s1_qk_nope_block_scaled_glm_h8_swap_ab(
+                                qk,
+                                q_fp8_stage,
+                                kv_fp8_b,
+                                q_sc_stage_view,
+                                warp_first_cand,
+                                lane,
+                                num_scales=t.num_scales,
+                                quant_tile=t.quant_tile,
+                                q_nope_stride=t.q_nope_stride,
+                                kv_smem_stride=staged_kv_stride,
+                            )
+                            h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
+                            h8_rope_stride = staged_kv_stride
+                        else:
+                            qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
+                                qk,
+                                q_fp8_stage,
+                                kv_fp8_b,
+                                q_sc_stage_view,
+                                kv_sc_b,
+                                warp_first_cand,
+                                lane,
+                                num_scales=t.num_scales,
+                                quant_tile=t.quant_tile,
+                                q_nope_stride=t.q_nope_stride,
+                                kv_smem_stride=staged_kv_stride,
+                                scale_bytes_per_token=8,
+                                packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
+                                packed_q_scale_words=self.native_h16 or self.native_dsv41_fp8,
+                            )
+                            h8_rope_addr = kv_rope_b
+                            h8_rope_stride = staged_kv_stride
+                        qk = s2_qk_rope_bf16_glm_h8_swap_ab(
                             qk,
-                            q_fp8_stage,
-                            kv_fp8_b,
-                            q_sc_stage_view,
+                            q_rope_stage,
+                            h8_rope_addr,
                             warp_first_cand,
                             lane,
-                            num_scales=t.num_scales,
-                            quant_tile=t.quant_tile,
-                            q_nope_stride=t.q_nope_stride,
-                            kv_smem_stride=staged_kv_stride,
+                            d_rope=t.d_rope,
+                            q_rope_stride=L.q_rope_stride,
+                            kv_rope_stride_bytes=h8_rope_stride,
                         )
-                        h8_rope_addr = kv_fp8_b + Int32(t.kv_smem_stride)
-                        h8_rope_stride = staged_kv_stride
-                    else:
-                        qk = s1_qk_nope_block_scaled_dsv4_h8_swap_ab(
-                            qk,
-                            q_fp8_stage,
-                            kv_fp8_b,
-                            q_sc_stage_view,
-                            kv_sc_b,
-                            warp_first_cand,
-                            lane,
-                            num_scales=t.num_scales,
-                            quant_tile=t.quant_tile,
-                            q_nope_stride=t.q_nope_stride,
-                            kv_smem_stride=staged_kv_stride,
-                            scale_bytes_per_token=8,
-                            packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
-                            packed_q_scale_words=self.native_h16 or self.native_dsv41_fp8,
-                        )
-                        h8_rope_addr = kv_rope_b
-                        h8_rope_stride = staged_kv_stride
-                    qk = s2_qk_rope_bf16_glm_h8_swap_ab(
-                        qk,
-                        q_rope_stage,
-                        h8_rope_addr,
-                        warp_first_cand,
-                        lane,
-                        d_rope=t.d_rope,
-                        q_rope_stride=L.q_rope_stride,
-                        kv_rope_stride_bytes=h8_rope_stride,
-                    )
-                    sc_start = split_cand_start
-                    sec_len = section_len
-                    if cutlass.const_expr(has_extra):
-                        if ci >= num_main_chunks:
-                            sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
-                            sec_len = extra_section_len
-                    sc_end = sc_start + Int32(_CAND_WINDOW)
-                    if sc_end > sec_len:
-                        sc_end = sec_len
-                    qk = s3_mask_and_scale_glm_h8_swap_ab(
-                        qk,
-                        tok_buf_view,
-                        warp_first_cand,
-                        sc_start,
-                        sc_end,
-                        sec_len,
-                        sm_scale_log2,
-                        lane,
-                    )
-                    p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
-                        qk,
-                        p,
-                        acc_nope,
-                        acc_rope,
-                        global_max,
-                        global_sum,
-                        reduce_max_stage,
-                        reduce_sum_stage,
-                        warp_sel,
-                        lane,
-                        tid_sel,
-                        n_acc_tiles=n_acc_tiles,
-                        hpb=t.hpb,
-                        n_warps=4,
-                        num_threads=nt_stage,
-                        barrier_id=3,
-                        rope_tiles_per_warp=(
-                            2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 0
-                        ),
-                        barrier_threads=bt_stage,
-                    )
-                    w_pre = [
-                        p[0] * wr0,
-                        p[1] * wr1,
-                        p[2] * wr0,
-                        p[3] * wr1,
-                    ]
-                    if cutlass.const_expr(self.native_glm_h8):
-                        acc_nope = s6_xv_nope_glm_h8_swap_ab(
-                            w_pre,
-                            acc_nope,
-                            kv_fp8_b,
-                            w_head_sc_view,
-                            w_fp8_addr,
-                            warp_id,
-                            lane,
-                            tid,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            kv_smem_stride=staged_kv_stride,
-                            w_fp8_stride=t.bi + 16,
-                            n_warps=4,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            num_threads=self.math_threads,
-                            barrier_id=3,
-                        )
-                    else:
-                        acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
-                            w_pre,
-                            acc_nope,
-                            kv_fp8_b,
-                            kv_sc_b,
-                            w_head_sc_stage_view,
-                            w_fp8_stage,
-                            sm_p_stage,
-                            warp_sel,
-                            lane,
-                            tid_sel,
-                            n_v_chunks=t.n_v_chunks,
-                            v_chunk=t.quant_tile,
-                            hpb=t.hpb,
-                            bi=t.bi,
-                            sm_p_stride=L.sm_p_full_stride,
-                            kv_smem_stride=staged_kv_stride,
-                            w_fp8_stride=t.bi + 16,
-                            n_warps=4,
-                            nt_per_warp_xv=t.nt_per_warp_xv,
-                            scale_bytes_per_token=8,
-                            num_threads=nt_stage,
-                            barrier_id=3,
-                            barrier_threads=bt_stage,
-                            packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
-                        )
-                else:
-                    if cutlass.const_expr(t.pv_bf16):
-                        qk, _unused = s1_qk_nope_bf16_mg2(
-                            qk, [Float32(0.0)] * 4, q_fp8_addr, q_fp8_addr,
-                            kv_fp8_b, kv_sc_b, warp_first_cand, lane,
-                            num_scales=t.num_scales, quant_tile=t.quant_tile,
-                            q_nope_bf16_stride=t.q_nope_stride,
-                            kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
-                            n_hg=1, inline_fp32_scale_offset=(
-                                t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
-                        )
-                    elif cutlass.const_expr(self.dsv41_bf16_tile):
-                        qk = s1_qk_dsv41_bf16_smem(
-                            qk,
-                            q_fp8_addr,
-                            kv_fp8_b,
-                            warp_first_cand,
-                            lane,
-                            d_nope=t.d_nope,
-                            q_nope_bf16_stride=t.q_nope_stride,
-                            kv_bf16_stride=staged_kv_stride,
-                        )
-                    else:
-                        qk = s1_qk_nope_block_scaled(
-                            qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
-                            warp_first_cand, lane, latent_scale,
-                            num_scales=t.num_scales, quant_tile=t.quant_tile,
-                            q_nope_stride=t.q_nope_stride,
-                            kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
-                            scale_format=(
-                                ScaleFormat.UE8M0_BYTE
-                                if self.native_dsv41_fp8 else t.scale_format
-                            ),
-                            latent_scale_per_token=t.latent_scale_per_token,
-                        )
-                    qk = s2_qk_rope_bf16(
-                        qk,
-                        q_rope_addr,
-                        kv_rope_b,
-                        warp_first_cand,
-                        lane,
-                        d_rope=t.d_rope,
-                        q_rope_stride=L.q_rope_stride,
-                        fp8_rope=t.fp8_rope,
-                        kv_rope_stride_bytes=(
-                            staged_kv_stride
-                            if self.packed_glm_generic
-                            else t.d_rope * 2
-                        ),
-                    )
-
-                    # Per-chunk section dispatch for the S3 mask: compare the
-                    # candidate's offset within its main/extra section.
-                    if cutlass.const_expr(has_extra):
                         sc_start = split_cand_start
                         sec_len = section_len
-                        if ci >= num_main_chunks:
-                            sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
-                            sec_len = extra_section_len
+                        if cutlass.const_expr(has_extra):
+                            if ci >= num_main_chunks:
+                                sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                                sec_len = extra_section_len
                         sc_end = sc_start + Int32(_CAND_WINDOW)
                         if sc_end > sec_len:
                             sc_end = sec_len
-                        qk = s3_mask_and_scale(
+                        qk = s3_mask_and_scale_glm_h8_swap_ab(
                             qk,
                             tok_buf_view,
                             warp_first_cand,
@@ -3457,184 +2388,387 @@ class UnifiedDecodeKernel:
                             sm_scale_log2,
                             lane,
                         )
-                    else:
-                        split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
-                        if split_cand_end > section_len:
-                            split_cand_end = section_len
-                        qk = s3_mask_and_scale(
+                        p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                        p, wr0, wr1 = s4_online_softmax_glm_h8_swap_ab(
                             qk,
-                            tok_buf_view,
-                            warp_first_cand,
-                            split_cand_start,
-                            split_cand_end,
-                            section_len,
-                            sm_scale_log2,
+                            p,
+                            acc_nope,
+                            acc_rope,
+                            global_max,
+                            global_sum,
+                            reduce_max_stage,
+                            reduce_sum_stage,
+                            warp_sel,
                             lane,
+                            tid_sel,
+                            n_acc_tiles=n_acc_tiles,
+                            hpb=t.hpb,
+                            n_warps=4,
+                            num_threads=nt_stage,
+                            barrier_id=3,
+                            rope_tiles_per_warp=(
+                                2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 0
+                            ),
+                            barrier_threads=bt_stage,
                         )
-
-                    p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                    p, wr0, wr1 = s4_online_softmax(
-                        qk,
-                        p,
-                        acc_nope,
-                        acc_rope,
-                        global_max,
-                        global_sum,
-                        reduce_max_addr,
-                        reduce_sum_addr,
-                        False,
-                        warp_id,
-                        lane,
-                        tid,
-                        n_v_chunks=t.n_v_chunks,
-                        hpb=t.hpb,
-                        n_warps=8,
-                        valid_hpb=self.valid_hpb,
-                        num_threads=self.math_threads,
-                        barrier_id=3,
-                        n_acc_tiles=n_acc_tiles,
-                    )
-                    w_pre = [
-                        p[0] * wr0,
-                        p[1] * wr0,
-                        p[2] * wr1,
-                        p[3] * wr1,
-                    ]
-                    if cutlass.const_expr(self.dsv41_bf16_tile or t.pv_bf16):
-                        s5_fill_sm_p_bf16(
-                            w_pre,
-                            sm_p_full_addr,
-                            warp_id,
-                            lane,
-                            sm_p_stride=L.sm_p_full_stride,
-                        )
-                        cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                        if cutlass.const_expr(t.pv_bf16):
-                            acc_nope = s6_xv_nope_nvfp4_bf16(
-                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane, latent_scale,
-                                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, bi=t.bi,
-                                kv_smem_stride=staged_kv_stride, n_warps=8,
+                        w_pre = [
+                            p[0] * wr0,
+                            p[1] * wr1,
+                            p[2] * wr0,
+                            p[3] * wr1,
+                        ]
+                        if cutlass.const_expr(self.native_glm_h8):
+                            acc_nope = s6_xv_nope_glm_h8_swap_ab(
+                                w_pre,
+                                acc_nope,
+                                kv_fp8_b,
+                                w_head_sc_view,
+                                w_fp8_addr,
+                                warp_id,
+                                lane,
+                                tid,
+                                n_v_chunks=t.n_v_chunks,
+                                v_chunk=t.quant_tile,
+                                hpb=t.hpb,
+                                bi=t.bi,
+                                kv_smem_stride=staged_kv_stride,
+                                w_fp8_stride=t.bi + 16,
+                                n_warps=4,
                                 nt_per_warp_xv=t.nt_per_warp_xv,
-                                sm_p_stride=L.sm_p_full_stride,
-                                inline_fp32_scale_offset=(
-                                    t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
-                                ue8m0_scales=t.scale_format == ScaleFormat.UE8M0_BYTE,
-                                kv_sc_base_addr=kv_sc_b,
+                                num_threads=self.math_threads,
+                                barrier_id=3,
                             )
                         else:
-                            acc_nope = s6_pv_dsv41_bf16_smem(
-                                acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane,
-                                n_v_chunks=t.n_v_chunks, bi=t.bi,
-                                sm_p_stride=L.sm_p_full_stride, kv_bf16_stride=staged_kv_stride,
+                            acc_nope = s6_xv_nope_dsv4_h8_swap_ab(
+                                w_pre,
+                                acc_nope,
+                                kv_fp8_b,
+                                kv_sc_b,
+                                w_head_sc_stage_view,
+                                w_fp8_stage,
+                                sm_p_stage,
+                                warp_sel,
+                                lane,
+                                tid_sel,
+                                n_v_chunks=t.n_v_chunks,
+                                v_chunk=t.quant_tile,
+                                hpb=t.hpb,
+                                bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride,
+                                kv_smem_stride=staged_kv_stride,
+                                w_fp8_stride=t.bi + 16,
+                                n_warps=4,
+                                nt_per_warp_xv=t.nt_per_warp_xv,
+                                scale_bytes_per_token=8,
+                                num_threads=nt_stage,
+                                barrier_id=3,
+                                barrier_threads=bt_stage,
+                                packed_footer_words=self.native_h16 or self.native_dsv41_fp8,
                             )
                     else:
-                        s5_fill_sm_p_full(
-                            w_pre,
-                            sm_p_full_addr,
-                            w_head_sc_view,
+                        if cutlass.const_expr(t.pv_bf16 and t.scale_format == ScaleFormat.UE8M0_BYTE):
+                            expand_v4_tile(
+                                kv_fp8_b,
+                                kv_sc_b,
+                                tok_buf_view,
+                                warp_id,
+                                lane,
+                                row_stride=staged_kv_stride,
+                                packed=t.packed_bf16_decode,
+                            )
+                            cute.arch.sync_warp()
+                            qk = s1_qk_dsv41_bf16_smem(
+                                qk,
+                                q_fp8_addr,
+                                kv_fp8_b,
+                                warp_first_cand,
+                                lane,
+                                d_nope=(512 if t.packed_bf16_decode else t.d_nope),
+                                q_nope_bf16_stride=t.q_nope_stride,
+                                kv_bf16_stride=staged_kv_stride,
+                            )
+                        elif cutlass.const_expr(t.pv_bf16):
+                            qk, _unused = s1_qk_nope_bf16_mg2(
+                                qk, [Float32(0.0)] * 4, q_fp8_addr, q_fp8_addr,
+                                kv_fp8_b, kv_sc_b, warp_first_cand, lane,
+                                num_scales=t.num_scales, quant_tile=t.quant_tile,
+                                q_nope_bf16_stride=t.q_nope_stride,
+                                kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
+                                n_hg=1, reg_prefix=q_prefix, inline_fp32_scale_offset=(
+                                    t.d_nope if t.scale_format == ScaleFormat.ARBITRARY_FP32 else 0),
+                            )
+                        elif cutlass.const_expr(self.dsv41_bf16_tile):
+                            qk = s1_qk_dsv41_bf16_smem(
+                                qk,
+                                q_fp8_addr,
+                                kv_fp8_b,
+                                warp_first_cand,
+                                lane,
+                                d_nope=t.d_nope,
+                                q_nope_bf16_stride=t.q_nope_stride,
+                                kv_bf16_stride=staged_kv_stride,
+                            )
+                        else:
+                            qk = s1_qk_nope_block_scaled(
+                                qk, q_fp8_addr, kv_fp8_b, q_sc_view, kv_sc_b,
+                                warp_first_cand, lane, latent_scale,
+                                num_scales=t.num_scales, quant_tile=t.quant_tile,
+                                q_nope_stride=t.q_nope_stride,
+                                kv_smem_stride=staged_kv_stride, scale_bytes_per_token=8,
+                                scale_format=(
+                                    ScaleFormat.UE8M0_BYTE
+                                    if self.native_dsv41_fp8 else t.scale_format
+                                ),
+                                latent_scale_per_token=t.latent_scale_per_token,
+                            )
+                        if cutlass.const_expr(not t.packed_bf16_decode):
+                            qk = s2_qk_rope_bf16(
+                                qk,
+                                q_rope_addr,
+                                kv_rope_b,
+                                warp_first_cand,
+                                lane,
+                                d_rope=t.d_rope,
+                                q_rope_stride=L.q_rope_stride,
+                                fp8_rope=t.fp8_rope,
+                                kv_rope_stride_bytes=(
+                                    staged_kv_stride
+                                    if self.packed_glm_generic
+                                    else t.d_rope * 2
+                                ),
+                            )
+
+                        # Per-chunk section dispatch for the S3 mask: compare the
+                        # candidate's offset within its main/extra section.
+                        if cutlass.const_expr(has_extra):
+                            sc_start = split_cand_start
+                            sec_len = section_len
+                            if ci >= num_main_chunks:
+                                sc_start = (ci - num_main_chunks) * Int32(_CAND_WINDOW)
+                                sec_len = extra_section_len
+                            sc_end = sc_start + Int32(_CAND_WINDOW)
+                            if sc_end > sec_len:
+                                sc_end = sec_len
+                            qk = s3_mask_and_scale(
+                                qk,
+                                tok_buf_view,
+                                warp_first_cand,
+                                sc_start,
+                                sc_end,
+                                sec_len,
+                                sm_scale_log2,
+                                lane,
+                            )
+                        else:
+                            split_cand_end = split_cand_start + Int32(_CAND_WINDOW)
+                            if split_cand_end > section_len:
+                                split_cand_end = section_len
+                            qk = s3_mask_and_scale(
+                                qk,
+                                tok_buf_view,
+                                warp_first_cand,
+                                split_cand_start,
+                                split_cand_end,
+                                section_len,
+                                sm_scale_log2,
+                                lane,
+                            )
+
+                        if cutlass.const_expr(t.packed_bf16_decode):
+                            cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                            v_fragments = snapshot_v4_pv_fragments(kv_fp8_b, warp_id, lane)
+                            cute.arch.sync_warp()
+                            if lane == Int32(0):
+                                cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+
+                        p = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+                        p, wr0, wr1 = s4_online_softmax(
+                            qk,
+                            p,
+                            acc_nope,
+                            acc_rope,
+                            global_max,
+                            global_sum,
+                            reduce_max_addr,
+                            reduce_sum_addr,
+                            False,
                             warp_id,
                             lane,
                             tid,
-                            bi=t.bi,
-                            sm_p_stride=L.sm_p_full_stride,
                             n_v_chunks=t.n_v_chunks,
                             hpb=t.hpb,
+                            n_warps=8,
+                            valid_hpb=self.valid_hpb,
                             num_threads=self.math_threads,
                             barrier_id=3,
+                            n_acc_tiles=n_acc_tiles,
+                            vector_fold=t.pv_bf16,
                         )
+                        w_pre = [
+                            p[0] * wr0,
+                            p[1] * wr0,
+                            p[2] * wr1,
+                            p[3] * wr1,
+                        ]
+                        if cutlass.const_expr(self.dsv41_bf16_tile or t.pv_bf16):
+                            s5_fill_sm_p_bf16(
+                                w_pre,
+                                sm_p_full_addr,
+                                warp_id,
+                                lane,
+                                sm_p_stride=L.sm_p_full_stride,
+                            )
+                            cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                            if cutlass.const_expr(t.packed_bf16_decode):
+                                acc_nope, acc_rope = apply_v4_pv(
+                                    acc_nope,
+                                    acc_rope,
+                                    v_fragments,
+                                    sm_p_full_addr,
+                                    warp_id,
+                                    lane,
+                                    sm_p_stride=L.sm_p_full_stride,
+                                )
+                            elif cutlass.const_expr(self.glm_bf16):
+                                v_scales = snapshot_glm_scales(
+                                    kv_fp8_b,
+                                    warp_id,
+                                    lane,
+                                    tok_buf_view,
+                                    stride=staged_kv_stride,
+                                    zero_masked_v=self.zero_masked_v,
+                                )
+                                acc_nope = apply_glm_pv(
+                                    acc_nope,
+                                    v_scales,
+                                    sm_p_full_addr,
+                                    warp_id,
+                                    lane,
+                                    kv_fp8_b,
+                                    tok_buf_view,
+                                    w_fp8_addr,
+                                    pstride=L.sm_p_full_stride,
+                                    record_stride=staged_kv_stride,
+                                    zero_masked_v=self.zero_masked_v,
+                                )
+                                cute.arch.sync_warp()
+                                if lane == Int32(0):
+                                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+                            else:
+                                acc_nope = s6_pv_dsv41_bf16_smem(
+                                    acc_nope, sm_p_full_addr, kv_fp8_b, warp_id, lane,
+                                    n_v_chunks=t.n_v_chunks, bi=t.bi,
+                                    sm_p_stride=L.sm_p_full_stride, kv_bf16_stride=staged_kv_stride,
+                                )
+                        else:
+                            s5_fill_sm_p_full(
+                                w_pre,
+                                sm_p_full_addr,
+                                w_head_sc_view,
+                                warp_id,
+                                lane,
+                                tid,
+                                bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride,
+                                n_v_chunks=t.n_v_chunks,
+                                hpb=t.hpb,
+                                num_threads=self.math_threads,
+                                barrier_id=3,
+                            )
+                            cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                            acc_nope = s6_xv_nope(
+                                w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view,
+                                w_fp8_addr, warp_id, lane, tid, latent_scale,
+                                n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb,
+                                bi=t.bi, kv_smem_stride=staged_kv_stride,
+                                w_fp8_stride=t.bi + 16, n_warps=8,
+                                scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
+                                scale_format=(
+                                    ScaleFormat.UE8M0_BYTE
+                                    if self.native_dsv41_fp8 else t.scale_format
+                                ),
+                                num_threads=self.math_threads, barrier_id=3,
+                                sm_p_full_addr=sm_p_full_addr, sm_p_stride=L.sm_p_full_stride,
+                                latent_scale_per_token=t.latent_scale_per_token,
+                                w_fp8_bufs=L.w_fp8_bufs,
+                            )
+
+                    # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
+                    if cutlass.const_expr(t.v_has_rope and not t.packed_bf16_decode):
+                        if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
+                            acc_rope = s6b_xv_rope_h8_swap_ab(
+                                acc_rope,
+                                sm_p_stage,
+                                kv_rope_b,
+                                warp_sel,
+                                lane,
+                                bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride,
+                                d_rope=t.d_rope,
+                                n_warps=4,
+                                tiles_per_warp=2,
+                                kv_rope_stride_bytes=staged_kv_stride,
+                            )
+                        else:
+                            acc_rope = s6b_xv_rope(
+                                acc_rope,
+                                sm_p_full_addr,
+                                kv_rope_b,
+                                warp_id,
+                                lane,
+                                bi=t.bi,
+                                sm_p_stride=L.sm_p_full_stride,
+                                d_rope=t.d_rope,
+                                n_warps=8,
+                            )
+
+                    for at in cutlass.range_constexpr(n_acc_tiles):
+                        accn_frag[at * 4 + 0] = acc_nope[at][0]
+                        accn_frag[at * 4 + 1] = acc_nope[at][1]
+                        accn_frag[at * 4 + 2] = acc_nope[at][2]
+                        accn_frag[at * 4 + 3] = acc_nope[at][3]
+                    for k in cutlass.range_constexpr(rope_acc_elems):
+                        accr_frag[k] = acc_rope[k]
+                    gmax_frag[0] = global_max[0]
+                    gmax_frag[1] = global_max[1]
+                    gsum_frag[0] = global_sum[0]
+                    gsum_frag[1] = global_sum[1]
+
+                    if cutlass.const_expr(not t.packed_bf16_decode and not self.glm_bf16):
                         cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                        acc_nope = s6_xv_nope(
-                            w_pre, acc_nope, kv_fp8_b, kv_sc_b, w_head_sc_view,
-                            w_fp8_addr, warp_id, lane, tid, latent_scale,
-                            n_v_chunks=t.n_v_chunks, v_chunk=t.quant_tile, hpb=t.hpb,
-                            bi=t.bi, kv_smem_stride=staged_kv_stride,
-                            w_fp8_stride=t.bi + 16, n_warps=8,
-                            scale_bytes_per_token=8, nt_per_warp_xv=t.nt_per_warp_xv,
-                            scale_format=(
-                                ScaleFormat.UE8M0_BYTE
-                                if self.native_dsv41_fp8 else t.scale_format
-                            ),
-                            num_threads=self.math_threads, barrier_id=3,
-                            sm_p_full_addr=sm_p_full_addr, sm_p_stride=L.sm_p_full_stride,
-                            latent_scale_per_token=t.latent_scale_per_token,
-                            w_fp8_bufs=L.w_fp8_bufs,
-                        )
+                        if tid == Int32(0):
+                            cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
+                    cons_idx += Int32(1)
+                    if cons_idx == Int32(n_buf):
+                        cons_idx = Int32(0)
+                        cons_phase ^= Int32(1)
 
-                # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
-                if cutlass.const_expr(t.v_has_rope):
-                    if cutlass.const_expr(self.native_dsv4_h8 or self.native_dsv4_h16):
-                        acc_rope = s6b_xv_rope_h8_swap_ab(
-                            acc_rope,
-                            sm_p_stage,
-                            kv_rope_b,
-                            warp_sel,
-                            lane,
-                            bi=t.bi,
-                            sm_p_stride=L.sm_p_full_stride,
-                            d_rope=t.d_rope,
-                            n_warps=4,
-                            tiles_per_warp=2,
-                            kv_rope_stride_bytes=staged_kv_stride,
-                        )
-                    else:
-                        acc_rope = s6b_xv_rope(
-                            acc_rope,
-                            sm_p_full_addr,
-                            kv_rope_b,
-                            warp_id,
-                            lane,
-                            bi=t.bi,
-                            sm_p_stride=L.sm_p_full_stride,
-                            d_rope=t.d_rope,
-                            n_warps=8,
-                        )
-
-                for at in cutlass.range_constexpr(n_acc_tiles):
-                    accn_frag[at * 4 + 0] = acc_nope[at][0]
-                    accn_frag[at * 4 + 1] = acc_nope[at][1]
-                    accn_frag[at * 4 + 2] = acc_nope[at][2]
-                    accn_frag[at * 4 + 3] = acc_nope[at][3]
-                for k in cutlass.range_constexpr(rope_acc_elems):
-                    accr_frag[k] = acc_rope[k]
-                gmax_frag[0] = global_max[0]
-                gmax_frag[1] = global_max[1]
-                gsum_frag[0] = global_sum[0]
-                gsum_frag[1] = global_sum[1]
-
-                cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
-                if tid == Int32(0):
-                    cute.arch.mbarrier_arrive(mbar_base + n_buf + cons_idx)
-                cons_idx += Int32(1)
-                if cons_idx == Int32(n_buf):
-                    cons_idx = Int32(0)
-                    cons_phase ^= Int32(1)
-
-            # ── S7: write this split's NORMALIZED partial + base-2 LSE into
-            #    mid_out[token, :, split, :] / mid_lse[token, :, split]. ──
-            fin_acc_nope = [
-                [
-                    accn_frag[at * 4 + 0],
-                    accn_frag[at * 4 + 1],
-                    accn_frag[at * 4 + 2],
-                    accn_frag[at * 4 + 3],
+                # ── S7: write this split's NORMALIZED partial + base-2 LSE into
+                #    mid_out[token, :, split, :] / mid_lse[token, :, split]. ──
+                fin_acc_nope = [
+                    [
+                        accn_frag[at * 4 + 0],
+                        accn_frag[at * 4 + 1],
+                        accn_frag[at * 4 + 2],
+                        accn_frag[at * 4 + 3],
+                    ]
+                    for at in range(n_acc_tiles)
                 ]
-                for at in range(n_acc_tiles)
-            ]
-            fin_acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
-            fin_gmax = [gmax_frag[0], gmax_frag[1]]
-            fin_gsum = [gsum_frag[0], gsum_frag[1]]
-            if cutlass.const_expr(self.native_h8 or self.native_h16):
-                gid = lane >> Int32(2)
-                pair_lane = gid >> Int32(1)
-                row_gmax0 = cute.arch.shuffle_sync(gmax_frag[0], pair_lane)
-                row_gmax1 = cute.arch.shuffle_sync(gmax_frag[1], pair_lane)
-                row_gsum0 = cute.arch.shuffle_sync(gsum_frag[0], pair_lane)
-                row_gsum1 = cute.arch.shuffle_sync(gsum_frag[1], pair_lane)
-                fin_gmax[0] = row_gmax0
-                fin_gsum[0] = row_gsum0
-                if (gid & Int32(1)) != Int32(0):
-                    fin_gmax[0] = row_gmax1
-                    fin_gsum[0] = row_gsum1
+                fin_acc_rope = [accr_frag[k] for k in range(rope_acc_elems)]
+                fin_gmax = [gmax_frag[0], gmax_frag[1]]
+                fin_gsum = [gsum_frag[0], gsum_frag[1]]
+                if cutlass.const_expr(self.native_h8 or self.native_h16):
+                    gid = lane >> Int32(2)
+                    pair_lane = gid >> Int32(1)
+                    row_gmax0 = cute.arch.shuffle_sync(gmax_frag[0], pair_lane)
+                    row_gmax1 = cute.arch.shuffle_sync(gmax_frag[1], pair_lane)
+                    row_gsum0 = cute.arch.shuffle_sync(gsum_frag[0], pair_lane)
+                    row_gsum1 = cute.arch.shuffle_sync(gsum_frag[1], pair_lane)
+                    fin_gmax[0] = row_gmax0
+                    fin_gsum[0] = row_gsum0
+                    if (gid & Int32(1)) != Int32(0):
+                        fin_gmax[0] = row_gmax1
+                        fin_gsum[0] = row_gsum1
 
             if cutlass.const_expr(self.native_dsv41_fp8 and self.valid_hpb < 8):
                 # H8 MMA computes padded rows, but the output pool is sized for
@@ -3680,6 +2814,7 @@ class UnifiedDecodeKernel:
                 nt_per_warp_xv=t.nt_per_warp_xv,
                 v_has_rope=t.v_has_rope,
                 single_split_partial_bf16=self.single_split_partial_bf16,
+                contiguous_glm_warp=self.glm_bf16,
                 rope_tiles_per_warp=(
                     2 if (self.native_dsv4_h8 or self.native_dsv4_h16) else 1
                 ),
