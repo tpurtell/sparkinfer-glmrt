@@ -1,4 +1,6 @@
-"""CPU-only contracts for the MG precision diagnostic."""
+"""Contracts for the MG precision diagnostic."""
+from pathlib import Path
+
 import pytest
 
 from benchmarks.bench_mg_precision import SOURCE, aot_cell_seed, arm_traits, critical_path_samples, decode_arm_traits, parse_args
@@ -111,7 +113,11 @@ from cuda.bindings import driver as cuda
 from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
 from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
 from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
-from benchmarks.bench_mg_precision import make_records
+from importlib.util import module_from_spec, spec_from_file_location
+spec = spec_from_file_location("duel_bench", os.environ["CUTEAFD_DUEL_HARNESS"])
+harness = module_from_spec(spec)
+spec.loader.exec_module(harness)
+make_records = harness.make_records
 
 family = sys.argv[1]
 v4 = family.startswith("v4")
@@ -156,7 +162,8 @@ with torch.cuda.stream(stream):
 stream.synchronize()
 assert torch.equal(cold.view(torch.int16), out.view(torch.int16)), "cold graph differs from warm launch"
 """
-    env = {**os.environ, "CUTEAFD_SPARKINFER_SOURCE_DIR": str(SOURCE)}
+    env = {**os.environ, "CUTEAFD_SPARKINFER_SOURCE_DIR": str(SOURCE),
+           "CUTEAFD_DUEL_HARNESS": str(Path(__file__).resolve().parents[2] / "benchmarks/bench_mg_precision.py")}
     result = subprocess.run([sys.executable, "-c", child, family], env=env,
                             capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
