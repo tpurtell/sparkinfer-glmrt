@@ -293,7 +293,8 @@ def row_sets(entries, dense_curve=False):
     # K8's split-K shuffle/reduce selector also has an M2/M3 edge not
     # advertised in decode_route_thresholds (it preserves arithmetic).
     extra = {3} if any(e["geometry"]["bits"] == 8 for e in entries) else set()
-    samples = set(range(1, 65)) if dense_curve else set(ROWS)
+    # The head routes may revert at M65; time that edge without ranking it.
+    samples = set(range(1, 66)) if dense_curve else set(ROWS)
     timing = sorted(samples | extra | {edge + offset for edge in edges for offset in (0, 1)})
     oracle = sorted(set(timing) | {edge + offset for edge in transitions for offset in (0, 1)} | {257})
     return timing, oracle
