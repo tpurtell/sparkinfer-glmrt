@@ -1,7 +1,7 @@
 """CPU-only contracts for the MG precision diagnostic."""
 import pytest
 
-from benchmarks.bench_mg_precision import aot_cell_seed, arm_traits, critical_path_samples, decode_arm_traits, parse_args
+from benchmarks.bench_mg_precision import SOURCE, aot_cell_seed, arm_traits, critical_path_samples, decode_arm_traits, parse_args
 from b12x.attention._shared.mla.traits import ComputeMode, ModelType
 
 
@@ -103,7 +103,9 @@ def test_aot_first_launch_inside_capture(family):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     child = r"""
+import os
 import sys
+sys.path.insert(0, os.environ["CUTEAFD_SPARKINFER_SOURCE_DIR"])
 import torch
 from cuda.bindings import driver as cuda
 from b12x.integration.cuteafd import FLASH, PRO, GLM53, GLM53_FLASH, exportable_compilation
@@ -154,6 +156,7 @@ with torch.cuda.stream(stream):
 stream.synchronize()
 assert torch.equal(cold.view(torch.int16), out.view(torch.int16)), "cold graph differs from warm launch"
 """
-    result = subprocess.run([sys.executable, "-c", child, family], env=os.environ.copy(),
+    env = {**os.environ, "CUTEAFD_SPARKINFER_SOURCE_DIR": str(SOURCE)}
+    result = subprocess.run([sys.executable, "-c", child, family], env=env,
                             capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
