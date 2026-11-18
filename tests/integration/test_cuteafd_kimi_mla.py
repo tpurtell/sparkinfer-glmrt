@@ -399,7 +399,9 @@ def test_ragged_mla_gpu_attention_and_merged_lse(heads, context, amplitude, kv_c
 
 @pytest.mark.parametrize("heads", [48, 96])
 def test_compact_extend_bf16_tier_beats_native_fp8(heads):
-    require_b12x()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.backends.cuda.matmul.allow_tf32 = False
     from b12x.attention._shared.mla.reference import (
         pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference,
     )
