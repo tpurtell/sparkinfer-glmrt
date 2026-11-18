@@ -1,7 +1,7 @@
 """CPU-only contracts for the MG precision diagnostic."""
 import pytest
 
-from benchmarks.bench_mg_precision import arm_traits, decode_arm_traits, parse_args
+from benchmarks.bench_mg_precision import aot_cell_seed, arm_traits, decode_arm_traits, parse_args
 from b12x.attention._shared.mla.traits import ComputeMode, ModelType
 
 
@@ -70,3 +70,11 @@ def test_decode_aot_has_fixed_production_cells_and_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("B12X_MLA_SM120_NUM_SPLITS", "2")
     with pytest.raises(SystemExit):
         parse_args(argv)
+
+
+def test_aot_cell_seeds_do_not_depend_on_selection_or_iteration_order():
+    cells = (("glmf-h64", "sparse"), ("v4p-h64", "c128"), ("v4p-h64", "c4"))
+    forward = {cell: aot_cell_seed(2146, *cell) for cell in cells}
+    assert forward == {cell: aot_cell_seed(2146, *cell) for cell in reversed(cells)}
+    assert len(set(forward.values())) == len(cells)
+    assert aot_cell_seed(2147, *cells[0]) != forward[cells[0]]

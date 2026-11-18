@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 from dataclasses import asdict, replace
 import json
 import math
@@ -180,6 +181,12 @@ def build_decode(q, main_cache, extra_cache, mi, ei, sink):
     return runs, lses
 
 
+def aot_cell_seed(seed, cell, kind):
+    """Stable across processes, subset selections, and matrix ordering."""
+    key = f"{seed}:{cell}:{kind}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
+
+
 def run_decode_aot(args):
     """Compare the production launch ABI over full-width packed records."""
     import torch
@@ -195,7 +202,6 @@ def run_decode_aot(args):
     from b12x.integration.cuteafd.dsv4_sparse_mla import compile_dsv4_sparse_mla_aot
     from b12x.integration.cuteafd.glm_sparse_mla import compile_glm_sparse_mla_aot
 
-    torch.manual_seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
@@ -213,9 +219,9 @@ def run_decode_aot(args):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     geometries = {"glm": GLM53, "glmf": GLM53_FLASH, "v4f": FLASH, "v4p": PRO}
 
-    def make_records(width, page, qdim, v4):
+    def make_records(width, page, qdim, v4, generator):
         slots = max(8192, width)
-        raw = torch.randn((slots, qdim), device=device).bfloat16()
+        raw = torch.randn((slots, qdim), device=device, generator=generator).bfloat16()
         if v4:
             cache = pack_v4(raw[:, :448], raw[:, 448:], page_size=page)
             k, v = unpack_v4(cache, page_size=page)
@@ -238,14 +244,17 @@ def run_decode_aot(args):
         scale = 512 ** -.5 if v4 else g.softmax_scale
         record_bytes = 584 if v4 else g.record_bytes
         main_width = 128 if v4 else getattr(g, "sparse_topk", g.index_topk)
-        main_cache, main_ids, main_lengths, mk, mv = make_records(main_width, 256 if v4 else g.page_rows, qdim, v4)
-        q = (torch.randn((capacity, heads, qdim), device=device) * 2.5).bfloat16()
         sink = torch.linspace(-1, 1, heads, device=device)
         kinds = (("win", 0, 64), ("c4", g.index_topk, 64), ("c128", 1024, 2)) if v4 else (("sparse", 0, 0),)
         for kind, width, page in kinds:
+            seed = aot_cell_seed(args.seed, cell, kind)
+            generator = torch.Generator(device=device).manual_seed(seed)
+            main_cache, main_ids, main_lengths, mk, mv = make_records(
+                main_width, 256 if v4 else g.page_rows, qdim, v4, generator)
+            q = (torch.randn((capacity, heads, qdim), device=device, generator=generator) * 2.5).bfloat16()
             inputs = (q, main_cache, main_ids, main_lengths)
             if width:
-                extra, extra_ids, extra_lengths, ek, ev = make_records(width, page, qdim, True)
+                extra, extra_ids, extra_lengths, ek, ev = make_records(width, page, qdim, True, generator)
             if v4:
                 inputs += ((extra, extra_ids, extra_lengths) if width else (None, None, None)) + (sink,)
             ref_out, ref_lse = [], []
@@ -277,7 +286,7 @@ def run_decode_aot(args):
             for plan_rows in plans:
                 for rows in range(1, capacity + 1):
                     record = {"cell": cell, "kind": kind, "rows": rows, "plan_rows": plan_rows,
-                              "unique_kv_bytes_per_row": (main_width + width) * record_bytes, "arms": {}}
+                              "cell_seed": seed, "unique_kv_bytes_per_row": (main_width + width) * record_bytes, "arms": {}}
                     scalars = (rows,) if v4 else (rows, plan_rows)
                     def execute(arm):
                         programs[arm].launch(*inputs, outs[arm], scratch[arm], scalars=scalars, stream=stream_handle)
