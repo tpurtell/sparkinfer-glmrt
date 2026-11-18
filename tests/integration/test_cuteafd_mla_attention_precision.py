@@ -1,5 +1,6 @@
 """Precision must change real QK/PV arithmetic, not only program metadata."""
 from dataclasses import replace
+from math import log2, e
 
 import pytest
 import torch
@@ -49,7 +50,7 @@ def test_bf16_attention_beats_fp8_on_identical_records(family, route):
     k = keys[selected.long()]
     scores = torch.bmm(query.float(), k.transpose(1, 2)) * scale
     if family == "v4":
-        sink = torch.zeros(heads, device="cuda")
+        sink = torch.linspace(-1, 1, heads, device="cuda")
         denominator = torch.logsumexp(torch.cat((scores, sink[None, :, None].expand(rows, -1, -1)), -1), -1)
         expected = torch.bmm(torch.exp(scores - denominator[:, :, None]), values[selected.long()])
     else:
@@ -103,7 +104,7 @@ def test_bf16_attention_beats_fp8_on_identical_records(family, route):
                 row_lse = scratch.view(torch.float32).reshape(rows, heads)[0]
                 if family == "v4":
                     # Sink contributes to normalization even with no real keys.
-                    assert torch.equal(row_lse, sink)
+                    torch.testing.assert_close(row_lse, sink * log2(e), rtol=0, atol=1e-6)
                 else:
                     assert torch.isneginf(row_lse).all()
     print(f"{family}/{route}: F32 relative RMS {errors}")
