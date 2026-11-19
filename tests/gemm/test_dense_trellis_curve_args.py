@@ -1,6 +1,9 @@
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 
-from benchmarks._dense_trellis_curve import curve_flags, select_shapes
+from benchmarks._dense_trellis_curve import capture_stages, curve_flags, select_shapes
 from benchmarks.kimi_k6_dense import parse_args
 
 
@@ -46,3 +49,31 @@ def test_curve_flags_collapse_and_adjacent_jump():
                          for rows, value in [(2048, 1.), (2752, 1.09), (4096, 1.3)]])
     point, = flags["trellis"]
     assert point["rows"] == 4096 and point["above_neighbor"] == pytest.approx(1.3 / 1.09 - 1)
+
+
+def test_capture_uses_active_stream_for_every_native_stage():
+    class Cuda:
+        stream = 11
+
+        def current_stream(self):
+            return SimpleNamespace(cuda_stream=self.stream)
+
+        @contextmanager
+        def graph(self, graph):
+            self.stream = 29
+            try:
+                yield
+            finally:
+                self.stream = 11
+
+        CUDAGraph = object
+
+        @staticmethod
+        def Event(**kwargs):
+            return SimpleNamespace(record=lambda: None)
+
+    log = []
+    calls = {name: lambda rows, stream, stage=name: log.append((stage, rows, stream))
+             for name in ("ingress", "trellis", "egress", "reference")}
+    capture_stages(Cuda(), calls, 2752)
+    assert log == [(name, 2752, 29) for name in calls]

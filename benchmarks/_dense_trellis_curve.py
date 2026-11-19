@@ -218,6 +218,18 @@ def _compile_variant(path, options):
         _native.NativeTrellisLinear = original
 
 
+def capture_stages(cuda, calls, rows):
+    events = [cuda.Event(enable_timing=True, external=True) for _ in range(len(calls) + 1)]
+    graph = cuda.CUDAGraph()
+    with cuda.graph(graph):
+        stream = cuda.current_stream().cuda_stream
+        events[0].record()
+        for run, event in zip(calls.values(), events[1:]):
+            run(rows, stream)
+            event.record()
+    return graph, events
+
+
 def _shape_curve(args, shape, registry, exported, sms):
     import torch
     from b12x.integration.cuteafd import exportable_compilation
@@ -319,14 +331,7 @@ def _shape_curve(args, shape, registry, exported, sms):
             arms["baseline"] = {"baseline_trellis" if s == "trellis" else f"baseline_{s}":
                                 base_body if s == "trellis" else run for s, run in stages.items()}
         for arm, calls in arms.items():
-            events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(len(calls) + 1)]
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                active_stream = torch.cuda.current_stream().cuda_stream
-                events[0].record()
-                for run, event in zip(calls.values(), events[1:]):
-                    run(rows, active_stream)
-                    event.record()
+            graph, events = capture_stages(torch.cuda, calls, rows)
             targets = (*raw, *final) if arm in ("candidate", "baseline") else (live_refs[arm][1],)
             for target in targets:
                 target.fill_(float("nan"))
@@ -334,14 +339,21 @@ def _shape_curve(args, shape, registry, exported, sms):
             for target in targets:
                 if not torch.isfinite(target[:rows]).all().item():
                     raise RuntimeError(f"{shape.name} M={rows}: {arm} graph did not overwrite poisoned output")
-            graphs[arm] = (graph, events, calls)
+            graphs[arm] = (graph, events, calls, targets)
         torch.cuda.synchronize()
         samples = {name: [] for calls in arms.values() for name in calls}
         samples.update({f"{arm}_total": [] for arm in arms if len(arms[arm]) > 1})
         for sample in range(args.samples):
-            for graph, events, calls in (graphs.values() if sample % 2 == 0 else reversed(graphs.values())):
+            for graph, events, calls, targets in (graphs.values() if sample % 2 == 0 else reversed(graphs.values())):
+                # Outside the timed graph: a last-live-row sentinel catches a
+                # missing replay without writing the full output every sample.
+                for target in targets:
+                    target[rows-1:rows].fill_(float("nan"))
                 graph.replay()
                 events[-1].synchronize()
+                for target in targets:
+                    if not torch.isfinite(target[rows-1:rows]).all().item():
+                        raise RuntimeError(f"{shape.name} M={rows}: timed graph did not overwrite poison")
                 for name, start, end in zip(calls, events, events[1:]):
                     samples[name].append(start.elapsed_time(end) * 1000)
                 if len(calls) > 1:
