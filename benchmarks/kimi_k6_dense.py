@@ -1694,11 +1694,11 @@ TORCH_LIBRARY(trellis_bench_encoder, m) {
             and path.suffix in (".cu", ".cuh", ".h", ".cpp")}
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--shapes", help="K:N:side[:groups] list; --prefill-route defaults to audited TP2 shapes")
-    parser.add_argument("--rows", default="1,64,256")
+    parser.add_argument("--rows")
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--transforms", action="store_true", help="include actual exported H128 input/output transforms")
     parser.add_argument("--cta-limit", type=int, help="override runtime grid budget for exactness checks")
@@ -1729,8 +1729,47 @@ def main():
     parser.add_argument("--fixture-dir", type=Path, help="independently reference-encoded K6/K8 fixture directory")
     parser.add_argument("--profile-catalog", type=Path, help="baseline kernel-catalog.json for per-emitted-token call counts")
     parser.add_argument("--profile-inventory", type=Path, help="decode kernel-inventory.json disambiguating shared gate/up and MLA gate symbols")
-    args = parser.parse_args()
+    parser.add_argument("--row-curve", action="store_true", help="measure production dense-trellis prefill stages")
+    parser.add_argument("--capacity", type=int, help="fixed exported row capacity")
+    parser.add_argument("--family", help="comma-separated families from the engine exporter")
+    parser.add_argument("--routes", type=Path, help="JSON describing selected engine references and native artifacts")
+    parser.add_argument("--compare-routes-exact", action="store_true", help="compare to --baseline-native on the same payload")
+    parser.add_argument("--check-prefix-rows", action="store_true", help="poison inactive rows and compare byte-identical prefixes")
+    args = parser.parse_args(argv)
+    if args.row_curve:
+        try:
+            args.live_rows = sorted({int(value) for value in (args.rows or "2048,2752,4096").split(",")})
+        except ValueError:
+            parser.error("--rows must be a comma-separated integer list")
+        if not args.routes or not args.family or args.capacity is None:
+            parser.error("--row-curve requires --routes, --family and --capacity")
+        if not 1 <= args.live_rows[0] <= args.live_rows[-1] <= args.capacity <= 4096:
+            parser.error("--rows must fit --capacity <= 4096")
+        if args.bits not in (6, 8) or args.codebook not in ("mcg", "mul1") or args.samples <= 0:
+            parser.error("--row-curve requires K6/K8 MCG/MUL1 and positive samples")
+        if args.compare_routes_exact != bool(args.baseline_native):
+            parser.error("--compare-routes-exact and --baseline-native must be supplied together")
+        if args.check_prefix_rows and args.live_rows[0] == args.capacity:
+            parser.error("--check-prefix-rows needs a live row count below capacity")
+        if args.compile_only or args.check_only or args.thresholds or args.cta_limit or args.timing_rows:
+            parser.error("legacy native comparison switches do not apply to --row-curve")
+    else:
+        if any((args.capacity, args.family, args.routes, args.compare_routes_exact, args.check_prefix_rows)):
+            parser.error("dense curve options require --row-curve")
+        args.rows = args.rows or "1,64,256"
+    return args, parser
+
+
+def main():
+    args, parser = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if args.row_curve:
+        if __package__:
+            from ._dense_trellis_curve import benchmark
+        else:
+            from _dense_trellis_curve import benchmark
+        benchmark(args, exported)
+        return
     if args.encoder_build_only:
         if args.encoder_source is None:
             parser.error("--encoder-build-only requires --encoder-source")
