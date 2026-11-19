@@ -2710,10 +2710,22 @@ def compile_mixed_trellis(
             if _k4_decode_override is not None
             else (
                 int(tier0_bits) == 4
-                and int(tier1_bits) in (2, 3, 4, 5, 6)
+                and (
+                    hidden_size, intermediate_size, route_num_experts,
+                    top_k, compact_weights, tier1_bits,
+                ) in (
+                    # Qualified Spark decode shard geometries only.
+                    (4608, 384, 384, 8, True, 5),    # Inkling2
+                    (4096, 384, 352, 8, True, 6),    # Step5
+                    (6144, 256, 256, 8, False, 5),   # GLM TP8
+                    (6144, 384, 256, 8, True, 5),    # GLM TP6
+                    (6144, 512, 256, 8, False, 5),   # GLM TP4
+                    (6144, 1024, 128, 4, False, 5),  # ML4
+                    (4096, 768, 256, 8, True, 5),    # Muse
+                )
                 and trellis_codebook == "mcg"
                 and rotation_input_dtype == "bf16"
-                and full_rotation_output_dtype in ("bf16", "fp32")
+                and full_rotation_output_dtype == "bf16"
                 and int(size_m) <= 80
                 and int(moe_block_size) == 8
                 and not grouped_m8_fc2
