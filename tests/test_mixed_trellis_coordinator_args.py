@@ -20,6 +20,8 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
     runner.write_text("runner-v1")
     replay = runner.with_name("spark_expert_replay.py")
     replay.write_text("replay-v1")
+    native = runner.with_name("spark_native_replay.py")
+    native.write_text("native-v1")
     package = tmp_path / "b12x"
     package.mkdir()
     first, second = package / "a.py", package / "z.py"
@@ -32,8 +34,8 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
     snapshot = scope["snapshot_prefill_sources"]
     frozen = snapshot(tmp_path)
     entries = sorted(f"{path.relative_to(tmp_path).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
-                     for path in (runner, replay, first, second))
-    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 4)
+                     for path in (runner, replay, native, first, second))
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 5)
     monkeypatch.setattr(Path, "rglob", lambda self, pattern: iter((second, first)))
     assert snapshot(tmp_path) == frozen
     replay.write_text("replay-v2")
@@ -41,7 +43,7 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
     replay.write_text("replay-v1")
     first.write_text("a-v2")
     assert snapshot(tmp_path) != frozen
-    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 4)
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 5)
     startup = next(i for i, node in enumerate(TREE.body) if isinstance(node, ast.Assign)
                    and any(isinstance(target, ast.Tuple)
                            and any(isinstance(name, ast.Name) and name.id == "PREFILL_SOURCE_SHA256"
@@ -861,3 +863,39 @@ def test_ordinary_ws_fc1_lowering_is_independent_of_row_address_code():
     text = ast.unparse(issue_wire)
     assert "Int64(row_id) * Int64(self.ws_wire_row)" in text and "get_ptr_as_int64(a_src, src)" in text
     assert method is not None
+
+
+def test_spark_replay_native_library_ignores_ambient_environment(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+
+    source = SOURCE.with_name("spark_expert_replay.py")
+    tree = ast.parse(source.read_text())
+    node, = [node for node in tree.body
+             if isinstance(node, ast.ClassDef) and node.name == "ReplayLibraries"]
+    cdll = Mock(return_value=object())
+    scope = dict(c=SimpleNamespace(CDLL=cdll), hashlib=hashlib, Path=Path)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
+    candidate = tmp_path / "candidate"
+    library = candidate / "lib/libcuteafd_native.so"
+    library.parent.mkdir(parents=True)
+    library.write_bytes(b"candidate")
+    sealed = tmp_path / "sealed.so"
+    sealed.write_bytes(b"sealed")
+    monkeypatch.setenv("CUTEAFD_NATIVE_LIB", str(sealed))
+    args = benchmark().benchmark_parser().parse_args([
+        "--spark-replay", "fixture.json", "--aot-root", str(candidate)])
+    loaded = scope["ReplayLibraries"](args.aot_root, args.replay_native_library)
+    digest = hashlib.sha256(b"candidate").hexdigest()
+    assert loaded.native(expected=digest) is loaded.native()
+    cdll.assert_called_once_with(str(library.resolve()))
+    assert loaded.receipt() == [{"path": str(library.resolve()), "sha256": digest}]
+    with pytest.raises(ValueError, match="replay library digest mismatch"):
+        loaded.native(expected="wrong")
+    overridden = scope["ReplayLibraries"](args.aot_root, sealed)
+    overridden.native()
+    assert cdll.call_args.args == (str(sealed.resolve()),)
+    assert overridden.receipt() == [{"path": str(sealed.resolve()),
+                                      "sha256": hashlib.sha256(b"sealed").hexdigest()}]
+    empty = scope["ReplayLibraries"](tmp_path / "missing")
+    with pytest.raises(FileNotFoundError):
+        empty.native()

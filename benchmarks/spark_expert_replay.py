@@ -3,12 +3,47 @@
 import ctypes as c
 import hashlib
 import json
-import os
 from pathlib import Path
 import random
 import statistics
 
 import torch
+
+
+class ReplayLibraries:
+    def __init__(self, root, override=None):
+        self.root = root
+        self.override = override
+        self.loaded = {}
+
+    def load(self, path, *, expected=None):
+        path = path.resolve(strict=True)
+        if path in self.loaded:
+            lib, digest = self.loaded[path]
+        else:
+            with path.open('rb') as stream:
+                digest = hashlib.sha256()
+                for block in iter(lambda: stream.read(1 << 20), b''):
+                    digest.update(block)
+                digest = digest.hexdigest()
+            lib = None
+        if expected is not None and expected != digest:
+            raise ValueError(f'replay library digest mismatch: {path}')
+        if lib is None:
+            lib = c.CDLL(str(path))
+            self.loaded[path] = (lib, digest)
+        return lib
+
+    def native(self, *, exl3_support=False, expected=None):
+        path = self.root / 'lib/libcuteafd_native.so'
+        if exl3_support and not path.exists():
+            # Standalone EXL3 package roots carry only the expert libraries.
+            path = Path('/opt/cuteafd/lib/libcuteafd_native.so')
+        return self.load(self.override if self.override is not None else path, expected=expected)
+
+    def receipt(self):
+        return [{'path': str(path), 'sha256': digest}
+                for path, (_, digest) in sorted(self.loaded.items())]
 
 
 def routes(shape, rows, seed):
@@ -165,23 +200,23 @@ def _replay_buckets(shape, root, rows):
     return paths, metas, selected
 
 
-def _run_shape(args, shape, rows, cls, source):
+def _run_shape(args, shape, rows, cls, source, libraries):
     if shape['format'] != 'exl3':
         from spark_native_replay import native_plan
-        plan = native_plan(shape, args.aot_root)
+        plan = native_plan(shape, args.aot_root, libraries)
         return _run_replay(args, shape, rows, source, plan.select(rows),
                            plan.select(tuple(shape.get('prefix_rows', (1, 8, 80)))),
                            plan.make, plan.metadata)
     paths, metas, selected = _replay_buckets(shape, args.aot_root, rows)
     resolved = [shape[k] for k in ('hidden', 'intermediate', 'experts', 'top_k', 'bits')]
     h, _, e, _, _ = resolved
-    lib = c.CDLL(os.environ.get('CUTEAFD_NATIVE_LIB', '/opt/cuteafd/lib/libcuteafd_native.so'))
+    lib = libraries.native(exl3_support=True)
     _check(_bind(lib, 'cuteafd_set_expert_hidden', [c.c_uint32])(h), 'set expert hidden')
     io = lambda v, hidden, experts: _SparkIO(v, hidden, experts, lib, shape['epilogue'])
     weights = _weights(shape, args.seed)
 
     def make(cap, _seed):
-        return cls(torch, paths[cap], cap, weights, resolved, io)
+        return cls(torch, paths[cap], cap, weights, resolved, io, load_library=libraries.load)
 
     def metadata(cap, _rows, distinct):
         return dict(weight_bytes=sum(h * shape['expert_widths'][expert] * sum(
@@ -296,19 +331,21 @@ def replay_spark_shapes(args, cls, source):
     shape = shapes[0]
     if not rows or rows[0] < 1:
         raise ValueError('unsupported replay format or invalid live rows')
+    libraries = ReplayLibraries(args.aot_root, args.replay_native_library)
     if args.preflight_only:
         if shape['format'] == 'exl3':
             plan = _replay_buckets(shape, args.aot_root, rows)[2]
         else:
             from spark_native_replay import native_plan
-            native = native_plan(shape, args.aot_root)
+            native = native_plan(shape, args.aot_root, libraries)
             native.select(tuple(shape.get('prefix_rows', (1, 8, 80))))
             plan = native.select(rows)
         print(json.dumps(plan))
         return
     if torch.cuda.get_device_capability() != (12, 1):
         raise ValueError('Spark AOT replay requires SM121')
-    report = _run_shape(args, shape, rows, cls, source)
+    report = _run_shape(args, shape, rows, cls, source, libraries)
+    report['libraries'] = libraries.receipt()
     report['fixture_sha256'] = hashlib.sha256(args.spark_replay.read_bytes()).hexdigest()
     if args.replay_reference:
         reference = json.loads(args.replay_reference.read_bytes())
