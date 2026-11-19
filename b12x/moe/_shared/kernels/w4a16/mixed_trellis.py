@@ -2489,6 +2489,72 @@ def effective_decode_schedule(driver: W4A16FusedMoeKernel) -> str | None:
     return None if schedule == MixedTrellisDecodeSchedule() else schedule.canonical()
 
 
+# Spark (SM121, GB10) K4 cooperative decode cells whose small-M curve was
+# measured in cuteafd#2511: (hidden, routed experts, top-k, tier bits) of
+# GLM 5.3, Inkling 2 Small, Mistral Large 4, Muse Spark and Step-5. Their
+# 8-row route-block programs take the decode recipe below unless the caller
+# names a schedule or a residency itself. Other geometries (K2/K3 tiers,
+# Qwen, GLM Flash) keep the caller's launch exactly; add a cell here once its
+# own curve is measured.
+_SM121_K4_DECODE_GEOMETRIES = frozenset(
+    {
+        (6144, 256, 8, (4, 5)),
+        (4608, 384, 8, (4, 5)),
+        (6144, 128, 4, (4, 5)),
+        (4096, 256, 8, (4, 5)),
+        (4096, 352, 8, (4, 6)),
+    }
+)
+# Weight words staged L2 evict-first, no prefetch (DECODE_SCHEDULE_PRESETS).
+_SM121_K4_DECODE_SCHEDULE = "l2=2,pf1=0,pf2=0,pdl=1"
+
+
+def _sm121_k4_decode_recipe(
+    *,
+    geometry: tuple[int, int, int, tuple[int, int]],
+    tile_config: tuple[int, int, int, int],
+    moe_block_size: int,
+    plain_cooperative: bool,
+    decode_schedule: str | None,
+    force_blocks_per_sm: int | None,
+) -> bool:
+    """Whether a launch takes the Spark K4 small-M decode recipe.
+
+    At 1-8 live rows a K4 rank shard reads its weights once and is bounded by
+    fixed cost, not by decode work: the cooperative grid's phase barriers, each
+    whole tile's start (route metadata and the first DRAM round trip of its
+    weight pipeline; an FC2 tile is only four to six K tiles long) and the
+    resident phase buffers evicted behind a one-pass weight stream. The recipe
+    is a schedule of the same loads, products and sums:
+
+    - weight words are staged L2 evict-first, so the one-pass stream replaces
+      its own lines instead of the phase buffers and the neighbours' tiles;
+    - an N256 whole tile runs as two N128 tiles on 128-thread CTAs. The K tile
+      and each output column's K order are unchanged, so every bit is; FC1
+      waves of a narrow shard become twice as wide (16 -> 32 tiles per row at
+      256 columns) and an FC2 tile start stalls half as many resident warps;
+    - two CTAs stay resident per SM, so one CTA's tile start hides behind the
+      other's stream. The grid is still the runtime SM count times this
+      residency, and the grid barrier counts the launched grid.
+
+    Only a caller that names neither a decode schedule nor a residency gets
+    it: an explicit choice (a packaged cell, an A/B arm) is never overridden.
+    """
+    fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n = tile_config
+    return bool(
+        plain_cooperative
+        and decode_schedule is None
+        and force_blocks_per_sm is None
+        and int(moe_block_size) == 8
+        and geometry in _SM121_K4_DECODE_GEOMETRIES
+        and (fc1_tile_k, fc2_tile_k) == (64, 64)
+        and fc1_tile_n == fc2_tile_n
+        and fc1_tile_n in (128, 256)
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 1)
+    )
+
+
 def compile_mixed_trellis(
     *,
     size_m: int,
@@ -2594,6 +2660,34 @@ def compile_mixed_trellis(
         route_num_experts = total_experts
     route_num_experts = int(route_num_experts)
     descriptor_bits = _descriptor_bits(route_num_experts)
+    if _sm121_k4_decode_recipe(
+        geometry=(
+            int(hidden_size),
+            route_num_experts,
+            int(top_k),
+            (int(tier0_bits), int(tier1_bits)),
+        ),
+        tile_config=(fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n),
+        moe_block_size=moe_block_size,
+        plain_cooperative=(
+            not warp_specialized
+            and not direct_topk_routes
+            and paired_boundary is None
+            and not token_major_rotation
+            and not fused_input_rotation
+            and not row_addresses
+            and activations == "a16"
+            and input_format == "bf16"
+            and rotation_input_dtype == "bf16"
+            and trellis_codebook == "mcg"
+        ),
+        decode_schedule=decode_schedule,
+        force_blocks_per_sm=force_blocks_per_sm,
+    ):
+        schedule = parse_decode_schedule(_SM121_K4_DECODE_SCHEDULE)
+        # The same K tile; N256 splits into two N128 tiles (128-thread CTAs).
+        fc1_tile_n = fc2_tile_n = 128
+        force_blocks_per_sm = 2
     def make_kernel(
         num_experts: int,
         bits: int,
