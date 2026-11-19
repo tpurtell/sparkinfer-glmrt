@@ -2510,6 +2510,7 @@ def benchmark_parser():
     parser.add_argument("--spark-replay", type=Path, help="planned Spark replay fixture JSON")
     parser.add_argument("--aot-root", type=Path, help="sealed Spark rank packages root")
     parser.add_argument("--replay-shape", action="append", help="replay fixture shape ID (repeatable)")
+    parser.add_argument("--replay-reference", type=Path, help="require byte-identical outputs against a prior Spark replay JSON")
     parser.add_argument("--profile-replay", action="store_true", help="capture one NVTX-marked sample per cell under Nsight Compute")
     parser.add_argument("--kimi-aot", type=Path, help="sealed EXL3 TP6 rank package containing m1/m80")
     parser.add_argument("--route-case", action="append", help="recorded Kimi wave ID (repeatable)")

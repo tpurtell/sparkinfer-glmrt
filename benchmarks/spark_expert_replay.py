@@ -93,7 +93,7 @@ class _SparkIO:
         ptrs = [self.v.ptr[k] for k in ('fc2_ptr', 'svh_ptr', 'raw_topk_ids', 'expert_map_ptr')]
         _check(self.partial_launch(self.index, (c.c_void_p * 6)(*(t.data_ptr() for t in
                (*ptrs, self.row_map, self.partial))), (c.c_uint64 * 4)(rows, rows,
-               self.v.scalar['weight_num_experts'], self.experts), stream), 'partial launch')
+               self.experts, self.experts), stream), 'partial launch')
 
     def close(self):
         if self.context:
@@ -151,11 +151,14 @@ def _replay_buckets(shape, root, rows):
     paths = {int(k): root / v for k, v in shape['buckets'].items()}
     metas = {k: json.loads((p / 'v41_exl3.json').read_bytes()) for k, p in paths.items()}
     dec = sorted(k for k, m in metas.items() if m['decode_capacity'])
-    if not dec or dec[0] != 1:
+    if not dec or dec[0] != 1 or dec[-1] < 80:
         raise ValueError('missing canonical m1 program')
     def recipe(m):
-        return tuple(m.get(k) for k in ('tile', 'threads', 'route_block', 'input_format',
-                     'direct', 'warp_specialized', 'fused_input_rotation', 'token_major_rotation'))
+        return (m['tile'], m.get('route_block', 8), m.get('input_format', 'bf16'),
+                *(bool(m.get(k)) for k in ('direct', 'warp_specialized', 'fused_input_rotation',
+                                          'token_major_rotation')),
+                *(m.get(k) for k in ('bits', 'swiglu_limit', 'output_dtype', 'hidden',
+                                     'intermediate', 'experts', 'top_k', 'sparkinfer_revision')))
     canonical = [k for k in dec if recipe(metas[k]) == recipe(metas[1])]
     selected = {m: next(k for k in (canonical if m <= dec[-1] else sorted(metas)) if k >= m)
                 for m in rows}
@@ -280,6 +283,14 @@ def replay_spark_shapes(args, cls, source):
         raise ValueError('Spark AOT replay requires SM121')
     report = _run_shape(args, shape, rows, cls, source)
     report['fixture_sha256'] = hashlib.sha256(args.spark_replay.read_bytes()).hexdigest()
+    if args.replay_reference:
+        reference = json.loads(args.replay_reference.read_bytes())
+        if any(reference[k] != report[k] for k in ('id', 'routes_sha256')):
+            raise ValueError('replay reference uses different routes or shape')
+        expected = {c['rows']: c['digest'] for c in reference['cells']}
+        for cell in report['cells']:
+            if expected.get(cell['rows']) != cell['digest']:
+                raise ValueError(f"reference output differs at m{cell['rows']}")
     if args.output:
         args.output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report), flush=True)
