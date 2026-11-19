@@ -77,3 +77,16 @@ def test_capture_uses_active_stream_for_every_native_stage():
              for name in ("ingress", "trellis", "egress", "reference")}
     capture_stages(Cuda(), calls, 2752)
     assert log == [(name, 2752, 29) for name in calls]
+
+
+def test_final_narrow_requires_fp32_h128_egress():
+    policy = dict(shape="projection", input_features=512, output_features=128, sharded_side=2,
+                  output_program="trellis_output_n128_f32", codebook="mcg")
+    refs = dict(bf16={"reason": "fused"}, fp8={"reason": "fused"})
+    route = dict(reduction="f32_add_then_narrow", references=refs)
+    args = ({"test": [policy]}, {"test": {"projection": route}}, ["test"], [], 6, "mcg")
+    shape, = select_shapes(*args)
+    assert shape.reduction == "f32_add_then_narrow" and shape.egress == "f32"
+    route["egress"] = "bf16"
+    with pytest.raises(ValueError, match="invalid egress dtype"):
+        select_shapes(*args)

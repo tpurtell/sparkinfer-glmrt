@@ -2,7 +2,7 @@
 
 The routes JSON names the engine exporter, native_library, manifest, and a
 families mapping of exporter shape names to routes. Each route chooses groups
-(1 or 4), egress (bf16/f32), reduction (none/bf16_partial/f32_add), and
+(1 or 4), egress (bf16/f32), reduction (none/bf16_partial/f32_add/f32_add_then_narrow), and
 references {bf16, fp8}. References are either {program, scalars} (the program
 and launch flags selected by the engine, excluding the live rows scalar), or
 {reason} if an exact-shape standalone shipping reference does not exist.
@@ -51,10 +51,11 @@ def select_shapes(policies, routes, families, requested, bits, codebook):
             egress = route.get("egress", p["output_program"].rsplit("_", 1)[1])
             if groups != 1 and groups != p.get("grouped", {}).get("groups"):
                 raise ValueError(f"{family}/{name} does not export {groups} groups")
-            if reduction not in ("none", "bf16_partial", "f32_add") or (
+            if reduction not in ("none", "bf16_partial", "f32_add", "f32_add_then_narrow") or (
                     reduction != "none" and (groups != 1 or p["sharded_side"] != 2)):
                 raise ValueError(f"invalid TP reduction for {family}/{name}: {reduction}")
-            if egress not in ("bf16", "f32") or (groups != 1 and egress != "bf16"):
+            if (egress not in ("bf16", "f32") or (groups != 1 and egress != "bf16")
+                    or (reduction == "f32_add_then_narrow" and egress != "f32")):
                 raise ValueError(f"invalid egress dtype for {family}/{name}: {egress}")
             refs = route.get("references", {})
             if set(refs) != {"bf16", "fp8"} or any(
@@ -287,19 +288,24 @@ def _shape_curve(args, shape, registry, exported, sms):
             peer = torch.randn_like(raw[0]) * .1
             stages["partial_add"] = registry.glue("cuteafd_cuda_residual_add_f32_async", (raw[0], peer, summed), n)
     stages["egress"] = bind(egress, [*egress_source, *svh, *final], (sms * 4,))
+    outputs = [*raw, *final]
+    if shape.reduction == "f32_add_then_narrow":
+        narrowed = torch.empty_like(final[0], dtype=torch.bfloat16)
+        stages["final_narrow"] = registry.glue("cuteafd_load_narrow_f32_bf16", (final[0], narrowed), n, sms)
+        outputs.append(narrowed)
     base_body = bind(baseline, [ptrs, *weights, *scales, partial, *raw], (0, sms * 4)) if baseline else None
     references = {name: bound for name, route in shape.references.items()
                   if (bound := bind_reference(torch, registry, route, shape, x, cap)) is not None}
 
     def chain(rows, core):
-        for target in (*raw, *final):
+        for target in outputs:
             target.fill_(float("nan"))
         for name, run in stages.items():
             (core if name == "trellis" else run)(rows, stream)
-        for target in (*raw, *final):
+        for target in outputs:
             if not torch.isfinite(target[:rows]).all().item() or not torch.isnan(target[rows:]).all().item():
                 raise RuntimeError(f"{shape.name} M={rows}: missing writes or write into inactive rows")
-        return [t[:rows].clone() for t in (*raw, *final)]
+        return [t[:rows].clone() for t in outputs]
 
     full = chain(cap, stages["trellis"]) if args.check_prefix_rows else None
     records = []
@@ -332,7 +338,7 @@ def _shape_curve(args, shape, registry, exported, sms):
                                 base_body if s == "trellis" else run for s, run in stages.items()}
         for arm, calls in arms.items():
             graph, events = capture_stages(torch.cuda, calls, rows)
-            targets = (*raw, *final) if arm in ("candidate", "baseline") else (live_refs[arm][1],)
+            targets = outputs if arm in ("candidate", "baseline") else (live_refs[arm][1],)
             for target in targets:
                 target.fill_(float("nan"))
             graph.replay()
