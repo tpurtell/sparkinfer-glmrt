@@ -74,6 +74,7 @@ from b12x._lib.intrinsics import (
     ld_shared_v4_u32,
     ldmatrix_m8n8x2_b16,
     pack_f32x2_to_f16x2,
+    packed_dequant_trellis_mul1_to_half2x4,
     packed_dequant_trellis_stream_to_half2x4,
     packed_dequant_trellis_to_half2x4,
     shared_ptr_to_u32,
@@ -90,6 +91,7 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_LINEAR_BETA,
 )
 from b12x.moe._shared.kernels.trellis_ring import trellis256_lane_geom_bits
+from b12x.moe._shared.trellis_codebooks import MCG, MUL1
 
 from .kernel import W4A16FusedMoeKernel
 from .mixed_trellis import W4A16MixedTrellisKernel
@@ -459,7 +461,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         )
         if (
             self.tier0.trellis_bits != 4
-            or self.tier0.trellis_codebook != "mcg"
+            or self.tier0.trellis_codebook not in (MCG, MUL1)
             or self.driver.moe_block_size != 8
             or self.driver.fc2.moe_block_size != 8
             or self.driver.fc2.schedule_route_block_factor != 1
@@ -474,7 +476,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             or self.intermediate_size % 128 != 0
         ):
             raise ValueError(
-                "W4A16MixedTrellisK4Decode requires SM121 MCG K4 cooperative m8 geometry"
+                "W4A16MixedTrellisK4Decode requires SM121 MCG or MUL1 K4 cooperative m8 geometry"
             )
         self.max_bits = max(int(self.tier0.trellis_bits), int(self.tier1.trellis_bits))
         self.is_m1_bucket = int(self.size_m) == 1
@@ -1154,9 +1156,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         aw = cute.arch.shuffle_sync(bw, prev_lane)
                         win_a = bw
                         win_b = _prmt_b32_5432(bw, aw)
-                        o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
-                            win_a, win_b, 4
-                        )
+                        if cutlass.const_expr(self.tier0.trellis_codebook == MUL1):
+                            o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+                                win_a, win_b, 4
+                            )
+                        else:
+                            o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+                                win_a, win_b, 4
+                            )
                         d0, d1, d2, d3 = f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
                             acc[jj * 4 + 0][0],
                             acc[jj * 4 + 1][0],
@@ -1183,9 +1190,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             x1 = ld_shared_u32(tbase + ia1 * Int32(4))
                             win_b = self._trellis_funnel256(b0, b1, sb)
                             win_a = self._trellis_funnel256(x0, x1, sa)
-                            o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
-                                win_a, win_b, 5
-                            )
+                            if cutlass.const_expr(self.tier0.trellis_codebook == MUL1):
+                                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+                                    win_a, win_b, 5
+                                )
+                            else:
+                                o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+                                    win_a, win_b, 5
+                                )
                         elif cutlass.const_expr(bits == 6):
                             z0 = ld_shared_u32(tbase + i0 * Int32(4))
                             z1 = ld_shared_u32(tbase + i1 * Int32(4))
@@ -1193,9 +1205,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             win_a, win_b = trellis_align_stream_u32x2(
                                 z0, z1, z2, s2_6, delta_6
                             )
-                            o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
-                                win_a, win_b, 6
-                            )
+                            if cutlass.const_expr(self.tier0.trellis_codebook == MUL1):
+                                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+                                    win_a, win_b, 6
+                                )
+                            else:
+                                o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
+                                    win_a, win_b, 6
+                                )
                         else:
                             aw = ld_shared_u32(tbase + ia_g * Int32(4))
                             bw = ld_shared_u32(tbase + ib_g * Int32(4))
@@ -1203,9 +1220,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             win_b = self._trellis_funnel256(
                                 aw, bw, s2_g + Int32(4 * bits)
                             )
-                            o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
-                                win_a, win_b, bits
-                            )
+                            if cutlass.const_expr(self.tier0.trellis_codebook == MUL1):
+                                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+                                    win_a, win_b, bits
+                                )
+                            else:
+                                o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+                                    win_a, win_b, bits
+                                )
                         d0, d1, d2, d3 = f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
                             acc[jj * 4 + 0][0],
                             acc[jj * 4 + 1][0],

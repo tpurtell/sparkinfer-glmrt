@@ -229,3 +229,153 @@ def test_mixed_trellis_format_accepts_mul1_and_separates_cache_keys_on_cpu(
             tier2=make_moe(2, bits[2], "mcg"),
         )
         assert mul1_k3.__cache_key__ != mcg_k3.__cache_key__
+
+
+@pytest.mark.parametrize("tier1_bits", [2, 3, 5, 6])
+@pytest.mark.parametrize("size_m", [1, 80])
+@pytest.mark.parametrize("compact", [False, True])
+def test_mixed_trellis_k4_decode_accepts_mul1_and_separates_cache_keys_on_cpu(
+    tier1_bits: int,
+    size_m: int,
+    compact: bool,
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import W4A16MixedTrellisKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis_k4 import W4A16MixedTrellisK4Decode
+
+    def make_moe(num_experts: int, bits: int, codebook: str) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=size_m,
+            hidden_size=512,
+            intermediate_size=256,
+            num_experts=num_experts,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=128,
+            fc1_tile_k=64,
+            fc2_tile_n=128,
+            fc2_tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=32,
+            element_dtype="fp16",
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj",
+            trellis_bits=bits,
+            trellis_codebook=codebook,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype="bf16",
+            workspace_sms=48,
+            schedule_whole_tiles=True,
+        )
+
+    mul1_k4 = W4A16MixedTrellisK4Decode(
+        driver=make_moe(4, 4, "mul1"),
+        tier0=make_moe(2, 4, "mul1"),
+        tier1=make_moe(2, tier1_bits, "mul1"),
+        compact_weights=compact,
+    )
+    mcg_k4 = W4A16MixedTrellisK4Decode(
+        driver=make_moe(4, 4, "mcg"),
+        tier0=make_moe(2, 4, "mcg"),
+        tier1=make_moe(2, tier1_bits, "mcg"),
+        compact_weights=compact,
+    )
+    coop_mul1 = W4A16MixedTrellisKernel(
+        driver=make_moe(4, 4, "mul1"),
+        tier0=make_moe(2, 4, "mul1"),
+        tier1=make_moe(2, tier1_bits, "mul1"),
+        compact_weights=compact,
+    )
+    assert mul1_k4.__cache_key__ != mcg_k4.__cache_key__
+    assert mul1_k4.__cache_key__ != coop_mul1.__cache_key__
+
+    if tier1_bits == 3 and size_m == 1 and not compact:
+        with pytest.raises(ValueError, match="W4A16MixedTrellisK4Decode"):
+            W4A16MixedTrellisK4Decode(
+                driver=make_moe(4, 4, "sqg_e4m3"),
+                tier0=make_moe(2, 4, "sqg_e4m3"),
+                tier1=make_moe(2, 3, "sqg_e4m3"),
+            )
+
+
+@pytest.mark.parametrize(
+    ("hidden", "inter", "route_experts", "topk", "compact", "tier1_bits"),
+    [
+        (4608, 384, 384, 8, True, 5),
+        (4096, 384, 352, 8, True, 6),
+        (6144, 256, 256, 8, False, 5),
+        (6144, 384, 256, 8, True, 5),
+        (6144, 512, 256, 8, False, 5),
+        (6144, 1024, 128, 4, False, 5),
+        (4096, 768, 256, 8, True, 5),
+    ],
+)
+def test_sm121_k4_decode_selector_dispatches_mul1_and_mcg_before_cuda(
+    monkeypatch,
+    hidden: int,
+    inter: int,
+    route_experts: int,
+    topk: int,
+    compact: bool,
+    tier1_bits: int,
+) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from types import SimpleNamespace
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mt_mod
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis_k4 import W4A16MixedTrellisK4Decode
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (12, 1))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_a, **_k: SimpleNamespace(
+            multi_processor_count=48, shared_memory_per_block_optin=101376
+        ),
+    )
+
+    class _StopBeforeCompile(Exception):
+        pass
+
+    selected: list[object] = []
+
+    def capture(build, **_kwargs):
+        selected.append(build(False))
+        raise _StopBeforeCompile
+
+    monkeypatch.setattr(mt_mod, "_select_mixed_fc2_kernel", capture)
+    for cb in ("mul1", "mcg"):
+        selected.clear()
+        with pytest.raises(_StopBeforeCompile):
+            mt_mod.compile_mixed_trellis(
+                size_m=8,
+                hidden_size=hidden,
+                intermediate_size=inter,
+                tier0_num_experts=2,
+                tier1_num_experts=2,
+                route_num_experts=route_experts,
+                top_k=topk,
+                max_m_blocks=64,
+                sms=48,
+                max_shared_mem=101376,
+                force_tile_config=(64, 128, 64, 128),
+                tier0_bits=4,
+                tier1_bits=tier1_bits,
+                trellis_codebook=cb,
+                moe_block_size=8,
+                rotation_input_dtype="bf16",
+                full_rotation_output_dtype="bf16",
+                compact_weights=compact,
+                workspace_sms=48,
+            )
+        assert len(selected) == 1
+        assert isinstance(selected[0], W4A16MixedTrellisK4Decode)
+        assert selected[0].tier0.trellis_codebook == cb

@@ -38,6 +38,7 @@ from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.trellis_codebooks import (
     MCG,
+    MUL1,
     normalize_codebook,
     validate_codebook_bits,
 )
@@ -2724,7 +2725,7 @@ def compile_mixed_trellis(
                     (6144, 1024, 128, 4, False, 5),  # ML4
                     (4096, 768, 256, 8, True, 5),    # Muse
                 )
-                and trellis_codebook == "mcg"
+                and trellis_codebook in (MCG, MUL1)
                 and rotation_input_dtype == "bf16"
                 and full_rotation_output_dtype == "bf16"
                 and int(size_m) <= 80

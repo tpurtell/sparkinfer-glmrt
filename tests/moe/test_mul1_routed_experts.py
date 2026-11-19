@@ -1978,3 +1978,553 @@ def test_mixed_trellis_ws_a16_bitwise_matches_reference(
         graph.replay()
         torch.cuda.synchronize(device)
         assert_bitwise_equal(buffers.output[:capacity_m], expected_live, f"ws_{mode}_graph_{codebook}")
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120 or SM121 GPU")
+@pytest.mark.parametrize("codebook", ["mul1", "mcg"])
+@pytest.mark.parametrize(
+    ("bits", "k4_case"),
+    [
+        ((4, 5), "m1_persistent_4stage"),
+        ((4, 5), "m80_persistent_and_medm_prefix"),
+        ((4, 6), "m80_compact_post_clamp"),
+        ((4, 3), "m16_proj_situ"),
+        ((4, 2), "m16_smallm_fused_and_act_pdl"),
+    ],
+)
+def test_mixed_trellis_k4_decode_bitwise_matches_reference(
+    codebook: str,
+    bits: tuple[int, int],
+    k4_case: str,
+) -> None:
+    """Bitwise oracle for W4A16MixedTrellisK4Decode across all persistent and PDL sub-kernels."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    hw_sms = int(props.multi_processor_count)
+    max_shared_mem = int(props.shared_memory_per_block_optin)
+
+    hidden, intermediate = 256, 256
+    experts, top_k = 4, 2
+    tile_config = (64, 128, 64, 128)
+    activation = (
+        "situ"
+        if k4_case == "m16_proj_situ"
+        else ("silu_post_clamp" if k4_case == "m80_compact_post_clamp" else "silu")
+    )
+    swiglu_limit = 7.0 if k4_case == "m80_compact_post_clamp" else None
+    compact = k4_case == "m80_compact_post_clamp"
+    proj_tiered = k4_case == "m16_proj_situ"
+
+    capacity_m = (
+        1
+        if k4_case == "m1_persistent_4stage"
+        else (80 if k4_case.startswith("m80_") else 16)
+    )
+    seed_base = 90_000 + bits[1] * 100 + (1 if codebook == "mul1" else 0)
+
+    if proj_tiered:
+        (
+            tiers,
+            mapping,
+            descriptor,
+            rotations,
+            gate_w,
+            up_w,
+            down_w,
+            gate_suh,
+            up_suh,
+            inter_rot,
+            down_svh,
+        ) = _build_projection_tiered_fixture(
+            hidden=hidden,
+            intermediate=intermediate,
+            tier_bits=bits,
+            gate_tiers=(0, 1, 0, 1),
+            up_tiers=(1, 0, 0, 1),
+            down_tiers=(0, 1, 1, 0),
+            codebook=codebook,
+            seed_base=seed_base,
+            tile_config=tile_config,
+            activation=activation,
+            device=device,
+        )
+        gate_counts: tuple[int, int] | None = (2, 2)
+        up_counts: tuple[int, int] | None = (2, 2)
+    else:
+        (
+            tiers,
+            mapping,
+            descriptor,
+            rotations,
+            gate_w,
+            up_w,
+            down_w,
+            gate_suh,
+            up_suh,
+            inter_rot,
+            down_svh,
+        ) = _build_disjoint_2tier_fixture(
+            hidden=hidden,
+            intermediate=intermediate,
+            bits=bits,
+            codebook=codebook,
+            seed_base=seed_base,
+            tile_config=tile_config,
+            activation=activation,
+            device=device,
+        )
+        gate_counts = None
+        up_counts = None
+
+    if compact:
+        combined_widths = [256, 128, 128, 256]
+        descriptor = build_compact_trellis_descriptor(
+            descriptor,
+            combined_widths,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            bits=bits,
+        )
+        compact_tiers = []
+        for t_idx, tier in enumerate(tiers):
+            t_bits = bits[t_idx]
+            packed = tier.w13.reshape(2, 2, hidden // 16, intermediate // 16, 8 * t_bits)
+            down = tier.w2.reshape(2, intermediate // 16, hidden // 16, 8 * t_bits)
+            local_widths = combined_widths[t_idx * 2 : t_idx * 2 + 2]
+            w13_c = torch.cat(
+                [packed[p, e, :, : w // 16].contiguous().flatten() for p in range(2) for e, w in enumerate(local_widths)]
+            )
+            w2_c = torch.cat([down[e, : w // 16].contiguous().flatten() for e, w in enumerate(local_widths)])
+            compact_tiers.append(replace(tier, w13=w13_c, w2=w2_c))
+        tiers = (compact_tiers[0], compact_tiers[1])
+        inter_rot = inter_rot.clone()
+        for g_exp in range(4):
+            c_idx = int(mapping[g_exp].item())
+            live_w = combined_widths[c_idx]
+            if live_w < intermediate:
+                inter_rot[g_exp, live_w:intermediate] = 0
+                inter_rot[g_exp, intermediate + live_w : 2 * intermediate] = 0
+                inter_rot[g_exp, 2 * intermediate + live_w : 3 * intermediate] = 0
+
+    route_slots = max_packed_route_slots(capacity_m * top_k, 8, experts)
+    max_m_blocks = (route_slots + 7) // 8
+
+    rng = torch.Generator(device="cpu").manual_seed(95_000 + bits[1] * 17)
+    x_full = (torch.randn((capacity_m, hidden), generator=rng) * 0.05).to(
+        device=device, dtype=torch.bfloat16
+    )
+    ids_full = torch.stack(
+        [torch.randperm(experts, generator=rng)[:top_k] for _ in range(capacity_m)]
+    ).to(device=device, dtype=torch.int32)
+    weights_full = torch.softmax(
+        torch.randn((capacity_m, top_k), generator=rng, dtype=torch.float32), dim=-1
+    ).to(device=device)
+
+    if k4_case == "m16_smallm_fused_and_act_pdl":
+        # Deterministically exercise both fc1_fused_smallm_kernel(do_fused_act=1) (sms=2 -> ws_cap=8,
+        # live_m=4 -> max_live_blocks=4) and fc1_fused_smallm_kernel(do_fused_act=0) + act_kernel
+        # (sms=1 -> ws_cap=4, live_m=6 -> max_live_blocks=5) on every GPU.
+        for launch_sms, live_m in ((2, 4), (1, 6)):
+            launch_sub = compile_mixed_trellis(
+                size_m=capacity_m,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                tier0_num_experts=2,
+                tier1_num_experts=2,
+                route_num_experts=experts,
+                top_k=top_k,
+                max_m_blocks=max_m_blocks,
+                sms=launch_sms,
+                workspace_sms=hw_sms,
+                max_shared_mem=max_shared_mem,
+                force_tile_config=tile_config,
+                tier0_bits=bits[0],
+                tier1_bits=bits[1],
+                trellis_codebook=codebook,
+                activation=activation,
+                moe_block_size=8,
+                rotation_input_dtype="bf16",
+                full_rotation_output_dtype="bf16",
+                _k4_decode_override=True,
+            )
+            binding_sub = bind_mixed_trellis(
+                tiers[0], tiers[1], mapping, descriptor, rotations, launch_sub
+            )
+            buffers_sub = make_mixed_trellis_buffers(launch_sub, device=device, sms=launch_sms)
+            buffers_sub.output.fill_(float("nan"))
+            actual_sub = run_bound_mixed_trellis(
+                x_full[:live_m], weights_full[:live_m], ids_full[:live_m], binding_sub, buffers_sub
+            ).clone()
+            torch.cuda.synchronize(device)
+            expected_sub = reference_exl3_routed_moe_bitwise(
+                x_full[:live_m],
+                ids_full[:live_m],
+                weights_full[:live_m],
+                gate_w,
+                up_w,
+                down_w,
+                gate_suh,
+                up_suh,
+                inter_rot,
+                down_svh,
+                activation=activation,
+                output_dtype=torch.bfloat16,
+                tile_k=tile_config[0],
+            )
+            assert_bitwise_equal(
+                actual_sub, expected_sub, f"k4_smallm_sms{launch_sms}_m{live_m}_{codebook}"
+            )
+        return
+
+    launch = compile_mixed_trellis(
+        size_m=capacity_m,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tier0_num_experts=2,
+        tier1_num_experts=2,
+        route_num_experts=experts,
+        top_k=top_k,
+        max_m_blocks=max_m_blocks,
+        sms=hw_sms,
+        max_shared_mem=max_shared_mem,
+        force_tile_config=tile_config,
+        tier0_bits=bits[0],
+        tier1_bits=bits[1],
+        trellis_codebook=codebook,
+        swiglu_limit=swiglu_limit,
+        activation=activation,
+        moe_block_size=8,
+        rotation_input_dtype="bf16",
+        full_rotation_output_dtype="bf16",
+        compact_weights=compact,
+        _k4_decode_override=True,
+    )
+    assert launch.trellis_codebook == codebook
+    binding = bind_mixed_trellis(
+        tiers[0],
+        tiers[1],
+        mapping,
+        descriptor,
+        rotations,
+        launch,
+        gate_experts=gate_counts,
+        up_experts=up_counts,
+    )
+    buffers = make_mixed_trellis_buffers(launch, device=device, sms=hw_sms)
+    warmup_mixed_trellis_route_pack(launch, buffers, expert_map=mapping)
+
+    live_counts = (
+        (1,)
+        if capacity_m == 1
+        else ((1, 8, 24) if k4_case == "m80_persistent_and_medm_prefix" else ((1, 8, 20) if compact else (1, 5, 16)))
+    )
+
+    m1_launch = None
+    m1_binding = None
+    m1_buffers = None
+    if k4_case == "m80_persistent_and_medm_prefix":
+        m1_slots = max_packed_route_slots(top_k, 8, experts)
+        m1_launch = compile_mixed_trellis(
+            size_m=1,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            tier0_num_experts=2,
+            tier1_num_experts=2,
+            route_num_experts=experts,
+            top_k=top_k,
+            max_m_blocks=(m1_slots + 7) // 8,
+            sms=hw_sms,
+            max_shared_mem=max_shared_mem,
+            force_tile_config=tile_config,
+            tier0_bits=bits[0],
+            tier1_bits=bits[1],
+            trellis_codebook=codebook,
+            activation=activation,
+            moe_block_size=8,
+            rotation_input_dtype="bf16",
+            full_rotation_output_dtype="bf16",
+            _k4_decode_override=True,
+        )
+        m1_binding = bind_mixed_trellis(tiers[0], tiers[1], mapping, descriptor, rotations, m1_launch)
+        m1_buffers = make_mixed_trellis_buffers(m1_launch, device=device, sms=hw_sms)
+        warmup_mixed_trellis_route_pack(m1_launch, m1_buffers, expert_map=mapping)
+
+    with kernel_resolution_guard(f"frozen k4_decode {k4_case}"):
+        x_saved = x_full.clone()
+        w_saved = weights_full.clone()
+        row0_outputs: list[torch.Tensor] = []
+        if m1_binding is not None and m1_buffers is not None:
+            m1_buffers.output.fill_(float("nan"))
+            out_m1 = run_bound_mixed_trellis(
+                x_saved[:1], w_saved[:1], ids_full[:1], m1_binding, m1_buffers
+            ).clone()
+            torch.cuda.synchronize(device)
+            row0_outputs.append(out_m1)
+        try:
+            for live_m in live_counts:
+                x_full.copy_(x_saved)
+                weights_full.copy_(w_saved)
+                if live_m < capacity_m:
+                    x_full[live_m:].fill_(float("nan"))
+                    weights_full[live_m:].fill_(float("nan"))
+                buffers.output.fill_(float("nan"))
+                actual = run_bound_mixed_trellis(
+                    x_full[:live_m], weights_full[:live_m], ids_full[:live_m], binding, buffers
+                ).clone()
+                torch.cuda.synchronize(device)
+                expected = reference_exl3_routed_moe_bitwise(
+                    x_saved[:live_m],
+                    ids_full[:live_m],
+                    w_saved[:live_m],
+                    gate_w,
+                    up_w,
+                    down_w,
+                    gate_suh,
+                    up_suh,
+                    inter_rot,
+                    down_svh,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    output_dtype=torch.bfloat16,
+                    tile_k=tile_config[0],
+                )
+                assert_bitwise_equal(actual, expected, f"k4_{k4_case}_m{live_m}_{codebook}")
+                row0_outputs.append(actual[:1].clone())
+        finally:
+            x_full.copy_(x_saved)
+            weights_full.copy_(w_saved)
+
+        for other in row0_outputs[1:]:
+            assert_bitwise_equal(other, row0_outputs[0], f"k4_prefix_row0_{k4_case}_{codebook}")
+
+        cap_test_m = live_counts[-1]
+        expected_cap = reference_exl3_routed_moe_bitwise(
+            x_full[:cap_test_m],
+            ids_full[:cap_test_m],
+            weights_full[:cap_test_m],
+            gate_w,
+            up_w,
+            down_w,
+            gate_suh,
+            up_suh,
+            inter_rot,
+            down_svh,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            output_dtype=torch.bfloat16,
+            tile_k=tile_config[0],
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_bound_mixed_trellis(
+                x_full[:cap_test_m], weights_full[:cap_test_m], ids_full[:cap_test_m], binding, buffers
+            )
+        for _ in range(2):
+            buffers.output.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            assert_bitwise_equal(
+                buffers.output[:cap_test_m], expected_cap, f"k4_graph_{k4_case}_{codebook}"
+            )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(torch.cuda.current_device()) != (12, 1),
+    reason="requires Spark SM121 for automatic use_sm121_k4_decode dispatch",
+)
+@pytest.mark.parametrize("codebook", ["mul1", "mcg"])
+def test_mixed_trellis_k4_decode_sm121_auto_inkling2_shard_bitwise(codebook: str) -> None:
+    """Verify automatic SM121 K4 decode selection on Inkling2/Hy4 Flash shard geometry (4608, 384, E=384, k=8, compact K4/K5)."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    sms = int(props.multi_processor_count)
+    max_shared_mem = int(props.shared_memory_per_block_optin)
+
+    hidden, intermediate = 4608, 384
+    route_experts, top_k = 384, 8
+    capacity_m = 8
+    bits = (4, 5)
+    tile_config = (64, 128, 64, 128)
+    chosen_globals = [0, 51, 102, 153, 204, 255, 306, 383]
+    tier0_globals = (chosen_globals[2], chosen_globals[0], chosen_globals[6], chosen_globals[4])
+    tier1_globals = (chosen_globals[3], chosen_globals[1], chosen_globals[7], chosen_globals[5])
+
+    seed_base = 98_000 + (1 if codebook == "mul1" else 0)
+    tiers = []
+    gate_w_by_global: dict[int, torch.Tensor] = {}
+    up_w_by_global: dict[int, torch.Tensor] = {}
+    down_w_by_global: dict[int, torch.Tensor] = {}
+    for t_idx, (t_bits, globals_t) in enumerate(zip(bits, (tier0_globals, tier1_globals), strict=True)):
+        g_projs = [
+            make_gptqmodel_exl3_projection(
+                hidden, intermediate, t_bits, codebook=codebook, seed=seed_base + t_idx * 40 + i * 3 + 0, device=device
+            )
+            for i in range(4)
+        ]
+        u_projs = [
+            make_gptqmodel_exl3_projection(
+                hidden, intermediate, t_bits, codebook=codebook, seed=seed_base + t_idx * 40 + i * 3 + 1, device=device
+            )
+            for i in range(4)
+        ]
+        d_projs = [
+            make_gptqmodel_exl3_projection(
+                intermediate, hidden, t_bits, codebook=codebook, seed=seed_base + t_idx * 40 + i * 3 + 2, device=device
+            )
+            for i in range(4)
+        ]
+        w13_t = torch.stack(
+            (
+                torch.stack([p.trellis for p in g_projs], dim=0),
+                torch.stack([p.trellis for p in u_projs], dim=0),
+            ),
+            dim=0,
+        ).contiguous()
+        w2_t = torch.stack([p.trellis for p in d_projs], dim=0).contiguous()
+        g_suh_t = torch.stack([p.suh for p in g_projs], dim=0).contiguous()
+        u_suh_t = torch.stack([p.suh for p in u_projs], dim=0).contiguous()
+        inter_t = torch.cat(
+            (
+                torch.stack([p.svh for p in g_projs], dim=0),
+                torch.stack([p.svh for p in u_projs], dim=0),
+                torch.stack([p.suh for p in d_projs], dim=0),
+            ),
+            dim=1,
+        ).contiguous()
+        d_svh_t = torch.stack([p.svh for p in d_projs], dim=0).contiguous()
+        tiers.append(
+            prepare_trellis256_moe_weights(
+                w13_t,
+                w2_t,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                num_experts=4,
+                activation="silu",
+                fc1_tile_n=tile_config[1],
+                fc2_tile_n=tile_config[3],
+                params_dtype=torch.float16,
+                w13_layout="trellis_t256_proj",
+                trellis_bits=t_bits,
+                codebook=codebook,
+                gate_suh=g_suh_t,
+                up_suh=u_suh_t,
+                intermediate_rotations=inter_t,
+                down_svh=d_svh_t,
+                tile_config=tile_config,
+            )
+        )
+        for local_i, g_exp in enumerate(globals_t):
+            gate_w_by_global[g_exp] = decode_exl3_projection_cpu(g_projs[local_i], t_bits)
+            up_w_by_global[g_exp] = decode_exl3_projection_cpu(u_projs[local_i], t_bits)
+            down_w_by_global[g_exp] = decode_exl3_projection_cpu(d_projs[local_i], t_bits)
+
+    route_map = torch.full((route_experts,), -1, dtype=torch.int32, device=device)
+    combined_order = list(tier0_globals) + list(tier1_globals)
+    for c_idx, g_exp in enumerate(combined_order):
+        route_map[g_exp] = c_idx
+    desc_row = torch.tensor(
+        [0, 1, 2, 3, (1 << 9) | 0, (1 << 9) | 1, (1 << 9) | 2, (1 << 9) | 3],
+        dtype=torch.int32,
+        device=device,
+    )
+    base_desc = desc_row.repeat(3).contiguous()
+    base_desc._mt_projection_counts = ((4, 4), (4, 4))
+
+    combined_widths = [384, 256, 128, 384, 256, 384, 128, 256]
+    compact_desc = build_compact_trellis_descriptor(
+        base_desc,
+        combined_widths,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        bits=bits,
+    )
+    compact_tiers = []
+    for t_idx, tier in enumerate(tiers):
+        t_bits = bits[t_idx]
+        packed = tier.w13.reshape(2, 4, hidden // 16, intermediate // 16, 8 * t_bits)
+        down = tier.w2.reshape(4, intermediate // 16, hidden // 16, 8 * t_bits)
+        local_widths = combined_widths[t_idx * 4 : t_idx * 4 + 4]
+        w13_c = torch.cat(
+            [packed[p, e, :, : w // 16].contiguous().flatten() for p in range(2) for e, w in enumerate(local_widths)]
+        )
+        w2_c = torch.cat([down[e, : w // 16].contiguous().flatten() for e, w in enumerate(local_widths)])
+        compact_tiers.append(replace(tier, w13=w13_c, w2=w2_c))
+
+    rotations = combine_trellis_rotations(tiers[0], tiers[1])
+    route_slots = max_packed_route_slots(capacity_m * top_k, 8, route_experts)
+    common_compile = dict(
+        size_m=capacity_m,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tier0_num_experts=4,
+        tier1_num_experts=4,
+        route_num_experts=route_experts,
+        top_k=top_k,
+        max_m_blocks=(route_slots + 7) // 8,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        force_tile_config=tile_config,
+        tier0_bits=4,
+        tier1_bits=5,
+        trellis_codebook=codebook,
+        activation="silu",
+        moe_block_size=8,
+        rotation_input_dtype="bf16",
+        full_rotation_output_dtype="bf16",
+        compact_weights=True,
+    )
+    auto_launch = compile_mixed_trellis(**common_compile)
+    explicit_k4 = compile_mixed_trellis(**common_compile, _k4_decode_override=True)
+    coop_launch = compile_mixed_trellis(**common_compile, _k4_decode_override=False)
+    # Automatic SM121 dispatch must select W4A16MixedTrellisK4Decode (not cooperative).
+    assert auto_launch.compiled is explicit_k4.compiled
+    assert auto_launch.compiled is not coop_launch.compiled
+
+    rng = torch.Generator(device="cpu").manual_seed(99_123)
+    x = (torch.randn((capacity_m, hidden), generator=rng) * 0.02).to(device=device, dtype=torch.bfloat16)
+    chosen_t = torch.tensor(chosen_globals, dtype=torch.int32)
+    ids = torch.stack([chosen_t[torch.randperm(8, generator=rng)] for _ in range(capacity_m)]).to(device=device)
+    weights = torch.softmax(torch.randn((capacity_m, top_k), generator=rng, dtype=torch.float32), dim=-1).to(
+        device=device
+    )
+
+    auto_binding = bind_mixed_trellis(
+        compact_tiers[0], compact_tiers[1], route_map, compact_desc, rotations, auto_launch
+    )
+    coop_binding = bind_mixed_trellis(
+        compact_tiers[0], compact_tiers[1], route_map, compact_desc, rotations, coop_launch
+    )
+    auto_buf = make_mixed_trellis_buffers(auto_launch, device=device, sms=sms)
+    coop_buf = make_mixed_trellis_buffers(coop_launch, device=device, sms=sms)
+
+    auto_out = run_bound_mixed_trellis(x, weights, ids, auto_binding, auto_buf).clone()
+    coop_out = run_bound_mixed_trellis(x, weights, ids, coop_binding, coop_buf).clone()
+    torch.cuda.synchronize(device)
+    assert_bitwise_equal(auto_out, coop_out, f"sm121_auto_inkling2_vs_coop_{codebook}")
+
+    # Also verify bit-for-bit against CPU Reference(codebook) over the 8 compact local experts.
+    local_ids = torch.stack(
+        [torch.tensor([combined_order.index(int(g)) for g in row.tolist()], dtype=torch.int32) for row in ids.cpu()]
+    ).to(device=device)
+    inter_ref = rotations.intermediate.view(8, 3 * intermediate).clone()
+    for c_idx, live_w in enumerate(combined_widths):
+        if live_w < intermediate:
+            inter_ref[c_idx, live_w:intermediate] = 0
+            inter_ref[c_idx, intermediate + live_w : 2 * intermediate] = 0
+            inter_ref[c_idx, 2 * intermediate + live_w : 3 * intermediate] = 0
+    expected_cpu = reference_exl3_routed_moe_bitwise(
+        x,
+        local_ids,
+        weights,
+        [gate_w_by_global[g] for g in combined_order],
+        [up_w_by_global[g] for g in combined_order],
+        [down_w_by_global[g] for g in combined_order],
+        rotations.gate_suh.view(8, hidden),
+        rotations.up_suh.view(8, hidden),
+        inter_ref,
+        rotations.down_svh.view(8, hidden),
+        activation="silu",
+        output_dtype=torch.bfloat16,
+        tile_k=tile_config[0],
+    )
+    assert_bitwise_equal(auto_out, expected_cpu, f"sm121_auto_inkling2_vs_cpu_{codebook}")
