@@ -2673,7 +2673,7 @@ def compile_mixed_trellis(
                 and str(activation).strip().lower() == "situ"
                 and swiglu_limit is None
                 and (tier0_bits, tier1_bits) == (2, 3)
-                and trellis_codebook == "mcg"
+                and trellis_codebook in (MCG, MUL1)
                 and rotation_input_dtype == "bf16"
                 and full_rotation_output_dtype == "bf16"
                 and int(size_m) in (1, 80)

@@ -510,3 +510,143 @@ def test_mixed_trellis4_format_accepts_mul1_and_separates_cache_keys_on_cpu(
         assert fused.trellis_codebook == "mul1"
         assert fused.fc1.l2_evict_first_b and fused.fc2.l2_evict_first_b
 
+
+@pytest.mark.parametrize("tier1_bits", [3, 4, 5, 6])
+@pytest.mark.parametrize("size_m", [1, 80])
+def test_mixed_trellis_kimi_tp6_accepts_mul1_and_separates_cache_keys_on_cpu(
+    tier1_bits: int,
+    size_m: int,
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import W4A16MixedTrellisKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis_kimi import W4A16MixedTrellisKimiTP6
+
+    def make_moe(num_experts: int, bits: int, codebook: str) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=size_m,
+            hidden_size=3584,
+            intermediate_size=512,
+            num_experts=num_experts,
+            top_k=16,
+            activation="situ",
+            swiglu_limit=None,
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=256,
+            fc1_tile_k=64,
+            fc2_tile_n=256,
+            fc2_tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=256,
+            element_dtype="fp16",
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj",
+            trellis_bits=bits,
+            trellis_codebook=codebook,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype="bf16",
+            workspace_sms=48,
+            schedule_whole_tiles=True,
+            l2_evict_first_b=True,
+        )
+
+    mul1_kimi = W4A16MixedTrellisKimiTP6(
+        driver=make_moe(8, 2, "mul1"),
+        tier0=make_moe(6, 2, "mul1"),
+        tier1=make_moe(2, tier1_bits, "mul1"),
+        descriptor_bits=10,
+    )
+    mcg_kimi = W4A16MixedTrellisKimiTP6(
+        driver=make_moe(8, 2, "mcg"),
+        tier0=make_moe(6, 2, "mcg"),
+        tier1=make_moe(2, tier1_bits, "mcg"),
+        descriptor_bits=10,
+    )
+    coop_mul1 = W4A16MixedTrellisKernel(
+        driver=make_moe(8, 2, "mul1"),
+        tier0=make_moe(6, 2, "mul1"),
+        tier1=make_moe(2, tier1_bits, "mul1"),
+        descriptor_bits=10,
+    )
+    assert mul1_kimi.max_span == (1 if size_m == 1 else 4)
+    assert mul1_kimi.__cache_key__ != mcg_kimi.__cache_key__
+    assert mul1_kimi.__cache_key__ != coop_mul1.__cache_key__
+
+    if tier1_bits == 3 and size_m == 1:
+        with pytest.raises(ValueError, match="W4A16MixedTrellisKimiTP6"):
+            W4A16MixedTrellisKimiTP6(
+                driver=make_moe(8, 2, "sqg_e4m3"),
+                tier0=make_moe(6, 2, "sqg_e4m3"),
+                tier1=make_moe(2, 3, "sqg_e4m3"),
+                descriptor_bits=10,
+            )
+
+
+@pytest.mark.parametrize("size_m", [1, 80])
+@pytest.mark.parametrize("codebook_arg", ["mul1", MUL1_MULTIPLIER, "mcg"])
+def test_sm121_kimi_tp6_selector_dispatches_mul1_and_mcg_before_cuda(
+    monkeypatch,
+    size_m: int,
+    codebook_arg: str | int,
+) -> None:
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from types import SimpleNamespace
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mt_mod
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis_kimi import W4A16MixedTrellisKimiTP6
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_a, **_k: (12, 1))
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_a, **_k: SimpleNamespace(
+            multi_processor_count=48, shared_memory_per_block_optin=101376
+        ),
+    )
+
+    class _StopBeforeCompile(Exception):
+        pass
+
+    selected: list[object] = []
+
+    def capture(build, **_kwargs):
+        selected.append(build(False))
+        raise _StopBeforeCompile
+
+    monkeypatch.setattr(mt_mod, "_select_mixed_fc2_kernel", capture)
+    with pytest.raises(_StopBeforeCompile):
+        mt_mod.compile_mixed_trellis(
+            size_m=size_m,
+            hidden_size=3584,
+            intermediate_size=512,
+            tier0_num_experts=6,
+            tier1_num_experts=2,
+            route_num_experts=896,
+            top_k=16,
+            max_m_blocks=256,
+            sms=48,
+            max_shared_mem=101376,
+            force_tile_config=(64, 256, 64, 256),
+            tier0_bits=2,
+            tier1_bits=3,
+            trellis_codebook=codebook_arg,
+            activation="situ",
+            swiglu_limit=None,
+            moe_block_size=8,
+            rotation_input_dtype="bf16",
+            full_rotation_output_dtype="bf16",
+            decode_schedule="gb10",
+            workspace_sms=48,
+        )
+    assert len(selected) == 1
+    assert isinstance(selected[0], W4A16MixedTrellisKimiTP6)
+    expected_cb = "mcg" if codebook_arg == "mcg" else "mul1"
+    assert selected[0].tier0.trellis_codebook == expected_cb
+
+
