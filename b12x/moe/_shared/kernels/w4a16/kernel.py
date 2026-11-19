@@ -1295,6 +1295,7 @@ class W4A16GemmKernel:
         self.fused_input_rotation = bool(fused_input_rotation)
         # Trace-time binding (suh_gate, suh_up, expert) for the FC1 tile being traced.
         self._rotation = None
+        self._group_rotate = None  # Grouped M8 FC1 only; trace-time producer of local A panels.
         self._compact_weight = None
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
@@ -1377,6 +1378,7 @@ class W4A16GemmKernel:
         # W4A16 shared-memory geometry, in int4 units unless noted.
         self.a_sh_stride = 16 * self.cta_k_blocks // 8
         self.a_sh_stage = self.a_sh_stride * (16 * self.cta_m_blocks)
+        self.a_ring_rows = _STAGES * 16 * self.cta_m_blocks
         self.a_gl_rd_delta_o = 16 * self.cta_k_blocks // 8
         self.a_sh_wr_delta = self.a_sh_stride * (
             self.cta_threads // self.a_gl_rd_delta_o
@@ -2704,7 +2706,7 @@ class W4A16GemmKernel:
         self._load_a_register_bundle(
             a_regs_cur,
             smem_base,
-            a_sh_rd,
+            self._a_wave_cursor(a_sh_rd, Int32(0), block_valid_rows),
             Int32(0),
             Int32(0),
             True,
@@ -3247,6 +3249,7 @@ class W4A16GemmKernel:
         b_frag = cute.make_rmem_tensor((2, 2), Uint32)
         tile_idx = Int32(0)
         while tile_idx < k_tiles:
+            a_cursor = self._a_wave_cursor(a_sh_rd, tile_idx, block_valid_rows)
             for pipe in cutlass.range_constexpr(_STAGES):
                 if tile_idx < k_tiles:
                     for kk in cutlass.range_constexpr(self.b_sh_wr_iters):
@@ -3257,7 +3260,7 @@ class W4A16GemmKernel:
                             tid,
                             b_sh_rd,
                             s_sh_rd,
-                            a_sh_rd,
+                            a_cursor,
                             pipe,
                             kk,
                             tile_idx,
@@ -3367,6 +3370,11 @@ class W4A16GemmKernel:
                     tile_idx += Int32(1)
             cute.arch.sync_threads()
             if tile_idx < k_tiles:
+                if cutlass.const_expr(self._group_rotate is not None):
+                    shift = self._group_a_row_shift(block_valid_rows)
+                    if (tile_idx & ((Int32(self.a_ring_rows) >> shift) - Int32(1))) == Int32(0):
+                        self._group_rotate(smem_base, tid, output_n_tile, tile_idx, block_valid_rows, shift)
+                        cute.arch.sync_threads()
                 self._load_b_scale_register_bundle(
                     b_scale_cur,
                     smem_base,
@@ -3381,7 +3389,7 @@ class W4A16GemmKernel:
                 self._load_a_register_bundle(
                     a_regs_cur,
                     smem_base,
-                    a_sh_rd,
+                    self._a_wave_cursor(a_sh_rd, tile_idx, block_valid_rows),
                     Int32(0),
                     Int32(0),
                     uses_m_block_8,
@@ -4030,19 +4038,43 @@ class W4A16GemmKernel:
         return ldmatrix_m8n8x4_b16(a_addr)
 
     @cute.jit
+    def _group_a_row_shift(self, valid):
+        # Packed M8 rows; a sparse expert turns the unused rows into K depth.
+        return (
+            (valid > Int32(1)).to(Int32) + (valid > Int32(2)).to(Int32)
+            + (valid > Int32(4)).to(Int32)
+        )
+
+    def _a_wave_cursor(self, rd, tile, valid):
+        if self._group_rotate is None:
+            return rd
+        shift = self._group_a_row_shift(valid)
+        panel_tiles = Int32(self.a_ring_rows) >> shift
+        stride = Int32(self.a_sh_stride) << shift
+        return rd, (tile & (panel_tiles - Int32(1))) * stride, stride
+
+    @cute.jit
     def _load_a_registers_m8(
         self,
         smem_base: Int32,
-        a_sh_rd: Int32,
+        a_sh_rd,
         pipe: Int32,
         kk: Int32,
     ):
-        a_addr = self._int4_addr(
-            smem_base,
-            Int32(self.sh_a_off)
-            + pipe * Int32(self.a_sh_stage)
-            + self._activation_smem_permuted_offset(Int32(2) * kk + a_sh_rd),
-        )
+        if cutlass.const_expr(self._group_rotate is not None):
+            rd, wave, stride = a_sh_rd
+            within = self._activation_smem_permuted_offset(Int32(2) * kk + rd)
+            # Mask off rows outside the compact pitch. Their results never leave
+            # the tile; valid rows retain the production ldmatrix lane mapping.
+            off = wave + pipe * stride + (within & (stride - Int32(1)))
+            a_addr = self._int4_addr(smem_base, Int32(self.sh_a_off) + off)
+        else:
+            a_addr = self._int4_addr(
+                smem_base,
+                Int32(self.sh_a_off)
+                + pipe * Int32(self.a_sh_stage)
+                + self._activation_smem_permuted_offset(Int32(2) * kk + a_sh_rd),
+            )
         return ldmatrix_m8n8x2_b16(a_addr)
 
     @cute.jit
@@ -4072,7 +4104,7 @@ class W4A16GemmKernel:
         self,
         regs: cute.Tensor,
         smem_base: Int32,
-        a_sh_rd: Int32,
+        a_sh_rd,
         pipe: Int32,
         kk: Int32,
     ):
@@ -4107,7 +4139,7 @@ class W4A16GemmKernel:
         self,
         regs: cute.Tensor,
         smem_base: Int32,
-        a_sh_rd: Int32,
+        a_sh_rd,
         pipe: Int32,
         kk: Int32,
         uses_m_block_8: cutlass.Constexpr[bool],
@@ -4274,7 +4306,7 @@ class W4A16GemmKernel:
         tid: Int32,
         b_sh_rd: Int32,
         s_sh_rd: Int32,
-        a_sh_rd: Int32,
+        a_sh_rd,
         pipe: cutlass.Constexpr[int],
         kk: cutlass.Constexpr[int],
         tile_idx: Int32,
@@ -5171,7 +5203,7 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
-        for i in cutlass.range_constexpr(self.a_sh_wr_iters):
+        for i in cutlass.range_constexpr(0 if self._group_rotate is not None else self.a_sh_wr_iters):
             row = a_rows_per_iter * Int32(i) + a_gl_rd_row
             route_index = Int32(0)
             if row < Int32(self.moe_block_size):
@@ -5730,6 +5762,11 @@ class W4A16GemmKernel:
                 )
             else:
                 cute.arch.cp_async_commit_group()
+        if cutlass.const_expr(self._group_rotate is not None):
+            # B is in flight. Materialize a projection-specific, CTA-private A
+            # panel in the existing four-stage A SRAM, before the normal wait.
+            self._group_rotate(smem_base, tid, output_n_tile, Int32(0), block_valid_rows,
+                               self._group_a_row_shift(block_valid_rows))
         if cutlass.const_expr(self.fused_input_rotation):
             # The first H128 pair: tiles 0 and 1 must both have landed.
             cute.arch.cp_async_wait_group(_STAGES - 3)

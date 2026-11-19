@@ -28,15 +28,18 @@ from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
+    cvt_bf16x2_to_f16x2,
+    f16x2_to_f32x2,
+    half2_mul,
     get_ptr_as_int64,
     half2_to_float2_scaled,
     ld_global_acquire_i32,
     ld_global_nc_v2_u32,
+    ld_shared_i32_relaxed,
     pack_f32x2_to_f16x2,
-    prefetch_bulk_global_l2,
     shared_ptr_to_u32,
-    st_global_release_i32,
     st_global_v2_u32,
+    st_shared_u64,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
@@ -264,10 +267,10 @@ class MixedTrellisTier(Protocol):
 
 
 @dsl_user_op
-def _group_arrive(addr: Int64, *, loc=None, ip=None) -> Int32:
+def _group_arrive(addr: Int64, last: Int32, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.inline_asm(
-        T.i32(), [addr.ir_value(loc=loc, ip=ip)],
-        "atom.acq_rel.gpu.global.add.u32 $0, [$1], 1;", "=r,l",
+        T.i32(), [addr.ir_value(loc=loc, ip=ip), last.ir_value(loc=loc, ip=ip)],
+        "atom.acq_rel.gpu.global.inc.u32 $0, [$1], $2;", "=r,l,r",
         has_side_effects=True, is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
     ))
@@ -419,8 +422,7 @@ class W4A16MixedTrellisKernel:
         ) + (
             () if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)
         ) + (("compact_weights_v2",) if self.compact_weights else ()) + (
-            (("group_compact_live_v2",) if self.compact_weights else ("group_decode_v1",))
-            if self.group_decode else ()
+            ("group_local_a_v3",) if self.group_decode else ()
         )
 
     @cute.jit
@@ -479,16 +481,19 @@ class W4A16MixedTrellisKernel:
                 active_size_m,
             )
 
-    def _dispatch_bound(self, is_fc1, combined_expert, gemm, compact_weight, *args):
+    def _dispatch_bound(self, is_fc1, combined_expert, gemm, compact_weight, *args, group_inputs=None):
         """Trace-time Python: bind the fused FC1 input rotation (SUH tables and
         the tile's combined expert) around one tier GEMM dispatch."""
         if is_fc1 and self.driver.fused_input_rotation:
             gemm._rotation = (*self._fused_suh, combined_expert)
+        if group_inputs is not None:
+            gemm._group_rotate = partial(self._group_rotate_panel, gemm, combined_expert, *group_inputs)
         gemm._compact_weight = compact_weight
         try:
             self._dispatch_tier_gemm(gemm, *args)
         finally:
             gemm._rotation = None
+            gemm._group_rotate = None
             gemm._compact_weight = None
 
     @cute.jit
@@ -529,6 +534,7 @@ class W4A16MixedTrellisKernel:
         reduce_slice_count: Int32,
         reduce_slice_idx: Int32,
         lock_slot: Int32,
+        group_inputs=None,
     ):
         if cutlass.const_expr(self.driver.direct_topk_routes):
             combined_expert = packed_route_indices[route_block_idx].to(Int32)
@@ -649,6 +655,7 @@ class W4A16MixedTrellisKernel:
                         reduce_slice_idx,
                         lock_slot,
                         active_size_m,
+                        group_inputs=group_inputs,
                     )
                 if cutlass.const_expr(is_fc1):
                     tier1_in_bounds = local_expert < tier1_gate_experts
@@ -688,6 +695,7 @@ class W4A16MixedTrellisKernel:
                         reduce_slice_idx,
                         lock_slot,
                         active_size_m,
+                        group_inputs=group_inputs,
                     )
 
     @cute.jit
@@ -1292,6 +1300,47 @@ class W4A16MixedTrellisKernel:
             unit += unit_stride
 
     @cute.jit
+    def _group_rotate_panel(self, gemm, expert, x, gate_suh, up_suh,
+                            smem_base, tid, output_n_tile, tile0, valid, shift):
+        # Same H128 butterfly/roundings as _run_input_rotation, but directly
+        # into the swizzled ldmatrix layout of this CTA's selected projection.
+        half_tiles = Int32(gemm.a_ring_rows // 2) >> shift
+        remaining = (Int32(gemm.k_tiles) - tile0) >> Int32(1)
+        if remaining < half_tiles:
+            half_tiles = remaining
+        pitch = Int32(1) << shift
+        lane = tid & Int32(31)
+        unit = tid >> Int32(5)
+        suh_offset = Int32(0)
+        if cutlass.const_expr(not self.driver.broadcast_suh):
+            suh_offset = expert * Int32(self.hidden_size)
+        suh_addr = get_ptr_as_int64(gate_suh, suh_offset)
+        if output_n_tile >= Int32(gemm.n_tiles // 2):
+            suh_addr = get_ptr_as_int64(up_suh, suh_offset)
+        while unit < (half_tiles << shift):
+            row = unit & (pitch - Int32(1))
+            pair = unit >> shift
+            lo = cutlass.Uint32(0)
+            hi = cutlass.Uint32(0)
+            if row < valid:
+                route = ld_shared_i32_relaxed(smem_base + Int32(gemm.sh_route_off * 16) + row * Int32(4))
+                col = tile0 * Int32(64) + pair * Int32(128) + lane * Int32(4)
+                x0, x1 = ld_global_nc_v2_u32(get_ptr_as_int64(
+                    x, (route // Int32(self.top_k)) * Int32(self.hidden_size) + col))
+                s0, s1 = ld_global_nc_v2_u32(suh_addr + col.to(Int64) * Int64(2))
+                v0, v1 = f16x2_to_f32x2(half2_mul(cvt_bf16x2_to_f16x2(x0), s0))
+                v2, v3 = f16x2_to_f32x2(half2_mul(cvt_bf16x2_to_f16x2(x1), s1))
+                h0, h1, h2, h3 = self.driver._had128_quad(v0, v1, v2, v3, lane)
+                lo = pack_f32x2_to_f16x2(h0, h1)
+                hi = pack_f32x2_to_f16x2(h2, h3)
+            tile = pair * Int32(2) + (lane >> Int32(4))
+            chunk = ((lane >> Int32(1)) & Int32(7)) ^ row
+            slot = ((tile << shift) + row) * Int32(8) + chunk
+            addr = smem_base + Int32(16 * gemm.sh_a_off) + slot * Int32(16) + (lane & Int32(1)) * Int32(8)
+            st_shared_u64(addr, lo.to(cutlass.Uint64) | (hi.to(cutlass.Uint64) << cutlass.Uint64(32)))
+            unit += Int32(self.cta_threads // 32)
+
+    @cute.jit
     def _group_boundary(self, candidate: Int32, blocks: Int32, experts: cute.Tensor):
         # The packed list is sorted by expert. Normally there is exactly one
         # M8 block per expert at <=8 tokens. Keep an overfull expert together
@@ -1311,12 +1360,13 @@ class W4A16MixedTrellisKernel:
     def _group_barrier(self, workspace, group, phase: cutlass.Constexpr, tid, peers):
         cute.arch.sync_threads()
         if tid == Int32(0):
-            # Whole-K tiles never use split-K lock slots. Three distinct words
+            # Whole-K tiles never use split-K lock slots. Distinct words
             # per group avoid ABA; every last arrival restores zero for replay.
             addr = get_ptr_as_int64(workspace, group * Int32(4) + Int32(phase))
-            if _group_arrive(addr) == peers - Int32(1):
-                st_global_release_i32(addr, Int32(0))
-            else:
+            # Increment modulo peers: the last arrival releases zero in the
+            # RMW itself, without another store after its return round trip.
+            last = peers - Int32(1)
+            if _group_arrive(addr, last) != last:
                 pending = ld_global_acquire_i32(addr)
                 while pending != Int32(0):
                     pending = ld_global_acquire_i32(addr)
@@ -1330,106 +1380,6 @@ class W4A16MixedTrellisKernel:
             emit(tile // tiles_n, tile % tiles_n, Int32(0), Int32(gemm.k_tiles),
                  Int32(1), Int32(0), Int32(0))
             tile += peers
-
-    @cute.jit
-    def _group_live_half(self, block, experts, descriptors, total_experts):
-        expert = experts[block].to(Int32)
-        half = Int32(0)
-        if expert >= Int32(0) and expert < total_experts:
-            width = descriptors[3 * total_experts + expert].to(Int32)
-            if width > Int32(0):
-                half = width // Int32(self.driver.fc1.tile_n)
-        return half
-
-    @cute.jit
-    def _group_prefix(self, value, lane):
-        # Only the first eight lanes can own groups.
-        for i in cutlass.range_constexpr(3):
-            prev = cute.arch.shuffle_sync_up(value, offset=1 << i, mask_and_clamp=0)
-            if lane >= Int32(1 << i):
-                value += prev
-        return value
-
-    @cute.jit
-    def _compact_group(self, blocks, groups, shift, experts, descriptors, total_experts, cta, grid_x):
-        # Every warp independently builds the same plan in registers. One lane
-        # per group counts live tiles over its range; no CTA broadcasts or
-        # global work queues. Even an empty range gets a (no-op) owner.
-        lane = cute.arch.lane_idx()
-        first = Int32(0)
-        stop = Int32(0)
-        load = Int32(0)
-        if lane < groups:
-            first = self._group_boundary((blocks * lane) >> shift, blocks, experts)
-            stop = self._group_boundary((blocks * (lane + Int32(1))) >> shift, blocks, experts)
-            block = first
-            while block < stop:
-                load += Int32(2) * self._group_live_half(block, experts, descriptors, total_experts)
-                block += Int32(1)
-        prefix = self._group_prefix(load, lane)
-        total = cute.arch.shuffle_sync(prefix, groups - Int32(1))
-        # Reserve the minimum integer CTA quota for each group's live FC1
-        # work to finish in 'waves'. Ceilings may oversubscribe the grid.
-        waves = max(Int32(1), (total + grid_x - Int32(1)) // grid_x)
-        required = grid_x + Int32(1)
-        quota = Int32(0)
-        quota_end = Int32(0)
-        while required > grid_x:
-            if lane < groups:
-                quota = max(Int32(1), (load + waves - Int32(1)) // waves)
-            quota_end = self._group_prefix(quota, lane)
-            required = cute.arch.shuffle_sync(quota_end, groups - Int32(1))
-            waves += Int32(1)
-        # Allocate any remainder by cumulative live width (also proportional
-        # to FC2 weight bytes at a fixed rate). Endpoints tile [0, grid_x).
-        end = quota_end + (grid_x - required) * prefix // max(Int32(1), total)
-        if total == Int32(0):
-            end = (grid_x * (lane + Int32(1))) >> shift
-        mask = cute.arch.vote_ballot_sync((lane < groups) & (cta >= end))
-        owner = Int32(cute.arch.popc(mask))
-        start_cta = cute.arch.shuffle_sync(end, max(Int32(0), owner - Int32(1)))
-        if owner == Int32(0):
-            start_cta = Int32(0)
-        peers = cute.arch.shuffle_sync(end, owner) - start_cta
-        return (owner, cta - start_cta, peers, cute.arch.shuffle_sync(first, owner),
-                cute.arch.shuffle_sync(stop, owner))
-
-    @cute.jit
-    def _group_compact_fc1(self, emit: cutlass.Constexpr, experts, descriptors, total_experts,
-                           first, stop, rank, peers, tid, w2_0, w2_1, down_0, down_1):
-        # Carry a live tile ticket across expert boundaries: padded gate/up
-        # tails consume no ticket. Restore physical N only at the emitter.
-        tile = rank
-        block = first
-        while block < stop:
-            half = self._group_live_half(block, experts, descriptors, total_experts)
-            count = Int32(2) * half
-            while tile < count:
-                n = tile
-                if tile >= half:
-                    n += Int32(self.driver.fc1.n_tiles // 2) - half
-                emit(block, n, Int32(0), Int32(self.driver.fc1.k_tiles),
-                     Int32(1), Int32(0), Int32(0))
-                tile += peers
-            # In a one-block group excess CTAs cannot steal a whole FC1
-            # tile. Give one of them the down projection's contiguous native
-            # weight span to warm while the other ranks compute gate and up.
-            if stop - first == Int32(1) and rank == count and tid == Int32(0) and half > Int32(0):
-                e = experts[block].to(Int32)
-                descriptor = descriptors[2 * total_experts + e].to(Int32)
-                if descriptor >= Int32(0):
-                    tier = descriptor >> Int32(self.descriptor_bits)
-                    local = descriptor & Int32((1 << self.descriptor_bits) - 1)
-                    off = descriptors[6 * total_experts + e].to(Int64)
-                    elems = half * Int32(self.driver.fc1.tile_n * self.hidden_size)
-                    if tier == Int32(0) and local < down_0:
-                        prefetch_bulk_global_l2(get_ptr_as_int64(w2_0, off),
-                                                elems * Int32(self.tier0.fc2.trellis_bits) // Int32(8))
-                    if tier == Int32(1) and local < down_1:
-                        prefetch_bulk_global_l2(get_ptr_as_int64(w2_1, off),
-                                                elems * Int32(self.tier1.fc2.trellis_bits) // Int32(8))
-            tile -= count
-            block += Int32(1)
 
     @cute.kernel
     def group_kernel(self, operands: tuple):
@@ -1462,6 +1412,7 @@ class W4A16MixedTrellisKernel:
             packed_routes, experts, descriptor_map, weights, fc1_scratch, workspace,
             lut_addr, smem_base, tid, active_m, t0_count, t1_count, t0_down,
             t1_down, t0_gate, t1_gate, t0_up, t1_up,
+            group_inputs=(rotation_input, gate_suh, up_suh),
         )
         fc2_emit = partial(
             self._emit_tier_tile, False, activated, activated,
@@ -1481,16 +1432,11 @@ class W4A16MixedTrellisKernel:
         elif blocks >= Int32(2) and grid_x >= Int32(2 * 6):
             shift = Int32(1)
         groups = Int32(1) << shift
-        if cutlass.const_expr(self.compact_weights):
-            group, rank, peers, first, stop = self._compact_group(
-                blocks, groups, shift, experts, descriptor_map, total_experts, cta, grid_x,
-            )
-        else:
-            group = cta & (groups - Int32(1))
-            rank = cta >> shift
-            peers = (grid_x + groups - Int32(1) - group) >> shift
-            first = self._group_boundary((blocks * group) >> shift, blocks, experts)
-            stop = self._group_boundary((blocks * (group + Int32(1))) >> shift, blocks, experts)
+        group = cta & (groups - Int32(1))
+        rank = cta >> shift
+        peers = (grid_x + groups - Int32(1) - group) >> shift
+        first = self._group_boundary((blocks * group) >> shift, blocks, experts)
+        stop = self._group_boundary((blocks * (group + Int32(1))) >> shift, blocks, experts)
         if first < stop:
             block_m = Int32(self.driver.moe_block_size)
             slots = (stop - first) * block_m
@@ -1499,17 +1445,7 @@ class W4A16MixedTrellisKernel:
             ids = cute.make_tensor(experts.iterator + first, cute.make_layout((stop - first,)))
             count = cute.make_rmem_tensor((1,), Int32)
             count[0] = slots
-            self.driver._run_input_rotation(
-                rotation_input, rotation_gate, rotation_up, gate_suh, up_suh, routes,
-                ids, count, descriptor_map, total_experts, total_experts,
-                tid, rank, peers, active_m,
-            )
-            self._group_barrier(workspace, group, 0, tid, peers)
-            if cutlass.const_expr(self.compact_weights):
-                self._group_compact_fc1(fc1_emit, experts, descriptor_map, total_experts,
-                                        first, stop, rank, peers, tid, t0_w2, t1_w2, t0_down, t1_down)
-            else:
-                self._group_gemm(fc1_emit, self.driver.fc1, first, stop, rank, peers)
+            self._group_gemm(fc1_emit, self.driver.fc1, first, stop, rank, peers)
             self._group_barrier(workspace, group, 1, tid, peers)
             self.driver._run_activation_compact(
                 fc1, activated, intermediate_rotations, routes, ids, count,
@@ -2991,6 +2927,7 @@ def compile_mixed_trellis(
             (6144, 256, 256, (4, 5), False),
         )
         and int(moe_block_size) == 8 and kernel.blocks_per_sm == 1
+        and kernel.driver.fc1.tile_k == 64 and kernel.driver.fc1.uses_m_block_8
         and kernel.driver.fc1.schedule_whole_tiles and kernel.driver.fc2.schedule_whole_tiles
         and trellis_codebook == "mcg" and rotation_input_dtype == "bf16"
         and not direct_topk_routes and not fused_input_rotation and not token_major_rotation
