@@ -21,21 +21,36 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.compiler import OptLevel
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Int32, Int64, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
+    atomic_add_global_i32,
     bfloat2_to_float2_scaled,
+    cvt_bf16x2_to_f16x2_via_f32,
+    f16x2_to_f32x2,
     get_ptr_as_int64,
     half2_to_float2_scaled,
+    ld_global_acquire_i32,
     ld_global_nc_v2_u32,
+    ld_global_v2_u32,
+    ld_shared_i32_relaxed,
     pack_f32x2_to_f16x2,
+    red_add_global_release_i32,
     shared_ptr_to_u32,
+    st_global_i32,
     st_global_v2_u32,
+    st_shared_i32,
+    threadfence,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe._shared.kernels.activations import (
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
+)
 from b12x.moe._shared.trellis_codebooks import (
     normalize_codebook,
     validate_codebook_bits,
@@ -1544,6 +1559,1002 @@ class W4A16MixedTrellisKernel:
         )
 
 
+@dsl_user_op
+def _group_nanosleep(nanoseconds: Int32, *, loc=None, ip=None):
+    """Short backoff inside group-local barrier polling to avoid L2 pressure."""
+    llvm.inline_asm(
+        None,
+        [Int32(nanoseconds).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
+    """One-launch SM-group-wise cooperative mixed-Trellis kernel for small-M.
+
+    At runtime ``active_m <= GROUP_MAX_M`` (m1..m8), partitions the launched
+    cooperative grid into ``G`` contiguous CTA groups (chosen from runtime
+    ``grid_x`` and the active expert runs). Active experts are deterministically
+    assigned to disjoint groups via 3-pass LPT load balancing weighted by each
+    expert's exact route-block count, compact live width, and bitrate sum.
+    Each group then runs rotation -> FC1 -> activation -> FC2 independently
+    with group-local sense-reversing barriers placed in the unused whole-tile
+    split-K lock prefix of ``workspace``. For ``active_m > GROUP_MAX_M``,
+    falls back seamlessly to ``G = 1`` (whole-grid execution) with zero
+    duplicated GEMM codegen.
+    """
+
+    GROUP_MAX_M = 8
+    MAX_GROUP_BLOCKS = 128
+    MAX_GROUPS_LIMIT = 8
+    GROUP_HDR_BYTES = 64
+    GROUP_ARRAY_BYTES = 512
+    GROUP_FC1_PREFIX_BYTES = 528
+
+    def __init__(
+        self,
+        *,
+        driver: W4A16FusedMoeKernel,
+        tier0: W4A16FusedMoeKernel,
+        tier1: W4A16FusedMoeKernel,
+        descriptor_bits: int = 9,
+        compact_weights: bool = False,
+    ):
+        super().__init__(
+            driver=driver,
+            tier0=tier0,
+            tier1=tier1,
+            descriptor_bits=descriptor_bits,
+            paired_boundary=None,
+            compact_weights=compact_weights,
+            token_major_rotation=False,
+        )
+        if (
+            self.driver.moe_block_size != 8
+            or self.driver.fc2.moe_block_size != 8
+            or self.driver.fc2.schedule_route_block_factor != 1
+            or self.driver.direct_topk_routes
+            or self.driver.fused_input_rotation
+            or self.driver.coupled_hadamard
+            or self.driver.collect_activation_amax
+            or self.driver.zero_fc2_output
+            or self.driver.activation_output_a8
+            or not self.driver.activation_is_gated
+            or self.driver.sqg_xor_cheb_t12_smem
+            or self.driver.rotation_input_dtype not in ("bf16", "fp16")
+            or not self.driver.fc1.schedule_whole_tiles
+            or not self.driver.fc2.schedule_whole_tiles
+        ):
+            raise ValueError(
+                "W4A16MixedTrellisGroupwiseKernel requires packed M8 whole-tile cooperative MCG geometry"
+            )
+        ws_words = int(self.driver.workspace_sms) * 4
+        if ws_words < 4:
+            raise ValueError("group-wise barrier workspace requires at least 4 int32 words")
+        self.max_groups = min(self.MAX_GROUPS_LIMIT, ws_words // 2)
+        self.group_barrier_stride = ws_words // self.max_groups
+        if self.group_barrier_stride < 2:
+            raise ValueError("group-wise barrier stride must hold at least (count, sense)")
+
+        base_bytes = ((int(self.shared_words) * 4 + 15) // 16) * 16
+        if base_bytes < 4096:
+            raise ValueError(f"unexpected small GEMM shared footprint: {base_bytes}")
+
+        self.compact_fc1_pack = bool(
+            self.compact_weights and self.driver.intermediate_size != self.driver.fc1.tile_n
+        )
+        self.group_hdr_off = base_bytes
+        self.group_blocks_off = self.group_hdr_off + self.GROUP_HDR_BYTES
+        self.group_routes_off = self.group_blocks_off + self.GROUP_ARRAY_BYTES
+        self.group_route_exp_off = self.group_routes_off + self.GROUP_ARRAY_BYTES
+        if self.compact_fc1_pack:
+            self.group_half_off = self.group_route_exp_off + self.GROUP_ARRAY_BYTES
+            self.group_fc1_pref_off = self.group_half_off + self.GROUP_ARRAY_BYTES
+            total_bytes = self.group_fc1_pref_off + self.GROUP_FC1_PREFIX_BYTES
+        else:
+            self.group_half_off = 0
+            self.group_fc1_pref_off = 0
+            total_bytes = self.group_route_exp_off + self.GROUP_ARRAY_BYTES
+        self.shared_words = total_bytes // 4
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        return super().__cache_key__ + (
+            (
+                "k4_groupwise_v1",
+                self.max_groups,
+                self.group_barrier_stride,
+                self.compact_fc1_pack,
+                self.group_hdr_off,
+            ),
+        )
+
+    @cute.jit
+    def _group_barrier(
+        self,
+        locks_i32_flat: cute.Tensor,
+        tid: Int32,
+        group_size: Int32,
+        count_off: Int32,
+        sense_off: Int32,
+    ):
+        cute.arch.sync_threads()
+        if group_size > Int32(1):
+            if tid == Int32(0):
+                threadfence()
+                count_addr = get_ptr_as_int64(locks_i32_flat, count_off)
+                sense_addr = get_ptr_as_int64(locks_i32_flat, sense_off)
+                old_sense = ld_global_acquire_i32(sense_addr)
+                old_count = atomic_add_global_i32(count_addr, Int32(1))
+                if old_count == group_size - Int32(1):
+                    st_global_i32(count_addr, Int32(0))
+                    threadfence()
+                    red_add_global_release_i32(sense_addr, Int32(1))
+                else:
+                    sense = ld_global_acquire_i32(sense_addr)
+                    while sense == old_sense:
+                        _group_nanosleep(Int32(64))
+                        sense = ld_global_acquire_i32(sense_addr)
+            cute.arch.sync_threads()
+        else:
+            if tid == Int32(0):
+                threadfence()
+            cute.arch.sync_threads()
+
+    @cute.jit
+    def _build_group_plan(
+        self,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        total_experts: Int32,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_m: Int32,
+    ):
+        hdr_smem = smem_base + Int32(self.group_hdr_off)
+        blocks_smem = smem_base + Int32(self.group_blocks_off)
+        routes_smem = smem_base + Int32(self.group_routes_off)
+        route_exp_smem = smem_base + Int32(self.group_route_exp_off)
+
+        # Prologue scratch aliases the unused GEMM SMEM [0..3616).
+        tmp_blk_exp = smem_base + Int32(0)
+        tmp_blk_w = smem_base + Int32(512)
+        tmp_blk_wu = smem_base + Int32(1024)
+        tmp_blk_ht = smem_base + Int32(1536)
+        tmp_run_start = smem_base + Int32(2048)
+        tmp_run_len = smem_base + Int32(2560)
+        tmp_run_w = smem_base + Int32(3072)
+        tmp_gload = smem_base + Int32(3584)
+
+        route_blocks = packed_route_count[Int32(0)].to(Int32) >> Int32(3)
+        if route_blocks < Int32(0):
+            route_blocks = Int32(0)
+        live_routes = active_m * Int32(self.top_k)
+
+        eligible = Int32(0)
+        if (
+            active_m <= Int32(self.GROUP_MAX_M)
+            and route_blocks >= Int32(2)
+            and route_blocks <= Int32(self.MAX_GROUP_BLOCKS)
+            and live_routes <= Int32(self.MAX_GROUP_BLOCKS)
+            and grid_x >= Int32(8)
+        ):
+            eligible = Int32(1)
+
+        if eligible == Int32(0):
+            if tid == Int32(0):
+                st_shared_i32(hdr_smem + Int32(0), Int32(1))
+                st_shared_i32(hdr_smem + Int32(4), route_blocks)
+                st_shared_i32(hdr_smem + Int32(8), Int32(0))
+                st_shared_i32(
+                    hdr_smem + Int32(12),
+                    route_blocks * Int32(self.driver.fc1.n_tiles),
+                )
+                st_shared_i32(hdr_smem + Int32(16), Int32(0))
+                st_shared_i32(hdr_smem + Int32(20), grid_x)
+                st_shared_i32(hdr_smem + Int32(24), cta)
+                st_shared_i32(
+                    hdr_smem + Int32(28), Int32(self.driver.barrier_count_off)
+                )
+                st_shared_i32(
+                    hdr_smem + Int32(32), Int32(self.driver.barrier_sense_off)
+                )
+            cute.arch.sync_threads()
+        else:
+            # Parallel descriptor + block-expert fetch across CTA threads.
+            te64 = total_experts.to(Int64)
+            b_idx = tid
+            while b_idx < route_blocks:
+                e = block_expert_ids[b_idx].to(Int32)
+                w = Int32(0)
+                wu = Int32(0)
+                ht = Int32(0)
+                if e >= Int32(0) and e < total_experts:
+                    e64 = e.to(Int64)
+                    d0 = descriptor_map[e64].to(Int32)
+                    d1 = descriptor_map[te64 + e64].to(Int32)
+                    d2 = descriptor_map[Int64(2) * te64 + e64].to(Int32)
+                    b_sum = Int32(0)
+                    if d0 >= Int32(0):
+                        if (d0 >> Int32(self.descriptor_bits)) == Int32(1):
+                            b_sum += Int32(self.tier1.trellis_bits)
+                        else:
+                            b_sum += Int32(self.tier0.trellis_bits)
+                    if d1 >= Int32(0):
+                        if (d1 >> Int32(self.descriptor_bits)) == Int32(1):
+                            b_sum += Int32(self.tier1.trellis_bits)
+                        else:
+                            b_sum += Int32(self.tier0.trellis_bits)
+                    if d2 >= Int32(0):
+                        if (d2 >> Int32(self.descriptor_bits)) == Int32(1):
+                            b_sum += Int32(self.tier1.trellis_bits)
+                        else:
+                            b_sum += Int32(self.tier0.trellis_bits)
+                    if cutlass.const_expr(self.compact_weights):
+                        if cutlass.const_expr(
+                            self.driver.intermediate_size == self.driver.fc1.tile_n
+                        ):
+                            lw = Int32(self.driver.intermediate_size)
+                        else:
+                            lw = descriptor_map[Int64(3) * te64 + e64].to(Int32)
+                        wu = lw // Int32(128)
+                        ht = lw // Int32(self.driver.fc1.tile_n)
+                        w = b_sum * wu
+                    else:
+                        wu = Int32(self.driver.intermediate_size // 128)
+                        ht = Int32(self.driver.fc1.n_tiles // 2)
+                        w = b_sum
+                st_shared_i32(tmp_blk_exp + b_idx * Int32(4), e)
+                st_shared_i32(tmp_blk_w + b_idx * Int32(4), w)
+                st_shared_i32(tmp_blk_wu + b_idx * Int32(4), wu)
+                st_shared_i32(tmp_blk_ht + b_idx * Int32(4), ht)
+                b_idx += Int32(self.cta_threads)
+            cute.arch.sync_threads()
+
+            if tid == Int32(0):
+                # Merge contiguous blocks of each active expert into runs so an
+                # expert's blocks always stay in one group (preserving L2 reuse).
+                num_runs = Int32(0)
+                min_run_w = Int32(0x7FFFFFFF)
+                max_run_w = Int32(0)
+                b = Int32(0)
+                while b < route_blocks:
+                    e0 = ld_shared_i32_relaxed(tmp_blk_exp + b * Int32(4))
+                    rlen = Int32(1)
+                    rw = ld_shared_i32_relaxed(tmp_blk_w + b * Int32(4))
+                    if e0 >= Int32(0):
+                        extending = Int32(1)
+                        while extending != Int32(0):
+                            if b + rlen < route_blocks:
+                                e_next = ld_shared_i32_relaxed(
+                                    tmp_blk_exp + (b + rlen) * Int32(4)
+                                )
+                                if e_next == e0:
+                                    rw += ld_shared_i32_relaxed(
+                                        tmp_blk_w + (b + rlen) * Int32(4)
+                                    )
+                                    rlen += Int32(1)
+                                else:
+                                    extending = Int32(0)
+                            else:
+                                extending = Int32(0)
+                    st_shared_i32(tmp_run_start + num_runs * Int32(4), b)
+                    st_shared_i32(tmp_run_len + num_runs * Int32(4), rlen)
+                    st_shared_i32(tmp_run_w + num_runs * Int32(4), rw)
+                    if rw > Int32(0):
+                        if rw < min_run_w:
+                            min_run_w = rw
+                        if rw > max_run_w:
+                            max_run_w = rw
+                    num_runs += Int32(1)
+                    b += rlen
+                if max_run_w == Int32(0):
+                    min_run_w = Int32(0)
+
+                # Runtime G selection from (grid_x, num_runs, weight uniformity).
+                cap_g = grid_x // Int32(4)
+                if Int32(self.max_groups) < cap_g:
+                    cap_g = Int32(self.max_groups)
+                if num_runs < cap_g:
+                    cap_g = num_runs
+                uniform_runs = Int32(0)
+                if min_run_w == max_run_w:
+                    uniform_runs = Int32(1)
+                max_balanced_g = cap_g
+                if uniform_runs == Int32(0):
+                    half_runs = num_runs // Int32(2)
+                    if half_runs < max_balanced_g:
+                        max_balanced_g = half_runs
+                num_groups = Int32(1)
+                if max_balanced_g >= Int32(4):
+                    num_groups = Int32(4)
+                elif max_balanced_g >= Int32(2):
+                    num_groups = Int32(2)
+                if cutlass.const_expr(not self.compact_weights):
+                    if (
+                        uniform_runs != Int32(0)
+                        and cap_g >= Int32(8)
+                        and num_runs == Int32(8)
+                        and (grid_x - (grid_x // Int32(8)) * Int32(8)) == Int32(0)
+                    ):
+                        g8_size = grid_x // Int32(8)
+                        fc2_n = Int32(self.driver.fc2.n_tiles)
+                        if (fc2_n - (fc2_n // g8_size) * g8_size) == Int32(0):
+                            num_groups = Int32(8)
+
+                if num_groups == Int32(1):
+                    st_shared_i32(hdr_smem + Int32(0), Int32(1))
+                    st_shared_i32(hdr_smem + Int32(4), route_blocks)
+                    st_shared_i32(hdr_smem + Int32(8), Int32(0))
+                    st_shared_i32(
+                        hdr_smem + Int32(12),
+                        route_blocks * Int32(self.driver.fc1.n_tiles),
+                    )
+                    st_shared_i32(hdr_smem + Int32(16), Int32(0))
+                    st_shared_i32(hdr_smem + Int32(20), grid_x)
+                    st_shared_i32(hdr_smem + Int32(24), cta)
+                    st_shared_i32(
+                        hdr_smem + Int32(28), Int32(self.driver.barrier_count_off)
+                    )
+                    st_shared_i32(
+                        hdr_smem + Int32(32), Int32(self.driver.barrier_sense_off)
+                    )
+                else:
+                    # Contiguous CTA-to-group mapping for any runtime grid_x.
+                    base_ctas = grid_x // num_groups
+                    rem_ctas = grid_x - base_ctas * num_groups
+                    split_cta = rem_ctas * (base_ctas + Int32(1))
+                    my_group = Int32(0)
+                    group_start = Int32(0)
+                    group_size = base_ctas
+                    if cta < split_cta:
+                        my_group = cta // (base_ctas + Int32(1))
+                        group_start = my_group * (base_ctas + Int32(1))
+                        group_size = base_ctas + Int32(1)
+                    else:
+                        my_group = rem_ctas + (cta - split_cta) // base_ctas
+                        group_start = split_cta + (my_group - rem_ctas) * base_ctas
+                        group_size = base_ctas
+                    local_cta = cta - group_start
+
+                    # 3-pass LPT greedy assignment: multi-block experts first,
+                    # heavy single-block experts (width-384/K5/K6) second,
+                    # remaining light experts last.
+                    gi = Int32(0)
+                    while gi < num_groups:
+                        st_shared_i32(tmp_gload + gi * Int32(4), Int32(0))
+                        gi += Int32(1)
+                    if cutlass.const_expr(self.compact_fc1_pack):
+                        st_shared_i32(
+                            smem_base + Int32(self.group_fc1_pref_off), Int32(0)
+                        )
+
+                    gb_count = Int32(0)
+                    fc1_acc = Int32(0)
+                    pass_idx = Int32(0)
+                    while pass_idx < Int32(3):
+                        r = Int32(0)
+                        while r < num_runs:
+                            rlen = ld_shared_i32_relaxed(tmp_run_len + r * Int32(4))
+                            rw = ld_shared_i32_relaxed(tmp_run_w + r * Int32(4))
+                            take = Int32(0)
+                            if pass_idx == Int32(0):
+                                if rlen > Int32(1):
+                                    take = Int32(1)
+                            elif pass_idx == Int32(1):
+                                if rlen == Int32(1) and rw > min_run_w:
+                                    take = Int32(1)
+                            else:
+                                if rlen == Int32(1) and rw <= min_run_w:
+                                    take = Int32(1)
+                            if take != Int32(0):
+                                best_g = Int32(0)
+                                best_load = ld_shared_i32_relaxed(tmp_gload)
+                                cand = Int32(1)
+                                while cand < num_groups:
+                                    cload = ld_shared_i32_relaxed(
+                                        tmp_gload + cand * Int32(4)
+                                    )
+                                    if cload < best_load:
+                                        best_load = cload
+                                        best_g = cand
+                                    cand += Int32(1)
+                                st_shared_i32(
+                                    tmp_gload + best_g * Int32(4), best_load + rw
+                                )
+                                if best_g == my_group:
+                                    rstart = ld_shared_i32_relaxed(
+                                        tmp_run_start + r * Int32(4)
+                                    )
+                                    rk = Int32(0)
+                                    while rk < rlen:
+                                        blk_id = rstart + rk
+                                        st_shared_i32(
+                                            blocks_smem + gb_count * Int32(4), blk_id
+                                        )
+                                        if cutlass.const_expr(self.compact_fc1_pack):
+                                            ht_b = ld_shared_i32_relaxed(
+                                                tmp_blk_ht + blk_id * Int32(4)
+                                            )
+                                            st_shared_i32(
+                                                smem_base
+                                                + Int32(self.group_half_off)
+                                                + gb_count * Int32(4),
+                                                ht_b,
+                                            )
+                                            fc1_acc += Int32(2) * ht_b
+                                            st_shared_i32(
+                                                smem_base
+                                                + Int32(self.group_fc1_pref_off)
+                                                + (gb_count + Int32(1)) * Int32(4),
+                                                fc1_acc,
+                                            )
+                                        gb_count += Int32(1)
+                                        rk += Int32(1)
+                            r += Int32(1)
+                        pass_idx += Int32(1)
+
+                    # Compact live routes belonging to my_group (eliminating
+                    # the 7/8 block-alignment padding in rotation & activation).
+                    lr_count = Int32(0)
+                    lb = Int32(0)
+                    while lb < gb_count:
+                        blk_id = ld_shared_i32_relaxed(blocks_smem + lb * Int32(4))
+                        e_b = ld_shared_i32_relaxed(tmp_blk_exp + blk_id * Int32(4))
+                        wu_b = ld_shared_i32_relaxed(tmp_blk_wu + blk_id * Int32(4))
+                        if e_b >= Int32(0) and e_b < total_experts:
+                            packed_e = (wu_b << Int32(16)) | e_b
+                            base_slot = blk_id * Int32(8)
+                            for slot in cutlass.range_constexpr(8):
+                                r_id = packed_route_indices[
+                                    base_slot + Int32(slot)
+                                ].to(Int32)
+                                if (
+                                    r_id >= Int32(0)
+                                    and r_id < live_routes
+                                    and lr_count < Int32(self.MAX_GROUP_BLOCKS)
+                                ):
+                                    st_shared_i32(
+                                        routes_smem + lr_count * Int32(4), r_id
+                                    )
+                                    st_shared_i32(
+                                        route_exp_smem + lr_count * Int32(4), packed_e
+                                    )
+                                    lr_count += Int32(1)
+                        lb += Int32(1)
+
+                    fc1_tasks = gb_count * Int32(self.driver.fc1.n_tiles)
+                    if cutlass.const_expr(self.compact_fc1_pack):
+                        fc1_tasks = fc1_acc
+                    b_count_off = my_group * Int32(self.group_barrier_stride)
+                    st_shared_i32(hdr_smem + Int32(0), num_groups)
+                    st_shared_i32(hdr_smem + Int32(4), gb_count)
+                    st_shared_i32(hdr_smem + Int32(8), lr_count)
+                    st_shared_i32(hdr_smem + Int32(12), fc1_tasks)
+                    st_shared_i32(hdr_smem + Int32(16), my_group)
+                    st_shared_i32(hdr_smem + Int32(20), group_size)
+                    st_shared_i32(hdr_smem + Int32(24), local_cta)
+                    st_shared_i32(hdr_smem + Int32(28), b_count_off)
+                    st_shared_i32(hdr_smem + Int32(32), b_count_off + Int32(1))
+            cute.arch.sync_threads()
+
+    @cute.jit
+    def _run_group_input_rotation(
+        self,
+        x_input: cute.Tensor,
+        a_gate: cute.Tensor,
+        a_up: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        smem_base: Int32,
+        group_live_routes: Int32,
+        tid: Int32,
+        local_cta: Int32,
+        group_size: Int32,
+    ):
+        lane = tid & Int32(31)
+        warp_in_cta = tid >> Int32(5)
+        warps_per_cta = Int32(self.cta_threads // 32)
+        nblk = Int32(self.hidden_size // 128)
+        routes_smem = smem_base + Int32(self.group_routes_off)
+        route_exp_smem = smem_base + Int32(self.group_route_exp_off)
+        gwarp = local_cta * warps_per_cta + warp_in_cta
+        gw_stride = group_size * warps_per_cta
+        total_units = group_live_routes * nblk
+        elem = lane * Int32(4)
+        unit = gwarp
+        while unit < total_units:
+            # Block-outer ordering keeps warps on the same (token, H128 block)
+            # hitting L1 on x_input across this group's routes.
+            blk = unit // group_live_routes
+            r_idx = unit - blk * group_live_routes
+            route = ld_shared_i32_relaxed(routes_smem + r_idx * Int32(4))
+            packed_exp = ld_shared_i32_relaxed(route_exp_smem + r_idx * Int32(4))
+            expert = packed_exp & Int32(0xFFFF)
+            token = route // Int32(self.top_k)
+            col0 = blk * Int32(128) + elem
+            x_off = Int64(token) * Int64(self.hidden_size) + Int64(col0)
+            if cutlass.const_expr(self.driver.broadcast_suh):
+                s_off = Int64(col0)
+            else:
+                s_off = Int64(expert) * Int64(self.hidden_size) + Int64(col0)
+            out_off = Int64(route) * Int64(self.hidden_size) + Int64(col0)
+
+            xw0, xw1 = ld_global_nc_v2_u32(get_ptr_as_int64(x_input, x_off))
+            gw0, gw1 = ld_global_nc_v2_u32(get_ptr_as_int64(gate_suh, s_off))
+            uw0, uw1 = ld_global_nc_v2_u32(get_ptr_as_int64(up_suh, s_off))
+            if cutlass.const_expr(self.driver.rotation_input_dtype == "bf16"):
+                xh0 = cvt_bf16x2_to_f16x2_via_f32(xw0)
+                xh1 = cvt_bf16x2_to_f16x2_via_f32(xw1)
+                x0, x1 = f16x2_to_f32x2(xh0)
+                x2, x3 = f16x2_to_f32x2(xh1)
+            else:
+                x0, x1 = f16x2_to_f32x2(xw0)
+                x2, x3 = f16x2_to_f32x2(xw1)
+
+            gs0, gs1 = f16x2_to_f32x2(gw0)
+            gs2, gs3 = f16x2_to_f32x2(gw1)
+            gv0, gv1 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x0 * gs0, x1 * gs1))
+            gv2, gv3 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x2 * gs2, x3 * gs3))
+            gh0, gh1, gh2, gh3 = self.driver._had128_quad(gv0, gv1, gv2, gv3, lane)
+            st_global_v2_u32(
+                get_ptr_as_int64(a_gate, out_off),
+                pack_f32x2_to_f16x2(gh0, gh1),
+                pack_f32x2_to_f16x2(gh2, gh3),
+            )
+
+            us0, us1 = f16x2_to_f32x2(uw0)
+            us2, us3 = f16x2_to_f32x2(uw1)
+            uv0, uv1 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x0 * us0, x1 * us1))
+            uv2, uv3 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x2 * us2, x3 * us3))
+            uh0, uh1, uh2, uh3 = self.driver._had128_quad(uv0, uv1, uv2, uv3, lane)
+            st_global_v2_u32(
+                get_ptr_as_int64(a_up, out_off),
+                pack_f32x2_to_f16x2(uh0, uh1),
+                pack_f32x2_to_f16x2(uh2, uh3),
+            )
+            unit += gw_stride
+
+    @cute.jit
+    def _run_group_activation(
+        self,
+        fc1: cute.Tensor,
+        activated: cute.Tensor,
+        intermediate_rotations: cute.Tensor,
+        smem_base: Int32,
+        group_live_routes: Int32,
+        tid: Int32,
+        local_cta: Int32,
+        group_size: Int32,
+    ):
+        lane = tid & Int32(31)
+        warp_in_cta = tid >> Int32(5)
+        warps_per_cta = Int32(self.cta_threads // 32)
+        nblk = Int32(self.intermediate_size // 128)
+        fc1_cols = Int64(self.driver.fc1_cols)
+        isz = Int64(self.intermediate_size)
+        rot_row = Int64(3 * self.intermediate_size)
+        routes_smem = smem_base + Int32(self.group_routes_off)
+        route_exp_smem = smem_base + Int32(self.group_route_exp_off)
+        gwarp = local_cta * warps_per_cta + warp_in_cta
+        gw_stride = group_size * warps_per_cta
+        total_units = group_live_routes * nblk
+        elem = lane * Int32(4)
+        unit = gwarp
+        while unit < total_units:
+            r_idx = unit // nblk
+            blk = unit - r_idx * nblk
+            packed_exp = ld_shared_i32_relaxed(route_exp_smem + r_idx * Int32(4))
+            expert = packed_exp & Int32(0xFFFF)
+            wu = packed_exp >> Int32(16)
+            if blk < wu:
+                row = ld_shared_i32_relaxed(routes_smem + r_idx * Int32(4))
+                col0 = blk * Int32(128) + elem
+                g_off = Int64(row) * fc1_cols + Int64(col0)
+                u_off = g_off + isz
+                s_off = Int64(expert) * rot_row + Int64(col0)
+
+                gp01, gp23 = ld_global_v2_u32(get_ptr_as_int64(fc1, g_off))
+                up01, up23 = ld_global_v2_u32(get_ptr_as_int64(fc1, u_off))
+                svg01, svg23 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(intermediate_rotations, s_off)
+                )
+                svu01, svu23 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(intermediate_rotations, s_off + isz)
+                )
+                sd01, sd23 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(intermediate_rotations, s_off + isz + isz)
+                )
+
+                g0, g1 = f16x2_to_f32x2(gp01)
+                g2, g3 = f16x2_to_f32x2(gp23)
+                u0, u1 = f16x2_to_f32x2(up01)
+                u2, u3 = f16x2_to_f32x2(up23)
+                gh0, gh1, gh2, gh3 = self.driver._had128_quad(g0, g1, g2, g3, lane)
+                uh0, uh1, uh2, uh3 = self.driver._had128_quad(u0, u1, u2, u3, lane)
+
+                svg0, svg1 = f16x2_to_f32x2(svg01)
+                svg2, svg3 = f16x2_to_f32x2(svg23)
+                svu0, svu1 = f16x2_to_f32x2(svu01)
+                svu2, svu3 = f16x2_to_f32x2(svu23)
+                sd0, sd1 = f16x2_to_f32x2(sd01)
+                sd2, sd3 = f16x2_to_f32x2(sd23)
+
+                ig0 = gh0 * svg0
+                ig1 = gh1 * svg1
+                ig2 = gh2 * svg2
+                ig3 = gh3 * svg3
+                iu0 = uh0 * svu0
+                iu1 = uh1 * svu1
+                iu2 = uh2 * svu2
+                iu3 = uh3 * svu3
+                ig0, iu0 = self.driver._clamp_swiglu_inputs(ig0, iu0)
+                ig1, iu1 = self.driver._clamp_swiglu_inputs(ig1, iu1)
+                ig2, iu2 = self.driver._clamp_swiglu_inputs(ig2, iu2)
+                ig3, iu3 = self.driver._clamp_swiglu_inputs(ig3, iu3)
+
+                if cutlass.const_expr(self.driver.activation_is_situ):
+                    beta = cutlass.Float32(SITU_DEFAULT_BETA)
+                    linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+                    a0 = (
+                        beta
+                        * cute.math.tanh(ig0 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig0)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu0 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd0
+                    )
+                    a1 = (
+                        beta
+                        * cute.math.tanh(ig1 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig1)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu1 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd1
+                    )
+                    a2 = (
+                        beta
+                        * cute.math.tanh(ig2 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig2)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu2 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd2
+                    )
+                    a3 = (
+                        beta
+                        * cute.math.tanh(ig3 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig3)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu3 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd3
+                    )
+                else:
+                    a0 = self.driver._gated_silu(ig0) * iu0 * sd0
+                    a1 = self.driver._gated_silu(ig1) * iu1 * sd1
+                    a2 = self.driver._gated_silu(ig2) * iu2 * sd2
+                    a3 = self.driver._gated_silu(ig3) * iu3 * sd3
+
+                o0, o1, o2, o3 = self.driver._had128_quad(a0, a1, a2, a3, lane)
+                out_off = Int64(row) * isz + Int64(col0)
+                st_global_v2_u32(
+                    get_ptr_as_int64(activated, out_off),
+                    pack_f32x2_to_f16x2(o0, o1),
+                    pack_f32x2_to_f16x2(o2, o3),
+                )
+            unit += gw_stride
+
+    @cute.kernel
+    def kernel(
+        self,
+        rotation_input: cute.Tensor,
+        rotation_gate: cute.Tensor,
+        rotation_up: cute.Tensor,
+        t0_w13: cute.Tensor,
+        t0_w2: cute.Tensor,
+        t0_w13_scales: cute.Tensor,
+        t0_w2_scales: cute.Tensor,
+        t0_w13_global: cute.Tensor,
+        t0_w2_global: cute.Tensor,
+        t1_w13: cute.Tensor,
+        t1_w2: cute.Tensor,
+        t1_w13_scales: cute.Tensor,
+        t1_w2_scales: cute.Tensor,
+        t1_w13_global: cute.Tensor,
+        t1_w2_global: cute.Tensor,
+        fc1: cute.Tensor,
+        activated: cute.Tensor,
+        fc2: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        global_to_combined: cute.Tensor,
+        topk_weights: cute.Tensor,
+        fc1_scratch: cute.Tensor,
+        fc2_scratch: cute.Tensor,
+        workspace: cute.Tensor,
+        intermediate_rotations: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        trellis_lut: cute.Tensor,
+        tier0_num_experts: cutlass.Int32,
+        tier1_num_experts: cutlass.Int32,
+        tier0_fc2_experts: cutlass.Int32,
+        tier1_fc2_experts: cutlass.Int32,
+        tier0_gate_experts: cutlass.Int32,
+        tier1_gate_experts: cutlass.Int32,
+        tier0_up_experts: cutlass.Int32,
+        tier1_up_experts: cutlass.Int32,
+        route_num_experts: cutlass.Int32,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_x_raw, _, _ = cute.arch.grid_dim()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        grid_x = Int32(grid_x_raw)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words], 1024
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        trellis_lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
+        total_experts = tier0_num_experts + tier1_num_experts
+
+        # Phase 0: deterministic balanced expert-to-group assignment (zero global sync).
+        self._build_group_plan(
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            descriptor_map,
+            total_experts,
+            smem_base,
+            tid,
+            cta,
+            grid_x,
+            active_m,
+        )
+
+        hdr_smem = smem_base + Int32(self.group_hdr_off)
+        num_groups = ld_shared_i32_relaxed(hdr_smem + Int32(0))
+        gb_count = ld_shared_i32_relaxed(hdr_smem + Int32(4))
+        lr_count = ld_shared_i32_relaxed(hdr_smem + Int32(8))
+        fc1_total_tasks = ld_shared_i32_relaxed(hdr_smem + Int32(12))
+        group_size = ld_shared_i32_relaxed(hdr_smem + Int32(20))
+        local_cta = ld_shared_i32_relaxed(hdr_smem + Int32(24))
+        b_count_off = ld_shared_i32_relaxed(hdr_smem + Int32(28))
+        b_sense_off = ld_shared_i32_relaxed(hdr_smem + Int32(32))
+
+        # Phase 1: Input rotation (group-local live routes when G > 1, whole-grid when G == 1).
+        if num_groups > Int32(1):
+            self._run_group_input_rotation(
+                rotation_input,
+                rotation_gate,
+                rotation_up,
+                gate_suh,
+                up_suh,
+                smem_base,
+                lr_count,
+                tid,
+                local_cta,
+                group_size,
+            )
+        else:
+            self.driver._run_input_rotation(
+                rotation_input,
+                rotation_gate,
+                rotation_up,
+                gate_suh,
+                up_suh,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                descriptor_map,
+                total_experts,
+                total_experts,
+                tid,
+                cta,
+                grid_x,
+                active_m,
+            )
+        self._group_barrier(workspace, tid, group_size, b_count_off, b_sense_off)
+
+        fc1_emit = partial(
+            self._emit_tier_tile,
+            True,
+            rotation_gate,
+            rotation_up,
+            t0_w13,
+            t0_w13_scales,
+            t0_w13_global,
+            t1_w13,
+            t1_w13_scales,
+            t1_w13_global,
+            fc1,
+            packed_route_indices,
+            block_expert_ids,
+            descriptor_map,
+            topk_weights,
+            fc1_scratch,
+            workspace,
+            trellis_lut_addr,
+            smem_base,
+            tid,
+            active_m,
+            tier0_num_experts,
+            tier1_num_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
+        )
+        fc2_emit = partial(
+            self._emit_tier_tile,
+            False,
+            activated,
+            activated,
+            t0_w2,
+            t0_w2_scales,
+            t0_w2_global,
+            t1_w2,
+            t1_w2_scales,
+            t1_w2_global,
+            fc2,
+            packed_route_indices,
+            block_expert_ids,
+            descriptor_map,
+            topk_weights,
+            fc2_scratch,
+            workspace,
+            trellis_lut_addr,
+            smem_base,
+            tid,
+            active_m * Int32(self.top_k),
+            tier0_num_experts,
+            tier1_num_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
+        )
+
+        # Phase 2: Unified whole-tile FC1 loop (single GEMM instantiation).
+        blocks_smem = smem_base + Int32(self.group_blocks_off)
+        fc1_n_tiles = Int32(self.driver.fc1.n_tiles)
+        fc1_half_tiles = Int32(self.driver.fc1.n_tiles // 2)
+        fc1_k_tiles = Int32(self.driver.fc1.k_tiles)
+        task = local_cta
+        while task < fc1_total_tasks:
+            route_block_idx = Int32(0)
+            output_n_tile = Int32(0)
+            if num_groups > Int32(1):
+                if cutlass.const_expr(self.compact_fc1_pack):
+                    fc1_pref_smem = smem_base + Int32(self.group_fc1_pref_off)
+                    half_smem = smem_base + Int32(self.group_half_off)
+                    lo = Int32(0)
+                    hi = gb_count
+                    while lo + Int32(1) < hi:
+                        mid = (lo + hi) >> Int32(1)
+                        if (
+                            ld_shared_i32_relaxed(fc1_pref_smem + mid * Int32(4))
+                            <= task
+                        ):
+                            lo = mid
+                        else:
+                            hi = mid
+                    route_block_idx = ld_shared_i32_relaxed(
+                        blocks_smem + lo * Int32(4)
+                    )
+                    rem = task - ld_shared_i32_relaxed(fc1_pref_smem + lo * Int32(4))
+                    half = ld_shared_i32_relaxed(half_smem + lo * Int32(4))
+                    if rem < half:
+                        output_n_tile = rem
+                    else:
+                        output_n_tile = fc1_half_tiles + (rem - half)
+                else:
+                    lb = task // fc1_n_tiles
+                    route_block_idx = ld_shared_i32_relaxed(
+                        blocks_smem + lb * Int32(4)
+                    )
+                    output_n_tile = task - lb * fc1_n_tiles
+            else:
+                route_block_idx = task // fc1_n_tiles
+                output_n_tile = task - route_block_idx * fc1_n_tiles
+            fc1_emit(
+                route_block_idx,
+                output_n_tile,
+                Int32(0),
+                fc1_k_tiles,
+                Int32(1),
+                Int32(0),
+                Int32(0),
+            )
+            task += group_size
+        self._group_barrier(workspace, tid, group_size, b_count_off, b_sense_off)
+
+        # Phase 3: Activation (group-local live routes when G > 1, whole-grid when G == 1).
+        if num_groups > Int32(1):
+            self._run_group_activation(
+                fc1,
+                activated,
+                intermediate_rotations,
+                smem_base,
+                lr_count,
+                tid,
+                local_cta,
+                group_size,
+            )
+        else:
+            self.driver._run_activation_compact(
+                fc1,
+                activated,
+                intermediate_rotations,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                descriptor_map,
+                total_experts,
+                total_experts,
+                tid,
+                cta,
+                grid_x,
+                active_m,
+            )
+        self._group_barrier(workspace, tid, group_size, b_count_off, b_sense_off)
+
+        # Phase 4: Unified whole-tile FC2 loop (single GEMM instantiation).
+        fc2_n_tiles = Int32(self.driver.fc2.n_tiles)
+        fc2_k_tiles = Int32(self.driver.fc2.k_tiles)
+        fc2_total_tasks = gb_count * fc2_n_tiles
+        task = local_cta
+        while task < fc2_total_tasks:
+            lb = task // fc2_n_tiles
+            output_n_tile = task - lb * fc2_n_tiles
+            route_block_idx = lb
+            if num_groups > Int32(1):
+                route_block_idx = ld_shared_i32_relaxed(blocks_smem + lb * Int32(4))
+            fc2_emit(
+                route_block_idx,
+                output_n_tile,
+                Int32(0),
+                fc2_k_tiles,
+                Int32(1),
+                Int32(0),
+                Int32(0),
+            )
+            task += group_size
+
+
 class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
     """One cooperative grid over three native Trellis bitrates.
 
@@ -2704,6 +3715,51 @@ def compile_mixed_trellis(
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 descriptor_bits=descriptor_bits,
             )
+        use_groupwise = (
+            4 in (tier0_bits, tier1_bits)
+            and trellis_codebook == "mcg"
+            and int(size_m) <= 80
+            and int(moe_block_size) == 8
+            and not grouped_m8_fc2
+            and not direct_topk_routes
+            and not token_major_rotation
+            and not fused_input_rotation
+            and paired_boundary is None
+            and activations == "a16"
+            and input_format == "bf16"
+            and not row_addresses
+            and rotation_input_dtype in ("bf16", "fp16")
+            and str(activation).strip().lower() in ("silu", "silu_post_clamp", "situ")
+            and (
+                schedule is None
+                or (
+                    not schedule.fc1_prefetch_k_tiles
+                    and not schedule.fc2_prefetch_k_tiles
+                    and not schedule.phase_prefetch
+                )
+            )
+            and not _w4a16_small_m_splitk_enabled()
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 1)
+        )
+        if use_groupwise:
+            candidate = W4A16MixedTrellisGroupwiseKernel(
+                driver=make_kernel(total_experts, tier0_bits, **common),
+                tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
+                tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+                descriptor_bits=descriptor_bits,
+                compact_weights=compact_weights,
+            )
+            min_ctas = int(force_blocks_per_sm) if force_blocks_per_sm is not None else 1
+            if (
+                candidate.shared_words * 4 <= int(max_shared_mem)
+                and (
+                    force_blocks_per_sm is None
+                    or min_ctas * (candidate.shared_words * 4 + 1024)
+                    <= int(max_shared_mem)
+                )
+            ):
+                return candidate
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
