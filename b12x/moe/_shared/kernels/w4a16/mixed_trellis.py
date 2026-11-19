@@ -21,17 +21,20 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.compiler import OptLevel
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Int32, Int64, T, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
     get_ptr_as_int64,
     half2_to_float2_scaled,
+    ld_global_acquire_i32,
     ld_global_nc_v2_u32,
     pack_f32x2_to_f16x2,
     shared_ptr_to_u32,
+    st_global_release_i32,
     st_global_v2_u32,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
@@ -259,12 +262,23 @@ class MixedTrellisTier(Protocol):
     w2_global_scale: torch.Tensor
 
 
+@dsl_user_op
+def _group_arrive(addr: Int64, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(
+        T.i32(), [addr.ir_value(loc=loc, ip=ip)],
+        "atom.acq_rel.gpu.global.add.u32 $0, [$1], 1;", "=r,l",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    ))
+
+
 class W4A16MixedTrellisKernel:
     """One cooperative grid over two native Trellis bitrates."""
 
     # Persistent compile keys do not include launch source text. Change this
     # version whenever the compiled argument or tensor-layout contract changes.
     ABI_VERSION = 21
+    group_decode = False
     _token_major_rotation = False
     compact_weights = False
     COMPACT_DESCRIPTOR_ROWS = 7
@@ -401,7 +415,11 @@ class W4A16MixedTrellisKernel:
             self.shared_words,
             self.paired_boundary,
             self.token_major_rotation,
-        ) + (() if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)) + (("compact_weights_v2",) if self.compact_weights else ())
+        ) + (
+            () if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)
+        ) + (("compact_weights_v2",) if self.compact_weights else ()) + (
+            ("group_decode_v1",) if self.group_decode else ()
+        )
 
     @cute.jit
     def _dispatch_tier_gemm(
@@ -984,7 +1002,7 @@ class W4A16MixedTrellisKernel:
                 (cutlass.Int64(_SQG_XOR_CHEB_T12_LUT_ENTRIES),), stride=(1,)
             ),
         )
-        self.kernel(
+        operands = (
             rotation_input,
             rotation_gate,
             rotation_up,
@@ -1027,12 +1045,22 @@ class W4A16MixedTrellisKernel:
             tier1_up_experts,
             route_num_experts,
             active_m,
-        ).launch(
-            grid=(grid_x, 1, 1),
-            block=[self.cta_threads, 1, 1],
-            min_blocks_per_mp=self.blocks_per_sm,
-            cooperative=True,
-            stream=stream,
+        )
+        if cutlass.const_expr(self.group_decode):
+            if active_m <= Int32(8):
+                self._launch_core(operands, grid_x, stream, True)
+            else:
+                self._launch_core(operands, grid_x, stream, False)
+        else:
+            self._launch_core(operands, grid_x, stream, False)
+
+    def _launch_core(self, operands, grid_x, stream, grouped):
+        # Separate device entries keep group control and registers out of the
+        # wide tile loop. Only one core is launched on either host branch.
+        entry = self.group_kernel(operands) if grouped else self.kernel(*operands)
+        entry.launch(
+            grid=(grid_x, 1, 1), block=[self.cta_threads, 1, 1],
+            min_blocks_per_mp=self.blocks_per_sm, cooperative=True, stream=stream,
         )
 
     @property
@@ -1260,6 +1288,124 @@ class W4A16MixedTrellisKernel:
                                 )
                     blk += Int32(1)
             unit += unit_stride
+
+    @cute.jit
+    def _group_boundary(self, candidate: Int32, blocks: Int32, experts: cute.Tensor):
+        # The packed list is sorted by expert. Normally there is exactly one
+        # M8 block per expert at <=8 tokens. Keep an overfull expert together
+        # even if the caller routes one token to the same expert twice.
+        boundary = candidate
+        if candidate > Int32(0) and candidate < blocks:
+            previous = experts[candidate - Int32(1)]
+            scan = Int32(1)
+            while scan != Int32(0) and boundary < blocks:
+                if experts[boundary] == previous:
+                    boundary += Int32(1)
+                else:
+                    scan = Int32(0)
+        return boundary
+
+    @cute.jit
+    def _group_barrier(self, workspace, group, phase: cutlass.Constexpr, tid, peers):
+        cute.arch.sync_threads()
+        if tid == Int32(0):
+            # Whole-K tiles never use split-K lock slots. Three distinct words
+            # per group avoid ABA; every last arrival restores zero for replay.
+            addr = get_ptr_as_int64(workspace, group * Int32(4) + Int32(phase))
+            if _group_arrive(addr) == peers - Int32(1):
+                st_global_release_i32(addr, Int32(0))
+            else:
+                pending = ld_global_acquire_i32(addr)
+                while pending != Int32(0):
+                    pending = ld_global_acquire_i32(addr)
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _group_gemm(self, emit: cutlass.Constexpr, gemm, first, stop, rank, peers):
+        tiles_n = Int32(gemm.n_tiles)
+        tile = first * tiles_n + rank
+        while tile < stop * tiles_n:
+            emit(tile // tiles_n, tile % tiles_n, Int32(0), Int32(gemm.k_tiles),
+                 Int32(1), Int32(0), Int32(0))
+            tile += peers
+
+    @cute.kernel
+    def group_kernel(self, operands: tuple):
+        (
+            rotation_input, rotation_gate, rotation_up, t0_w13, t0_w2,
+            t0_s13, t0_s2, t0_g13, t0_g2, t1_w13, t1_w2, t1_s13, t1_s2,
+            t1_g13, t1_g2, fc1, activated, fc2, packed_routes, _, experts,
+            packed_count, descriptor_map, _, weights, fc1_scratch, fc2_scratch,
+            workspace, intermediate_rotations, gate_suh, up_suh, lut, t0_count,
+            t1_count, t0_down, t1_down, t0_gate, t1_gate, t0_up, t1_up, _, active_m,
+        ) = operands
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        grid_x, _, _ = cute.arch.grid_dim()
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words], 1024
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        lut_addr = get_ptr_as_int64(lut, Int32(0))
+        total_experts = t0_count + t1_count
+        fc1_emit = partial(
+            self._emit_tier_tile, True, rotation_gate, rotation_up,
+            t0_w13, t0_s13, t0_g13, t1_w13, t1_s13, t1_g13, fc1,
+            packed_routes, experts, descriptor_map, weights, fc1_scratch, workspace,
+            lut_addr, smem_base, tid, active_m, t0_count, t1_count, t0_down,
+            t1_down, t0_gate, t1_gate, t0_up, t1_up,
+        )
+        fc2_emit = partial(
+            self._emit_tier_tile, False, activated, activated,
+            t0_w2, t0_s2, t0_g2, t1_w2, t1_s2, t1_g2, fc2,
+            packed_routes, experts, descriptor_map, weights, fc2_scratch, workspace,
+            lut_addr, smem_base, tid, active_m * Int32(self.top_k), t0_count,
+            t1_count, t0_down, t1_down, t0_gate, t1_gate, t0_up, t1_up,
+        )
+        blocks = packed_count[Int32(0)] // Int32(self.driver.moe_block_size)
+        # Choose power-of-two groups with at least six CTAs each when split.
+        # The launcher sizes grid_x from the runtime device, not the AOT cap.
+        shift = Int32(0)
+        if blocks >= Int32(8) and grid_x >= Int32(8 * 6):
+            shift = Int32(3)
+        elif blocks >= Int32(4) and grid_x >= Int32(4 * 6):
+            shift = Int32(2)
+        elif blocks >= Int32(2) and grid_x >= Int32(2 * 6):
+            shift = Int32(1)
+        groups = Int32(1) << shift
+        group = cta & (groups - Int32(1))
+        rank = cta >> shift
+        peers = (grid_x + groups - Int32(1) - group) >> shift
+        first = self._group_boundary((blocks * group) >> shift, blocks, experts)
+        stop = self._group_boundary((blocks * (group + Int32(1))) >> shift, blocks, experts)
+        if first < stop:
+            block_m = Int32(self.driver.moe_block_size)
+            slots = (stop - first) * block_m
+            routes = cute.make_tensor(packed_routes.iterator + first * block_m,
+                                      cute.make_layout((slots,)))
+            ids = cute.make_tensor(experts.iterator + first, cute.make_layout((stop - first,)))
+            count = cute.make_rmem_tensor((1,), Int32)
+            count[0] = slots
+            self.driver._run_input_rotation(
+                rotation_input, rotation_gate, rotation_up, gate_suh, up_suh, routes,
+                ids, count, descriptor_map, total_experts, total_experts,
+                tid, rank, peers, active_m,
+            )
+            self._group_barrier(workspace, group, 0, tid, peers)
+            self._group_gemm(fc1_emit, self.driver.fc1, first, stop, rank, peers)
+            self._group_barrier(workspace, group, 1, tid, peers)
+            self.driver._run_activation_compact(
+                fc1, activated, intermediate_rotations, routes, ids, count,
+                descriptor_map, total_experts, total_experts, tid, rank, peers, active_m,
+            )
+            self._group_barrier(workspace, group, 2, tid, peers)
+            self._group_gemm(fc2_emit, self.driver.fc2, first, stop, rank, peers)
 
     @cute.kernel
     def kernel(
@@ -2725,6 +2871,23 @@ def compile_mixed_trellis(
             max_shared_mem=max_shared_mem,
         )
         _apply_mixed_residency(kernel, force_blocks_per_sm, max_shared_mem)
+    # Limit the experiment to the three packed M8 Spark decode geometries.
+    # Prefetch schedules and every larger-capacity export retain their own path.
+    if (
+        not warp_specialized and int(size_m) in (1, 16, 80) and int(top_k) == 8
+        and (hidden_size, intermediate_size, route_num_experts, bits, compact_weights) in (
+            (4608, 384, 384, (4, 5), True), (4096, 384, 352, (4, 6), True),
+            (6144, 256, 256, (4, 5), False),
+        )
+        and int(moe_block_size) == 8 and kernel.blocks_per_sm == 1
+        and kernel.driver.fc1.schedule_whole_tiles and kernel.driver.fc2.schedule_whole_tiles
+        and trellis_codebook == "mcg" and rotation_input_dtype == "bf16"
+        and not direct_topk_routes and not fused_input_rotation and not token_major_rotation
+        and paired_boundary is None and schedule is None and kernel.driver.activation_is_gated
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 1)
+    ):
+        kernel.group_decode = True
     # shared_words is the complete dynamically allocated MemRange used by the
     # cooperative kernel. CUDA permits a launch exactly at the device's
     # opt-in shared-memory limit; rejecting an additional 512 bytes here
