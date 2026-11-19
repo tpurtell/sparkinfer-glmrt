@@ -18,7 +18,8 @@ from unittest.mock import patch
 
 def snapshot_prefill_sources(root: Path) -> tuple[str, int]:
     """Freeze runner and compiler-input provenance before loading CUDA modules."""
-    paths = [root / "benchmarks/benchmark_mixed_trellis.py", *(root / "b12x").rglob("*.py")]
+    paths = [root / "benchmarks/benchmark_mixed_trellis.py",
+             root / "benchmarks/spark_expert_replay.py", *(root / "b12x").rglob("*.py")]
     entries = sorted(
         f"{path.relative_to(root).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
         for path in paths
@@ -567,17 +568,21 @@ def _make_kimi_replay_weights(torch, seed):
     return ptr, scalar
 
 
-class _KimiReplayVariant:
-    def __init__(self, torch, directory, capacity, weights):
+class _AotReplayVariant:
+    def __init__(self, torch, directory, capacity, weights, geometry=None, io=None):
         self.torch = torch
         self.capacity = capacity
         meta = json.loads((directory / 'v41_exl3.json').read_text())
         self.meta = meta
+        if geometry is None:
+            geometry = KIMI_HIDDEN, KIMI_INTERMEDIATE, KIMI_EXPERTS, KIMI_TOPK, [2, 3]
+            check(meta['activation'] == 'situ' and meta.get('route_block', 8) == 8
+                  and not meta.get('warp_specialized'), f'unexpected decode recipe: {directory}')
+        hidden, intermediate, experts, self.top_k, bits = geometry
         check((meta['compute'], meta['hidden'], meta['intermediate'], meta['experts'], meta['top_k'],
-               meta['capacity'], meta['bits'], meta['activation'], meta['output_dtype'],
-               meta['requires_route_preparation'], meta.get('route_block', 8)) ==
-              ([12, 1], KIMI_HIDDEN, KIMI_INTERMEDIATE, KIMI_EXPERTS, KIMI_TOPK, capacity, [2, 3], 'situ', 'bf16', True, 8)
-              and not meta.get('warp_specialized'), f'unexpected decode recipe: {directory}')
+               meta['bits'], meta['capacity'], meta['output_dtype'], meta['requires_route_preparation']) ==
+              ([12, 1], hidden, intermediate, experts, self.top_k, bits, capacity, 'bf16', True),
+              f'unexpected AOT recipe: {directory}')
         check([o['label'] for o in meta['objects']] == ['v41_exl3_core', 'v41_exl3_sum'],
               f'unexpected launch sequence: {directory}')
         self.buffers = buffers = {}
@@ -595,16 +600,18 @@ class _KimiReplayVariant:
         raw = (directory / meta['trellis_lut']['file']).read_bytes()
         check(hashlib.sha256(raw).hexdigest() == meta['trellis_lut']['sha256'], 'trellis LUT checksum mismatch')
         lut = torch.frombuffer(bytearray(raw), dtype=torch.float16).to('cuda')
-        self.x = torch.empty((capacity, KIMI_HIDDEN), dtype=torch.bfloat16, device='cuda')
-        self.ids = torch.empty((capacity, KIMI_TOPK), dtype=torch.int32, device='cuda')
-        self.gates = torch.empty((capacity, KIMI_TOPK), dtype=torch.float32, device='cuda')
+        self.x = torch.empty((capacity, hidden), dtype=torch.bfloat16, device='cuda')
+        self.ids = torch.empty((capacity, self.top_k), dtype=torch.int32, device='cuda')
+        self.gates = torch.empty((capacity, self.top_k), dtype=torch.float32, device='cuda')
         weight_ptr, scalar = weights
         self.ptr = dict(buffers, **weight_ptr, rotation_input_ptr=self.x, raw_topk_ids=self.ids,
                         route_expert_ids_ptr=self.ids, topk_weights_ptr=self.gates, trellis_lut_ptr=lut,
                         fc2_ptr=buffers['fc2'], output_ptr=buffers['output'])
         # Match the daemon's requested grid; the bridge queries device attributes
         # at create time and clamps to the runtime device before any capture.
-        self.scalar = dict(scalar, grid_x=meta['sms'] * meta['blocks_per_sm'])
+        self.scalar = dict(scalar, grid_x=torch.cuda.get_device_properties('cuda').multi_processor_count
+                           * meta['blocks_per_sm'])
+        self.io = io(self, hidden, experts) if io else None
         self.lib = c.CDLL(str(directory / 'libcuteafd_exl3.so'))
         route = directory / meta['route_preparation']['manifest']
         check(hashlib.sha256(route.read_bytes()).hexdigest() == meta['route_preparation']['sha256'],
@@ -623,17 +630,22 @@ class _KimiReplayVariant:
             'packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts')]
 
     def load(self, tensors, rows):
-        self.x[:rows].copy_(tensors[0][:rows])
+        (self.io.input if self.io else self.x)[:rows].copy_(tensors[0][:rows])
         self.ids[:rows].copy_(tensors[1][:rows])
         self.gates[:rows].copy_(tensors[2][:rows])
 
     def run(self, rows):
         stream = self.torch.cuda.current_stream().cuda_stream
+        if self.io:
+            self.io.decode(rows, stream)
         native_call(self.pack, self.route_ctx,
                     (c.c_void_p * 7)(*(x.data_ptr() for x in self.route_buffers)),
-                    (c.c_uint64 * 7)(rows * KIMI_TOPK * 4, *(x.nbytes for x in self.route_buffers[1:])),
+                    (c.c_uint64 * 7)(rows * self.top_k * 4, *(x.nbytes for x in self.route_buffers[1:])),
                     rows, stream)
         for fn, obj in zip(self.objects, self.meta['objects']):
+            if self.io and self.io.partial is not None and obj['label'] == 'v41_exl3_sum':
+                self.io.run_partial(rows, stream)
+                continue
             p = obj['pointer_slots']
             s = obj['scalar_slots']
             scalars = dict(self.scalar, active_m=rows)
@@ -650,13 +662,15 @@ class _KimiReplayVariant:
         return graph
 
     def output(self, rows):
-        return self.buffers['output'][:rows]
+        return (self.io.partial if self.io and self.io.partial is not None else self.buffers['output'])[:rows]
 
     def poison_output(self):
-        self.buffers['output'].fill_(float('nan'))
+        self.output(self.capacity).fill_(float('nan'))
 
     def close(self):
         self.torch.cuda.synchronize()
+        if self.io:
+            self.io.close()
         native_call(self.destroy_routes, self.route_ctx)
         self.destroy(self.ctx)
 
@@ -720,7 +734,7 @@ def _run_kimi_replay(args, device, waves):
     variants = {}
     try:
         for cap, p in paths.items():
-            variants[cap] = _KimiReplayVariant(torch, p, cap, weights)
+            variants[cap] = _AotReplayVariant(torch, p, cap, weights)
         for name, ids, distinct in waves:
             rows = len(ids)
             cap = next(cap for cap in buckets if rows <= cap)
@@ -2493,6 +2507,10 @@ def benchmark_parser():
         default=None,
         help="Comma-separated decode row counts for --kimi (default: 1,2,4,6,8,12,16,24,32,36)",
     )
+    parser.add_argument("--spark-replay", type=Path, help="planned Spark replay fixture JSON")
+    parser.add_argument("--aot-root", type=Path, help="sealed Spark rank packages root")
+    parser.add_argument("--replay-shape", action="append", help="replay fixture shape ID (repeatable)")
+    parser.add_argument("--profile-replay", action="store_true", help="capture one NVTX-marked sample per cell under Nsight Compute")
     parser.add_argument("--kimi-aot", type=Path, help="sealed EXL3 TP6 rank package containing m1/m80")
     parser.add_argument("--route-case", action="append", help="recorded Kimi wave ID (repeatable)")
     parser.add_argument(
@@ -2547,6 +2565,11 @@ def benchmark_parser():
 def main() -> None:
     parser = benchmark_parser()
     args = parser.parse_args()
+    if args.spark_replay:
+        from spark_expert_replay import replay_spark_shapes
+
+        replay_spark_shapes(args, _AotReplayVariant, PREFILL_SOURCE_SHA256)
+        return
     if args.kimi and (args.routes or args.kimi_aot or args.capacity is not None or args.route_case):
         if not args.routes or not args.kimi_aot or args.kimi_variant:
             parser.error("recorded Kimi decode needs --routes and --kimi-aot and uses sealed AOT only")
