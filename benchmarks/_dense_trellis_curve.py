@@ -114,7 +114,7 @@ class Registry:
             require_success(self.lib.cuteafd_dsv4_program_info(index, C.byref(info)), "program_info")
             self.programs[info.name.decode()] = (index, info.pointers, info.scalars, info.kinds)
 
-    def bind(self, name, operands, flags, stream):
+    def bind(self, name, operands, flags):
         index, pointers, scalars, kinds = self.programs[name]
         if pointers != len(operands) or scalars != len(flags) + 1 or kinds != b"i" * scalars:
             raise ValueError(f"{name}: incompatible native registry ABI")
@@ -122,22 +122,22 @@ class Registry:
         ptrs = (C.c_void_p * pointers)(*(t.data_ptr() for t in operands))
         args = (C.c_uint64 * scalars)(0, *flags)
 
-        def run(rows):
+        def run(rows, stream):
             args[0] = rows
             require_success(self.launch(index, ptrs, args, stream), name)
 
         return run
 
-    def glue(self, name, operands, count_multiplier, stream, sms=None):
+    def glue(self, name, operands, count_multiplier, sms=None):
         fn = getattr(self.lib, name)
         fn.argtypes = [C.c_void_p] * len(operands) + [C.c_int64] + (
             [C.c_int32] if sms is not None else []) + [C.c_void_p]
         args = [t.data_ptr() for t in operands]
-        tail = [stream] if sms is None else [sms, stream]
-        return lambda rows: require_success(fn(*args, rows * count_multiplier, *tail), name)
+        tail = () if sms is None else (sms,)
+        return lambda rows, stream: require_success(fn(*args, rows * count_multiplier, *tail, stream), name)
 
 
-def bind_reference(torch, registry, route, shape, x, capacity, stream):
+def bind_reference(torch, registry, route, shape, x, capacity):
     if "reason" in route:
         return None
     if shape.groups != 1:
@@ -160,10 +160,10 @@ def bind_reference(torch, registry, route, shape, x, capacity, stream):
         raise ValueError(f"{name}: must provide the selected runtime scalars in ABI order")
     weight = torch.randn((shape.n, shape.k), device=x.device, dtype=torch.bfloat16) * .1
     if abi == ["x", "w", "out"]:
-        bound = registry.bind(name, (x, weight, out), (), stream)
+        bound = registry.bind(name, (x, weight, out), ())
 
-        def run(rows, _storage=weight):
-            bound(rows)
+        def run(rows, stream, _storage=weight):
+            bound(rows, stream)
 
         return run, out, reference_capacity
     if abi != ["x", "weight", "scales", "out", "scratch"] or g.get("scale_block", 128) != 128:
@@ -173,10 +173,10 @@ def bind_reference(torch, registry, route, shape, x, capacity, stream):
     scales = torch.ones((shape.n // 128, shape.k // 128), device=x.device, dtype=torch.float32)
     scratch = torch.empty(p["scratch_bytes_at_capacity"]["scratch"], device=x.device, dtype=torch.uint8)
     # The closure owns the backing allocations through graph replay.
-    bound = registry.bind(name, (x, packed, scales, out, scratch), tuple(flags.values()), stream)
+    bound = registry.bind(name, (x, packed, scales, out, scratch), tuple(flags.values()))
 
-    def run(rows, _storage=(packed, scales, scratch)):
-        bound(rows)
+    def run(rows, stream, _storage=(packed, scales, scratch)):
+        bound(rows, stream)
 
     return run, out, reference_capacity
 
@@ -253,8 +253,12 @@ def _shape_curve(args, shape, registry, exported, sms):
     final = [torch.empty((cap, n), dtype=final_dtype, **cuda) for _ in range(groups)]
 
     def bind(lib, tensors, flags):
-        ptrs = [t.data_ptr() for t in tensors]
-        return lambda rows: require_success(lib.run(*ptrs, rows, *flags, stream), lib._name)
+        pointers = [t.data_ptr() for t in tensors]
+
+        def run(rows, active_stream):
+            require_success(lib.run(*pointers, rows, *flags, active_stream), lib._name)
+
+        return run
 
     stages = {"ingress": bind(ingress, [x, *suh, *rotation, *scales], (sms * 4,)),
               "trellis": bind(body, [ptrs, *weights, *scales, partial, *raw], (0, sms * 4))}
@@ -265,21 +269,21 @@ def _shape_curve(args, shape, registry, exported, sms):
         if shape.reduction == "bf16_partial":
             local = torch.empty_like(raw[0], dtype=torch.bfloat16)
             peer = torch.randn_like(local) * .1
-            stages["narrow"] = registry.glue("cuteafd_load_narrow_f32_bf16", (raw[0], local), n, stream, sms)
-            stages["partial_add"] = registry.glue("cuteafd_bf16_f32_add_async", (local, peer, summed), n, stream, sms)
+            stages["narrow"] = registry.glue("cuteafd_load_narrow_f32_bf16", (raw[0], local), n, sms)
+            stages["partial_add"] = registry.glue("cuteafd_bf16_f32_add_async", (local, peer, summed), n, sms)
         else:
             peer = torch.randn_like(raw[0]) * .1
-            stages["partial_add"] = registry.glue("cuteafd_cuda_residual_add_f32_async", (raw[0], peer, summed), n, stream)
+            stages["partial_add"] = registry.glue("cuteafd_cuda_residual_add_f32_async", (raw[0], peer, summed), n)
     stages["egress"] = bind(egress, [*egress_source, *svh, *final], (sms * 4,))
     base_body = bind(baseline, [ptrs, *weights, *scales, partial, *raw], (0, sms * 4)) if baseline else None
     references = {name: bound for name, route in shape.references.items()
-                  if (bound := bind_reference(torch, registry, route, shape, x, cap, stream)) is not None}
+                  if (bound := bind_reference(torch, registry, route, shape, x, cap)) is not None}
 
     def chain(rows, core):
         for target in (*raw, *final):
             target.fill_(float("nan"))
         for name, run in stages.items():
-            (core if name == "trellis" else run)(rows)
+            (core if name == "trellis" else run)(rows, stream)
         for target in (*raw, *final):
             if not torch.isfinite(target[:rows]).all().item() or not torch.isnan(target[rows:]).all().item():
                 raise RuntimeError(f"{shape.name} M={rows}: missing writes or write into inactive rows")
@@ -305,7 +309,7 @@ def _shape_curve(args, shape, registry, exported, sms):
         live_refs = {name: (run, out) for name, (run, out, limit) in references.items() if rows <= limit}
         for name, (run, out) in live_refs.items():
             out.fill_(float("nan"))
-            run(rows)
+            run(rows, stream)
             if not torch.isfinite(out[:rows]).all().item():
                 raise RuntimeError(f"{shape.name} M={rows}: {name} did not overwrite poison")
 
@@ -318,11 +322,18 @@ def _shape_curve(args, shape, registry, exported, sms):
             events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(len(calls) + 1)]
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
+                active_stream = torch.cuda.current_stream().cuda_stream
                 events[0].record()
                 for run, event in zip(calls.values(), events[1:]):
-                    run(rows)
+                    run(rows, active_stream)
                     event.record()
+            targets = (*raw, *final) if arm in ("candidate", "baseline") else (live_refs[arm][1],)
+            for target in targets:
+                target.fill_(float("nan"))
             graph.replay()
+            for target in targets:
+                if not torch.isfinite(target[:rows]).all().item():
+                    raise RuntimeError(f"{shape.name} M={rows}: {arm} graph did not overwrite poisoned output")
             graphs[arm] = (graph, events, calls)
         torch.cuda.synchronize()
         samples = {name: [] for calls in arms.values() for name in calls}
