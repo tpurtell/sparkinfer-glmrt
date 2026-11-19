@@ -1581,8 +1581,9 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
     At runtime ``active_m <= GROUP_MAX_M`` (m1..m8), partitions the launched
     cooperative grid into ``G`` contiguous CTA groups (chosen from runtime
     ``grid_x`` and the active expert runs). Active experts are deterministically
-    assigned to disjoint groups via 3-pass LPT load balancing weighted by each
-    expert's exact route-block count, compact live width, and bitrate sum.
+    assigned to disjoint groups via register-resident 3-pass LPT load balancing
+    (or O(1) strided assignment when expert weights are uniform), weighted by
+    each expert's exact route-block count, compact live width, and bitrate sum.
     Each group then runs rotation -> FC1 -> activation -> FC2 independently
     with group-local sense-reversing barriers placed in the unused whole-tile
     split-K lock prefix of ``workspace``. For ``active_m > GROUP_MAX_M``,
@@ -1595,7 +1596,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
     MAX_GROUPS_LIMIT = 8
     GROUP_HDR_BYTES = 64
     GROUP_ARRAY_BYTES = 512
-    GROUP_FC1_PREFIX_BYTES = 528
+    GROUP_BLOCKS_COMPACT_BYTES = 528
 
     def __init__(
         self,
@@ -1643,31 +1644,32 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             raise ValueError("group-wise barrier stride must hold at least (count, sense)")
 
         base_bytes = ((int(self.shared_words) * 4 + 15) // 16) * 16
-        if base_bytes < 4096:
+        if base_bytes < 8192:
             raise ValueError(f"unexpected small GEMM shared footprint: {base_bytes}")
 
         self.compact_fc1_pack = bool(
             self.compact_weights and self.driver.intermediate_size != self.driver.fc1.tile_n
         )
+        # Compact persistent group metadata (~1.06-1.08 KiB total):
+        # - hdr[16] (64 B)
+        # - blocks[128] (512 B) or packed (blk_id | half<<8 | fc1_pref<<16)[129] (528 B)
+        # - route_meta[128] (512 B): packed (expert | wu<<12 | route_id<<20)
         self.group_hdr_off = base_bytes
         self.group_blocks_off = self.group_hdr_off + self.GROUP_HDR_BYTES
-        self.group_routes_off = self.group_blocks_off + self.GROUP_ARRAY_BYTES
-        self.group_route_exp_off = self.group_routes_off + self.GROUP_ARRAY_BYTES
-        if self.compact_fc1_pack:
-            self.group_half_off = self.group_route_exp_off + self.GROUP_ARRAY_BYTES
-            self.group_fc1_pref_off = self.group_half_off + self.GROUP_ARRAY_BYTES
-            total_bytes = self.group_fc1_pref_off + self.GROUP_FC1_PREFIX_BYTES
-        else:
-            self.group_half_off = 0
-            self.group_fc1_pref_off = 0
-            total_bytes = self.group_route_exp_off + self.GROUP_ARRAY_BYTES
+        blocks_bytes = (
+            self.GROUP_BLOCKS_COMPACT_BYTES
+            if self.compact_fc1_pack
+            else self.GROUP_ARRAY_BYTES
+        )
+        self.group_route_meta_off = self.group_blocks_off + blocks_bytes
+        total_bytes = self.group_route_meta_off + self.GROUP_ARRAY_BYTES
         self.shared_words = total_bytes // 4
 
     @property
     def __cache_key__(self) -> tuple[object, ...]:
         return super().__cache_key__ + (
             (
-                "k4_groupwise_v1",
+                "k4_groupwise_v2",
                 self.max_groups,
                 self.group_barrier_stride,
                 self.compact_fc1_pack,
@@ -1723,10 +1725,9 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
     ):
         hdr_smem = smem_base + Int32(self.group_hdr_off)
         blocks_smem = smem_base + Int32(self.group_blocks_off)
-        routes_smem = smem_base + Int32(self.group_routes_off)
-        route_exp_smem = smem_base + Int32(self.group_route_exp_off)
+        route_meta_smem = smem_base + Int32(self.group_route_meta_off)
 
-        # Prologue scratch aliases the unused GEMM SMEM [0..3616).
+        # Prologue scratch aliases the unused GEMM SMEM [0..8192).
         tmp_blk_exp = smem_base + Int32(0)
         tmp_blk_w = smem_base + Int32(512)
         tmp_blk_wu = smem_base + Int32(1024)
@@ -1734,7 +1735,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         tmp_run_start = smem_base + Int32(2048)
         tmp_run_len = smem_base + Int32(2560)
         tmp_run_w = smem_base + Int32(3072)
-        tmp_gload = smem_base + Int32(3584)
+        tmp_slots = smem_base + Int32(4096)
 
         route_blocks = packed_route_count[Int32(0)].to(Int32) >> Int32(3)
         if route_blocks < Int32(0):
@@ -1927,119 +1928,130 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         group_size = base_ctas
                     local_cta = cta - group_start
 
-                    # 3-pass LPT greedy assignment: multi-block experts first,
-                    # heavy single-block experts (width-384/K5/K6) second,
-                    # remaining light experts last.
-                    gi = Int32(0)
-                    while gi < num_groups:
-                        st_shared_i32(tmp_gload + gi * Int32(4), Int32(0))
-                        gi += Int32(1)
-                    if cutlass.const_expr(self.compact_fc1_pack):
-                        st_shared_i32(
-                            smem_base + Int32(self.group_fc1_pref_off), Int32(0)
-                        )
-
                     gb_count = Int32(0)
                     fc1_acc = Int32(0)
-                    pass_idx = Int32(0)
-                    while pass_idx < Int32(3):
-                        r = Int32(0)
+                    if uniform_runs != Int32(0):
+                        # O(1) strided assignment when all runs have equal weight.
+                        r = my_group
                         while r < num_runs:
+                            rstart = ld_shared_i32_relaxed(
+                                tmp_run_start + r * Int32(4)
+                            )
                             rlen = ld_shared_i32_relaxed(tmp_run_len + r * Int32(4))
-                            rw = ld_shared_i32_relaxed(tmp_run_w + r * Int32(4))
-                            take = Int32(0)
-                            if pass_idx == Int32(0):
-                                if rlen > Int32(1):
-                                    take = Int32(1)
-                            elif pass_idx == Int32(1):
-                                if rlen == Int32(1) and rw > min_run_w:
-                                    take = Int32(1)
-                            else:
-                                if rlen == Int32(1) and rw <= min_run_w:
-                                    take = Int32(1)
-                            if take != Int32(0):
-                                best_g = Int32(0)
-                                best_load = ld_shared_i32_relaxed(tmp_gload)
-                                cand = Int32(1)
-                                while cand < num_groups:
-                                    cload = ld_shared_i32_relaxed(
-                                        tmp_gload + cand * Int32(4)
+                            rk = Int32(0)
+                            while rk < rlen:
+                                blk_id = rstart + rk
+                                if cutlass.const_expr(self.compact_fc1_pack):
+                                    ht_b = ld_shared_i32_relaxed(
+                                        tmp_blk_ht + blk_id * Int32(4)
                                     )
-                                    if cload < best_load:
-                                        best_load = cload
-                                        best_g = cand
-                                    cand += Int32(1)
-                                st_shared_i32(
-                                    tmp_gload + best_g * Int32(4), best_load + rw
+                                    packed_blk = (
+                                        blk_id
+                                        | (ht_b << Int32(8))
+                                        | (fc1_acc << Int32(16))
+                                    )
+                                    st_shared_i32(
+                                        blocks_smem + gb_count * Int32(4), packed_blk
+                                    )
+                                    fc1_acc += Int32(2) * ht_b
+                                else:
+                                    st_shared_i32(
+                                        blocks_smem + gb_count * Int32(4), blk_id
+                                    )
+                                gb_count += Int32(1)
+                                rk += Int32(1)
+                            r += num_groups
+                    else:
+                        # Heterogeneous runs always have num_groups in {2, 4}:
+                        # register-resident 3-pass LPT (multi-block first,
+                        # heavy width-384/K5/K6 second, remaining light last).
+                        g0 = Int32(0)
+                        g1 = Int32(0)
+                        g2 = Int32(0)
+                        g3 = Int32(0)
+                        pass_idx = Int32(0)
+                        while pass_idx < Int32(3):
+                            r = Int32(0)
+                            while r < num_runs:
+                                rlen = ld_shared_i32_relaxed(
+                                    tmp_run_len + r * Int32(4)
                                 )
-                                if best_g == my_group:
-                                    rstart = ld_shared_i32_relaxed(
-                                        tmp_run_start + r * Int32(4)
-                                    )
-                                    rk = Int32(0)
-                                    while rk < rlen:
-                                        blk_id = rstart + rk
-                                        st_shared_i32(
-                                            blocks_smem + gb_count * Int32(4), blk_id
+                                rw = ld_shared_i32_relaxed(tmp_run_w + r * Int32(4))
+                                take = Int32(0)
+                                if pass_idx == Int32(0):
+                                    if rlen > Int32(1):
+                                        take = Int32(1)
+                                elif pass_idx == Int32(1):
+                                    if rlen == Int32(1) and rw > min_run_w:
+                                        take = Int32(1)
+                                else:
+                                    if rlen == Int32(1) and rw <= min_run_w:
+                                        take = Int32(1)
+                                if take != Int32(0):
+                                    best_g = Int32(0)
+                                    best_load = g0
+                                    if g1 < best_load:
+                                        best_load = g1
+                                        best_g = Int32(1)
+                                    if num_groups > Int32(2):
+                                        if g2 < best_load:
+                                            best_load = g2
+                                            best_g = Int32(2)
+                                        if g3 < best_load:
+                                            best_load = g3
+                                            best_g = Int32(3)
+                                    if best_g == Int32(0):
+                                        g0 += rw
+                                    elif best_g == Int32(1):
+                                        g1 += rw
+                                    elif best_g == Int32(2):
+                                        g2 += rw
+                                    else:
+                                        g3 += rw
+                                    if best_g == my_group:
+                                        rstart = ld_shared_i32_relaxed(
+                                            tmp_run_start + r * Int32(4)
                                         )
-                                        if cutlass.const_expr(self.compact_fc1_pack):
-                                            ht_b = ld_shared_i32_relaxed(
-                                                tmp_blk_ht + blk_id * Int32(4)
-                                            )
-                                            st_shared_i32(
-                                                smem_base
-                                                + Int32(self.group_half_off)
-                                                + gb_count * Int32(4),
-                                                ht_b,
-                                            )
-                                            fc1_acc += Int32(2) * ht_b
-                                            st_shared_i32(
-                                                smem_base
-                                                + Int32(self.group_fc1_pref_off)
-                                                + (gb_count + Int32(1)) * Int32(4),
-                                                fc1_acc,
-                                            )
-                                        gb_count += Int32(1)
-                                        rk += Int32(1)
-                            r += Int32(1)
-                        pass_idx += Int32(1)
+                                        rk = Int32(0)
+                                        while rk < rlen:
+                                            blk_id = rstart + rk
+                                            if cutlass.const_expr(
+                                                self.compact_fc1_pack
+                                            ):
+                                                ht_b = ld_shared_i32_relaxed(
+                                                    tmp_blk_ht + blk_id * Int32(4)
+                                                )
+                                                packed_blk = (
+                                                    blk_id
+                                                    | (ht_b << Int32(8))
+                                                    | (fc1_acc << Int32(16))
+                                                )
+                                                st_shared_i32(
+                                                    blocks_smem + gb_count * Int32(4),
+                                                    packed_blk,
+                                                )
+                                                fc1_acc += Int32(2) * ht_b
+                                            else:
+                                                st_shared_i32(
+                                                    blocks_smem + gb_count * Int32(4),
+                                                    blk_id,
+                                                )
+                                            gb_count += Int32(1)
+                                            rk += Int32(1)
+                                r += Int32(1)
+                            pass_idx += Int32(1)
 
-                    # Compact live routes belonging to my_group (eliminating
-                    # the 7/8 block-alignment padding in rotation & activation).
-                    lr_count = Int32(0)
-                    lb = Int32(0)
-                    while lb < gb_count:
-                        blk_id = ld_shared_i32_relaxed(blocks_smem + lb * Int32(4))
-                        e_b = ld_shared_i32_relaxed(tmp_blk_exp + blk_id * Int32(4))
-                        wu_b = ld_shared_i32_relaxed(tmp_blk_wu + blk_id * Int32(4))
-                        if e_b >= Int32(0) and e_b < total_experts:
-                            packed_e = (wu_b << Int32(16)) | e_b
-                            base_slot = blk_id * Int32(8)
-                            for slot in cutlass.range_constexpr(8):
-                                r_id = packed_route_indices[
-                                    base_slot + Int32(slot)
-                                ].to(Int32)
-                                if (
-                                    r_id >= Int32(0)
-                                    and r_id < live_routes
-                                    and lr_count < Int32(self.MAX_GROUP_BLOCKS)
-                                ):
-                                    st_shared_i32(
-                                        routes_smem + lr_count * Int32(4), r_id
-                                    )
-                                    st_shared_i32(
-                                        route_exp_smem + lr_count * Int32(4), packed_e
-                                    )
-                                    lr_count += Int32(1)
-                        lb += Int32(1)
-
+                    if cutlass.const_expr(self.compact_fc1_pack):
+                        st_shared_i32(
+                            blocks_smem + gb_count * Int32(4), fc1_acc << Int32(16)
+                        )
                     fc1_tasks = gb_count * Int32(self.driver.fc1.n_tiles)
                     if cutlass.const_expr(self.compact_fc1_pack):
                         fc1_tasks = fc1_acc
                     b_count_off = my_group * Int32(self.group_barrier_stride)
                     st_shared_i32(hdr_smem + Int32(0), num_groups)
                     st_shared_i32(hdr_smem + Int32(4), gb_count)
-                    st_shared_i32(hdr_smem + Int32(8), lr_count)
+                    st_shared_i32(hdr_smem + Int32(8), Int32(0))
                     st_shared_i32(hdr_smem + Int32(12), fc1_tasks)
                     st_shared_i32(hdr_smem + Int32(16), my_group)
                     st_shared_i32(hdr_smem + Int32(20), group_size)
@@ -2047,6 +2059,62 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     st_shared_i32(hdr_smem + Int32(28), b_count_off)
                     st_shared_i32(hdr_smem + Int32(32), b_count_off + Int32(1))
             cute.arch.sync_threads()
+
+            # Parallel preload of this group's packed route slots into SMEM,
+            # then fast SMEM-only compaction (zero serial global loads on tid 0).
+            plan_groups = ld_shared_i32_relaxed(hdr_smem + Int32(0))
+            if plan_groups > Int32(1):
+                plan_blocks = ld_shared_i32_relaxed(hdr_smem + Int32(4))
+                total_slots = plan_blocks * Int32(8)
+                s_idx = tid
+                while s_idx < total_slots:
+                    lb_s = s_idx >> Int32(3)
+                    slot_s = s_idx & Int32(7)
+                    blk_s = ld_shared_i32_relaxed(
+                        blocks_smem + lb_s * Int32(4)
+                    ) & Int32(0xFF)
+                    r_id = packed_route_indices[blk_s * Int32(8) + slot_s].to(Int32)
+                    st_shared_i32(tmp_slots + s_idx * Int32(4), r_id)
+                    s_idx += Int32(self.cta_threads)
+                cute.arch.sync_threads()
+
+                if tid == Int32(0):
+                    lr_count = Int32(0)
+                    lb = Int32(0)
+                    while lb < plan_blocks:
+                        blk_id = ld_shared_i32_relaxed(
+                            blocks_smem + lb * Int32(4)
+                        ) & Int32(0xFF)
+                        e_b = ld_shared_i32_relaxed(tmp_blk_exp + blk_id * Int32(4))
+                        wu_b = ld_shared_i32_relaxed(tmp_blk_wu + blk_id * Int32(4))
+                        if (
+                            e_b >= Int32(0)
+                            and e_b < total_experts
+                            and e_b < Int32(4096)
+                        ):
+                            base_slot = lb * Int32(8)
+                            for slot in cutlass.range_constexpr(8):
+                                r_id = ld_shared_i32_relaxed(
+                                    tmp_slots + (base_slot + Int32(slot)) * Int32(4)
+                                )
+                                if (
+                                    r_id >= Int32(0)
+                                    and r_id < live_routes
+                                    and lr_count < Int32(self.MAX_GROUP_BLOCKS)
+                                ):
+                                    packed_meta = (
+                                        e_b
+                                        | (wu_b << Int32(12))
+                                        | (r_id << Int32(20))
+                                    )
+                                    st_shared_i32(
+                                        route_meta_smem + lr_count * Int32(4),
+                                        packed_meta,
+                                    )
+                                    lr_count += Int32(1)
+                        lb += Int32(1)
+                    st_shared_i32(hdr_smem + Int32(8), lr_count)
+                cute.arch.sync_threads()
 
     @cute.jit
     def _run_group_input_rotation(
@@ -2066,8 +2134,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         warp_in_cta = tid >> Int32(5)
         warps_per_cta = Int32(self.cta_threads // 32)
         nblk = Int32(self.hidden_size // 128)
-        routes_smem = smem_base + Int32(self.group_routes_off)
-        route_exp_smem = smem_base + Int32(self.group_route_exp_off)
+        route_meta_smem = smem_base + Int32(self.group_route_meta_off)
         gwarp = local_cta * warps_per_cta + warp_in_cta
         gw_stride = group_size * warps_per_cta
         total_units = group_live_routes * nblk
@@ -2078,9 +2145,9 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             # hitting L1 on x_input across this group's routes.
             blk = unit // group_live_routes
             r_idx = unit - blk * group_live_routes
-            route = ld_shared_i32_relaxed(routes_smem + r_idx * Int32(4))
-            packed_exp = ld_shared_i32_relaxed(route_exp_smem + r_idx * Int32(4))
-            expert = packed_exp & Int32(0xFFFF)
+            packed_meta = ld_shared_i32_relaxed(route_meta_smem + r_idx * Int32(4))
+            expert = packed_meta & Int32(0xFFF)
+            route = (packed_meta >> Int32(20)) & Int32(0xFF)
             token = route // Int32(self.top_k)
             col0 = blk * Int32(128) + elem
             x_off = Int64(token) * Int64(self.hidden_size) + Int64(col0)
@@ -2144,8 +2211,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         fc1_cols = Int64(self.driver.fc1_cols)
         isz = Int64(self.intermediate_size)
         rot_row = Int64(3 * self.intermediate_size)
-        routes_smem = smem_base + Int32(self.group_routes_off)
-        route_exp_smem = smem_base + Int32(self.group_route_exp_off)
+        route_meta_smem = smem_base + Int32(self.group_route_meta_off)
         gwarp = local_cta * warps_per_cta + warp_in_cta
         gw_stride = group_size * warps_per_cta
         total_units = group_live_routes * nblk
@@ -2154,11 +2220,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         while unit < total_units:
             r_idx = unit // nblk
             blk = unit - r_idx * nblk
-            packed_exp = ld_shared_i32_relaxed(route_exp_smem + r_idx * Int32(4))
-            expert = packed_exp & Int32(0xFFFF)
-            wu = packed_exp >> Int32(16)
+            packed_meta = ld_shared_i32_relaxed(route_meta_smem + r_idx * Int32(4))
+            expert = packed_meta & Int32(0xFFF)
+            wu = (packed_meta >> Int32(12)) & Int32(0xFF)
             if blk < wu:
-                row = ld_shared_i32_relaxed(routes_smem + r_idx * Int32(4))
+                row = (packed_meta >> Int32(20)) & Int32(0xFF)
                 col0 = blk * Int32(128) + elem
                 g_off = Int64(row) * fc1_cols + Int64(col0)
                 u_off = g_off + isz
@@ -2459,24 +2525,22 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             output_n_tile = Int32(0)
             if num_groups > Int32(1):
                 if cutlass.const_expr(self.compact_fc1_pack):
-                    fc1_pref_smem = smem_base + Int32(self.group_fc1_pref_off)
-                    half_smem = smem_base + Int32(self.group_half_off)
                     lo = Int32(0)
                     hi = gb_count
                     while lo + Int32(1) < hi:
                         mid = (lo + hi) >> Int32(1)
-                        if (
-                            ld_shared_i32_relaxed(fc1_pref_smem + mid * Int32(4))
-                            <= task
-                        ):
+                        mid_pref = (
+                            ld_shared_i32_relaxed(blocks_smem + mid * Int32(4))
+                            >> Int32(16)
+                        )
+                        if mid_pref <= task:
                             lo = mid
                         else:
                             hi = mid
-                    route_block_idx = ld_shared_i32_relaxed(
-                        blocks_smem + lo * Int32(4)
-                    )
-                    rem = task - ld_shared_i32_relaxed(fc1_pref_smem + lo * Int32(4))
-                    half = ld_shared_i32_relaxed(half_smem + lo * Int32(4))
+                    entry = ld_shared_i32_relaxed(blocks_smem + lo * Int32(4))
+                    route_block_idx = entry & Int32(0xFF)
+                    half = (entry >> Int32(8)) & Int32(0xFF)
+                    rem = task - (entry >> Int32(16))
                     if rem < half:
                         output_n_tile = rem
                     else:
@@ -2542,7 +2606,14 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             output_n_tile = task - lb * fc2_n_tiles
             route_block_idx = lb
             if num_groups > Int32(1):
-                route_block_idx = ld_shared_i32_relaxed(blocks_smem + lb * Int32(4))
+                if cutlass.const_expr(self.compact_fc1_pack):
+                    route_block_idx = ld_shared_i32_relaxed(
+                        blocks_smem + lb * Int32(4)
+                    ) & Int32(0xFF)
+                else:
+                    route_block_idx = ld_shared_i32_relaxed(
+                        blocks_smem + lb * Int32(4)
+                    )
             fc2_emit(
                 route_block_idx,
                 output_n_tile,
@@ -3500,6 +3571,93 @@ def effective_decode_schedule(driver: W4A16FusedMoeKernel) -> str | None:
     return None if schedule == MixedTrellisDecodeSchedule() else schedule.canonical()
 
 
+def _compiled_max_active_blocks_per_sm(
+    compiled,
+    *,
+    cta_threads: int,
+    shared_mem_bytes: int,
+) -> int | None:
+    """Query the CUDA driver's real cooperative residency for a compiled core."""
+    try:
+        from cuda.bindings import driver, runtime
+
+        executable = getattr(compiled, "_executable", compiled)
+        module = getattr(executable, "jit_module", None)
+        if module is None:
+            return None
+        err, dev_id = runtime.cudaGetDevice()
+        if int(err) != 0:
+            return None
+        cu_dev = driver.CUdevice(int(dev_id))
+        kernels = [entry.kernel for entry in getattr(module, "cuda_modules", ())]
+        for library in getattr(module, "cuda_library", ()):
+            err_c, count = runtime.cudaLibraryGetKernelCount(library)
+            if int(err_c) == 0:
+                err_k, enum_k = runtime.cudaLibraryEnumerateKernels(count, library)
+                if int(err_k) == 0:
+                    kernels.extend(enum_k)
+        if not kernels:
+            return None
+        cu_kernel = driver.CUkernel(int(kernels[0]))
+        static_smem = 0
+        err_s, s_val = driver.cuKernelGetAttribute(
+            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES,
+            cu_kernel,
+            cu_dev,
+        )
+        if int(err_s) == 0:
+            static_smem = int(s_val)
+        launch_dyn_smem = (
+            0 if static_smem >= int(shared_mem_bytes) else int(shared_mem_bytes)
+        )
+        cu_func = None
+        err_f, func_handle = driver.cuKernelGetFunction(cu_kernel)
+        if int(err_f) == 0:
+            cu_func = func_handle
+        if launch_dyn_smem > 49152:
+            attr = (
+                driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+            )
+            set_ok = False
+            try:
+                err_a = driver.cuKernelSetAttribute(
+                    attr, launch_dyn_smem, cu_kernel, cu_dev
+                )
+                err_code = err_a[0] if isinstance(err_a, tuple) else err_a
+                set_ok = int(err_code) == 0
+            except Exception:
+                set_ok = False
+            if not set_ok and cu_func is not None:
+                try:
+                    err_a = driver.cuFuncSetAttribute(cu_func, attr, launch_dyn_smem)
+                    err_code = err_a[0] if isinstance(err_a, tuple) else err_a
+                    set_ok = int(err_code) == 0
+                except Exception:
+                    set_ok = False
+            if not set_ok:
+                return 0
+        try:
+            err_o, o_val = runtime.cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                kernels[0], int(cta_threads), launch_dyn_smem
+            )
+            if int(err_o) == 0:
+                return int(o_val)
+        except Exception:
+            pass
+        if cu_func is not None:
+            try:
+                err_o, o_val = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                    cu_func, int(cta_threads), launch_dyn_smem
+                )
+                if int(err_o) == 0:
+                    return int(o_val)
+            except Exception:
+                pass
+    except Exception:
+        return None
+    return None
+
+
 def compile_mixed_trellis(
     *,
     size_m: int,
@@ -3647,7 +3805,9 @@ def compile_mixed_trellis(
             **({} if schedule is None else schedule.kernel_options()),
         )
 
-    def build_kernel(grouped_m8_fc2: bool) -> W4A16MixedTrellisKernel:
+    def build_kernel(
+        grouped_m8_fc2: bool, *, allow_groupwise: bool = True
+    ) -> W4A16MixedTrellisKernel:
         common = {"grouped_m8_fc2": grouped_m8_fc2}
         if warp_specialized:
             from .mixed_trellis_ws import W4A16MixedTrellisWSKernel
@@ -3715,8 +3875,34 @@ def compile_mixed_trellis(
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 descriptor_bits=descriptor_bits,
             )
+        # Restrict the SM-group-wise prototype strictly to the three Spark K4
+        # small-M targets so all guard and non-target exports stay unchanged:
+        #   - Inkling TP8, compact 4608x384
+        #   - Step-5 TP5, compact 4096x384 (E=352, silu_post_clamp)
+        #   - GLM 5.3 TP8, contiguous 6144x256 (E=256, top_k=8)
+        is_target_shape = (
+            (int(hidden_size), int(intermediate_size), bool(compact_weights))
+            == (4608, 384, True)
+            or (
+                int(hidden_size),
+                int(intermediate_size),
+                bool(compact_weights),
+                int(route_num_experts),
+            )
+            == (4096, 384, True, 352)
+            or (
+                int(hidden_size),
+                int(intermediate_size),
+                bool(compact_weights),
+                int(route_num_experts),
+                int(top_k),
+            )
+            == (6144, 256, False, 256, 8)
+        )
         use_groupwise = (
-            4 in (tier0_bits, tier1_bits)
+            allow_groupwise
+            and is_target_shape
+            and 4 in (tier0_bits, tier1_bits)
             and trellis_codebook == "mcg"
             and int(size_m) <= 80
             and int(moe_block_size) == 8
@@ -3926,6 +4112,41 @@ def compile_mixed_trellis(
         ),
         dsl_compile_options=OptLevel(2),
     )
+    if isinstance(kernel, W4A16MixedTrellisGroupwiseKernel):
+        real_occ = _compiled_max_active_blocks_per_sm(
+            compiled,
+            cta_threads=int(kernel.cta_threads),
+            shared_mem_bytes=int(kernel.shared_words * 4),
+        )
+        if real_occ is not None and real_occ < int(kernel.blocks_per_sm):
+            # Real hardware cooperative residency is below the planned
+            # blocks_per_sm (would fail cudaLaunchCooperativeKernel with 720):
+            # fall back to the stock cooperative kernel at the requested residency.
+            kernel = _select_mixed_fc2_kernel(
+                lambda grouped: build_kernel(grouped, allow_groupwise=False),
+                moe_block_size=moe_block_size,
+                max_shared_mem=max_shared_mem,
+            )
+            _apply_mixed_residency(kernel, force_blocks_per_sm, max_shared_mem)
+            fallback_key = (
+                "mixed_trellis",
+                device,
+                kernel.__cache_key__,
+                str(route_ids_dtype),
+                int(size_m),
+                int(max_m_blocks),
+                direct_topk_routes,
+            )
+            compiled = b12x_compile(
+                kernel,
+                *compile_args,
+                compile_spec=KernelCompileSpec.from_key(
+                    "moe.w4a16.mixed_trellis",
+                    W4A16MixedTrellisKernel.ABI_VERSION,
+                    fallback_key,
+                ),
+                dsl_compile_options=OptLevel(2),
+            )
     result = MixedTrellisCompileResult(
         compiled=compiled,
         topk_sum=topk_sum,
