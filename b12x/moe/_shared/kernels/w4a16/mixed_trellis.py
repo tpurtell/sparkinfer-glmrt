@@ -38,7 +38,10 @@ from b12x._lib.intrinsics import (
     get_ptr_as_int64,
     half2_to_float2_scaled,
     ld_global_acquire_i32,
+    ld_global_nc_f32,
+    ld_global_nc_u32,
     ld_global_nc_v2_u32,
+    ld_global_nc_v4_u32,
     ld_shared_i32_relaxed,
     ld_shared_u32,
     ld_shared_v4_f32,
@@ -1608,6 +1611,28 @@ def _gw_atom_add_acq_rel_gpu_i32(
 
 
 @dsl_user_op
+def _gw_nanosleep_u32(ns: int = 48, *, loc=None, ip=None):
+    """Yield SMSP/LSU issue bandwidth briefly while polling a group barrier."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"nanosleep.u32 {int(ns)};",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _gw_ld_global_nc_i32(base_ptr: Int64, *, loc=None, ip=None) -> Int32:
+    """Load 32-bit signed integer through the non-coherent read-only cache."""
+    return Int32(ld_global_nc_u32(base_ptr, loc=loc, ip=ip))
+
+
+@dsl_user_op
 def _gw_ld_global_cg_v2_u32(
     base_ptr: Int64, *, loc=None, ip=None
 ) -> tuple[Uint32, Uint32]:
@@ -1630,15 +1655,89 @@ def _gw_ld_global_cg_v2_u32(
 
 
 @dsl_user_op
-def _gw_cp_async4_shared_global_l2hint(
+def _gw_st_shared_u32(smem_addr: Int32, val: Uint32, *, loc=None, ip=None):
+    """Store 32-bit unsigned word to shared memory."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.shared.b32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _gw_st_shared_f16_from_f32_off(
     smem_addr: Int32,
-    gmem_addr: Int64,
-    cache_policy: Uint64,
+    val: cutlass.Float32,
+    byte_off: int = 0,
     *,
     loc=None,
     ip=None,
 ):
-    """Unpredicated 16-byte ``cp.async.cg.shared.global`` with L2 cache hint."""
+    """Convert FP32 to RN FP16 and store at immediate shared byte offset."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(val).ir_value(loc=loc, ip=ip),
+        ],
+        f"{{ .reg .b16 tmp; cvt.rn.f16.f32 tmp, $1; st.shared.b16 [$0 + {int(byte_off)}], tmp; }}",
+        "r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _gw_cp_async4_zfill_shared_global(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    valid_pred: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """16-byte ``cp.async.cg`` that hardware-zeroes SMEM when ``valid_pred == 0``."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(valid_pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred q; .reg .b32 sz; setp.ne.b32 q, $2, 0; "
+        "selp.b32 sz, 16, 0, q; cp.async.cg.shared.global [$0], [$1], 16, sz; }",
+        "r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _gw_cp_async4_shared_global_l2hint_off(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    cache_policy: Uint64,
+    smem_off: int = 0,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Unpredicated 16-byte ``cp.async.cg`` with immediate SMEM offset and L2 hint."""
     llvm.inline_asm(
         None,
         [
@@ -1646,8 +1745,39 @@ def _gw_cp_async4_shared_global_l2hint(
             Int64(gmem_addr).ir_value(loc=loc, ip=ip),
             Uint64(cache_policy).ir_value(loc=loc, ip=ip),
         ],
-        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2;",
+        f"cp.async.cg.shared.global.L2::cache_hint [$0 + {int(smem_off)}], [$1], 16, $2;",
         "r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _gw_cp_async4_shared_global_pred_l2hint_off(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    pred: Int32,
+    cache_policy: Uint64,
+    smem_off: int = 0,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Predicated 16-byte ``cp.async.cg`` with immediate SMEM offset and L2 hint."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Uint64(cache_policy).ir_value(loc=loc, ip=ip),
+        ],
+        f"{{ .reg .pred p; setp.ne.b32 p, $0, 0; "
+        f"@p cp.async.cg.shared.global.L2::cache_hint [$1 + {int(smem_off)}], [$2], 16, $3; }}",
+        "r,r,l,l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1670,49 +1800,50 @@ def _gw_warp_scan_inc_i32(val: Int32, lane: Int32) -> Int32:
 
 
 class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
-    """SM121 K4 small-M group-wise cooperative mixed-Trellis kernel (v2).
+    """SM121 K4 small-M group-wise cooperative mixed-Trellis kernel (v3).
 
     At ``active_m <= 8`` (up to 64 routed token-expert pairs), partitions the
-    cooperative launch's 128-thread ``M8 x K64 x N128`` sub-workers into an
-    even count ``G in {2, 4, 6, 8}`` of independent groups inside one launch.
-    Each physical SM runs two independent 128-thread sub-workers (``bar 1`` and
-    ``bar 2``, 256 threads/CTA at 1 CTA/SM within the <=64 KiB L1-preserving
-    SMEM carveout across both K4/K5 and K4/K6 tiers), antithetically pairing
-    heavy group ``c`` with light group ``G - 1 - c`` and reversed worker index
-    on each SM cluster. Groups run ``input rotation -> FC1 -> activation ->
-    FC2`` asynchronously with phase-separated L2-sector-isolated group barriers.
+    cooperative launch's 128-thread sub-workers into an even count
+    ``G in {2, 4, 6, 8, 12}`` of independent groups inside one launch, chosen
+    by an exact 30-lane Warp-0 schedule evaluator over the actual live compact
+    expert widths. Each physical SM runs two independent 128-thread sub-workers
+    (``bar 1`` and ``bar 2``, 256 threads/CTA at 1 CTA/SM, or 2 CTAs/SM when
+    ``force_blocks_per_sm == 2``, always within the <=64 KiB L1-preserving SMEM
+    carveout across both K4/K5 and K4/K6 tiers), antithetically pairing heavy
+    group ``c`` with light group ``G - 1 - c``.
 
-    Both ``active_m <= 8`` and ``active_m > 8`` share a single unified 4-stage
-    ``M8 x K64 x N128`` sub-worker GEMM engine with cross-tile persistent
-    ``cp.async`` weight/activation lookahead, disjoint epilogue SMEM, 3-load
-    32-bit K5/K6 stream alignment, and L2 ``evict_first`` weight streaming.
+    Groups run ``input rotation -> FC1 -> activation -> FC2`` asynchronously
+    with nanosleep-backed L2-sector-isolated group barriers, pre-barrier
+    stage-0 ``LDGSTS`` cold-weight prefetch, adaptive ``M8 x K64 x N64``
+    ragged-tail splitting (doubling active SMs and halving serial FC1 wave
+    latency at ``m=1`` and odd wave tails while preserving exact K64 two-chain
+    summation), and a universal 2-barrier warp-partitioned XOR-swizzled
+    epilogue across K4/K5 and K4/K6.
     """
 
     SUB_STAGES = 4
     SUB_A_STAGE_BYTES = 1024
-    SUB_SH_FOLD_BYTES = 4096
-    SUB_SH_OUT_BYTES = 2176
-    GROUP_SMEM_BYTES = 1536
+    SUB_SH_EPI_K5_BYTES = 4096
+    SUB_SH_EPI_K6_BYTES = 2048
+    GROUP_SMEM_BYTES = 1024
 
     OFF_HDR = 0
-    OFF_GRP_RB_PREFIX = 64
-    OFF_GRP_RT_PREFIX = 128
-    OFF_SORTED_RB = 192
-    OFF_SORTED_EXPERT = 448
-    OFF_FC1_PREFIX = 704
-    OFF_SORTED_HALF_TILES = 976
-    OFF_LIVE_ROUTES = 1232
+    OFF_GRP_RB_PREFIX = 16
+    OFF_GRP_RT_PREFIX = 80
+    OFF_FC1_PREFIX = 144
+    OFF_SORTED_META = 416
+    OFF_LIVE_ROUTES = 672
 
     TMP_KEY = 0
-    TMP_EXPERT = 256
-    TMP_FC1_TILES = 512
-    TMP_HALF_TILES = 768
-    TMP_ACT_NBLK = 1024
-    TMP_LIVE_CNT = 1280
-    TMP_SORTED_FC1 = 1536
-    TMP_SORTED_CNT = 1792
-    TMP_RT_PREFIX = 2048
-    TMP_ROUTES = 2320
+    TMP_RK_META = 256
+    TMP_RK_RLO = 512
+    TMP_RK_RHI = 768
+    TMP_POS_FC1 = 1024
+    TMP_POS_CNT = 1280
+    TMP_POS_RK = 1536
+    TMP_RT_PREFIX = 1792
+    TMP_CAND_SERIAL = 2064
+    TMP_CAND_PAIR = 2192
 
     def __init__(
         self,
@@ -1740,6 +1871,8 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             self.cta_threads not in (128, 256)
             or self.tier0_bits != 4
             or self.tier1_bits not in (5, 6)
+            or self.top_k > 8
+            or self.size_m * self.top_k > 4096
             or self.driver.moe_block_size != 8
             or self.driver.fc2.moe_block_size != 8
             or self.driver.fc2.schedule_route_block_factor != 1
@@ -1755,7 +1888,9 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             or self.driver.fc2.l2_prefetch_k_tiles != 0
             or self.driver.phase_l2_prefetch
             or self.hidden_size % 256 != 0
+            or self.hidden_size > 16384
             or self.intermediate_size % 128 != 0
+            or self.intermediate_size > 63 * 128
         ):
             raise ValueError(
                 "W4A16MixedTrellisGroupwiseKernel requires packed M8 MCG K4/(K5|K6) BF16-input geometry"
@@ -1780,32 +1915,26 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         self.sub_b_stage_bytes = 4 * 8 * 32 * self.max_bits
         self.sub_sh_b_off = 0
         self.sub_sh_a_off = self.SUB_STAGES * self.sub_b_stage_bytes
-        self.disjoint_fold_out = bool(
-            self.dual_sub_workers and self.max_bits <= 5
-        )
-        self.sub_sh_fold_off = (
+        self.sub_sh_epi_off = (
             self.sub_sh_a_off + self.SUB_STAGES * self.SUB_A_STAGE_BYTES
         )
-        if self.disjoint_fold_out:
-            self.sub_sh_out_off = (
-                self.sub_sh_fold_off + self.SUB_SH_FOLD_BYTES
-            )
-            self.sub_worker_smem_bytes = (
-                self.sub_sh_out_off + self.SUB_SH_OUT_BYTES
-            )
-        else:
-            self.sub_sh_out_off = self.sub_sh_fold_off
-            self.sub_worker_smem_bytes = (
-                self.sub_sh_fold_off + self.SUB_SH_OUT_BYTES
-            )
+        self.full_fold_epi = bool(self.max_bits <= 5)
+        self.sub_sh_epi_bytes = (
+            self.SUB_SH_EPI_K5_BYTES
+            if self.full_fold_epi
+            else self.SUB_SH_EPI_K6_BYTES
+        )
+        self.sub_worker_smem_bytes = (
+            self.sub_sh_epi_off + self.sub_sh_epi_bytes
+        )
 
         workers_per_cta = 2 if self.dual_sub_workers else 1
         self.group_smem_off = workers_per_cta * self.sub_worker_smem_bytes
         raw_total_bytes = self.group_smem_off + self.GROUP_SMEM_BYTES
         aligned_total_bytes = ((raw_total_bytes + 1023) // 1024) * 1024
-        if self.dual_sub_workers and aligned_total_bytes + 1024 > 65536:
+        if self.blocks_per_sm * (aligned_total_bytes + 1024) > 65536:
             raise ValueError(
-                "dual sub-worker shared memory exceeds 64 KiB L1-preserving carveout"
+                "sub-worker shared memory exceeds 64 KiB L1-preserving carveout"
             )
         self.shared_words = aligned_total_bytes // 4
 
@@ -1822,11 +1951,13 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         avail_locks = int(self.driver.barrier_count_off)
         if avail_locks < 6:
             raise ValueError("insufficient workspace capacity for group barriers")
-        self.max_groups = min(8, avail_locks // 6)
-        if avail_locks >= 256:
+        self.max_groups = min(12, avail_locks // 6)
+        if avail_locks >= 384:
             self.group_barrier_stride = 32
-        elif avail_locks >= 128:
+        elif avail_locks >= 192:
             self.group_barrier_stride = 16
+        elif avail_locks >= 96:
+            self.group_barrier_stride = 8
         else:
             self.group_barrier_stride = max(
                 6, avail_locks // max(self.max_groups, 1)
@@ -1836,11 +1967,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
     def __cache_key__(self) -> tuple[object, ...]:
         return super().__cache_key__ + (
             (
-                "k4_groupwise_v2",
+                "k4_groupwise_v3",
                 self.cta_threads,
                 self.blocks_per_sm,
                 self.dual_sub_workers,
-                self.disjoint_fold_out,
+                self.full_fold_epi,
                 self.sub_worker_smem_bytes,
                 self.group_smem_off,
                 self.max_groups,
@@ -1882,62 +2013,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     st_global_i32(count_addr, Int32(0))
                     red_add_global_release_i32(sense_addr, Int32(1))
                 else:
-                    sense = old_sense
+                    sense = ld_global_acquire_i32(sense_addr)
                     while sense == old_sense:
+                        _gw_nanosleep_u32(48)
                         sense = ld_global_acquire_i32(sense_addr)
             self._worker_sync(sub_bar_id)
-
-    @cute.jit
-    def _select_group_count(
-        self,
-        d_valid: Int32,
-        total_workers: Int32,
-    ) -> Int32:
-        """Select even ``G in {4, 6, 8}`` (or ``2``/``1`` fallback) minimizing
-        physical SM-cluster K64xN128 wave work plus barrier cost."""
-        g_sel = Int32(1)
-        if d_valid >= Int32(2):
-            best_g = Int32(0)
-            best_cost = Int32(1 << 29)
-            fc1_nt = Int32(self.gemm_fc1_n_tiles)
-            fc1_kt = Int32(self.gemm_fc1_k_tiles)
-            fc2_nt = Int32(self.gemm_fc2_n_tiles)
-            fc2_kt = Int32(self.gemm_fc2_k_tiles)
-            for cand in cutlass.range_constexpr(3):
-                g_val = 4 if cand == 0 else (6 if cand == 1 else 8)
-                if cutlass.const_expr(g_val <= self.max_groups):
-                    if d_valid >= Int32(g_val) and (
-                        total_workers % Int32(g_val)
-                    ) == Int32(0):
-                        h_val = Int32(g_val // 2)
-                        wpg = total_workers // Int32(g_val)
-                        e_pair = (d_valid + h_val - Int32(1)) // h_val
-                        sm_fc1_waves = (
-                            e_pair * fc1_nt + wpg - Int32(1)
-                        ) // wpg
-                        sm_fc2_waves = (
-                            e_pair * fc2_nt + wpg - Int32(1)
-                        ) // wpg
-                        sm_k64_work = (
-                            sm_fc1_waves * fc1_kt + sm_fc2_waves * fc2_kt
-                        )
-                        e0 = (e_pair + Int32(1)) >> Int32(1)
-                        grp0_k64 = (
-                            ((e0 * fc1_nt + wpg - Int32(1)) // wpg) * fc1_kt
-                            + ((e0 * fc2_nt + wpg - Int32(1)) // wpg) * fc2_kt
-                        )
-                        cost = sm_k64_work * Int32(4) + grp0_k64 + wpg * Int32(2)
-                        if cost <= best_cost:
-                            best_cost = cost
-                            best_g = Int32(g_val)
-            if best_g > Int32(0):
-                g_sel = best_g
-            elif (
-                cutlass.const_expr(2 <= self.max_groups)
-                and (total_workers % Int32(2)) == Int32(0)
-            ):
-                g_sel = Int32(2)
-        return g_sel
 
     @cute.jit
     def _build_group_schedule_smem(
@@ -1952,37 +2032,61 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         smem_base: Int32,
         tid: Int32,
     ) -> Int32:
-        """Build exact byte-weighted snake group schedule in shared memory."""
+        """Build exact live-tile-evaluated snake group schedule in 3 CTA syncs."""
         sched_smem = smem_base + Int32(self.group_smem_off)
         tmp_smem = smem_base
 
+        my_key = Int32(-1)
+        my_ce = Int32(0)
+        my_half = Int32(0)
+        my_cnt = Int32(0)
+        my_rlo = Uint32(0xFFFFFFFF)
+        my_rhi = Uint32(0xFFFFFFFF)
+
         if tid < Int32(64):
             rb = tid
-            key = Int32(-1)
-            expert = Int32(-1)
-            fc1_tiles = Int32(0)
-            half_tiles = Int32(0)
-            act_nblk = Int32(self.intermediate_size // 128)
-            live_cnt = Int32(0)
-
             if rb < raw_blocks:
-                ce = block_expert_ids[rb].to(Int32)
-                for k in cutlass.range_constexpr(8):
-                    r_k = packed_route_indices[rb * Int32(8) + Int32(k)].to(Int32)
-                    st_shared_i32(
-                        tmp_smem
-                        + Int32(self.TMP_ROUTES)
-                        + (rb * Int32(8) + Int32(k)) * Int32(4),
-                        r_k,
+                ce = _gw_ld_global_nc_i32(
+                    get_ptr_as_int64(block_expert_ids, rb)
+                )
+                q0, q1, q2, q3 = ld_global_nc_v4_u32(
+                    get_ptr_as_int64(packed_route_indices, rb * Int32(8))
+                )
+                q4, q5, q6, q7 = ld_global_nc_v4_u32(
+                    get_ptr_as_int64(
+                        packed_route_indices, rb * Int32(8) + Int32(4)
                     )
+                )
+                r_quads = (q0, q1, q2, q3, q4, q5, q6, q7)
+                for k_in in cutlass.range_constexpr(8):
+                    r_k = Int32(r_quads[k_in])
                     if r_k >= Int32(0) and r_k < live_routes:
-                        live_cnt += Int32(1)
-                if live_cnt > Int32(0) and ce >= Int32(0) and ce < total_experts:
+                        bval = Uint32(r_k) & Uint32(0xFF)
+                        if my_cnt < Int32(4):
+                            sh = Uint32(my_cnt * Int32(8))
+                            my_rlo = (
+                                my_rlo & ~(Uint32(0xFF) << sh)
+                            ) | (bval << sh)
+                        else:
+                            sh = Uint32((my_cnt - Int32(4)) * Int32(8))
+                            my_rhi = (
+                                my_rhi & ~(Uint32(0xFF) << sh)
+                            ) | (bval << sh)
+                        my_cnt += Int32(1)
+                if my_cnt > Int32(0) and ce >= Int32(0) and ce < total_experts:
                     ce_i64 = ce.to(Int64)
                     tot_i64 = total_experts.to(Int64)
-                    d0 = descriptor_map[ce_i64].to(Int32)
-                    d1 = descriptor_map[tot_i64 + ce_i64].to(Int32)
-                    d2 = descriptor_map[Int64(2) * tot_i64 + ce_i64].to(Int32)
+                    d0 = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(descriptor_map, ce_i64)
+                    )
+                    d1 = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(descriptor_map, tot_i64 + ce_i64)
+                    )
+                    d2 = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(
+                            descriptor_map, Int64(2) * tot_i64 + ce_i64
+                        )
+                    )
                     if d0 >= Int32(0) and d1 >= Int32(0) and d2 >= Int32(0):
                         bit_delta = Int32(self.tier1_bits - self.tier0_bits)
                         b0 = Int32(self.tier0_bits) + (
@@ -1998,44 +2102,25 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         if cutlass.const_expr(
                             self.compact_weights and not self.full_compact
                         ):
-                            live_w = descriptor_map[
-                                Int64(3) * tot_i64 + ce_i64
-                            ].to(Int32)
-                        half_tiles = live_w // Int32(128)
-                        fc1_tiles = half_tiles * Int32(2)
-                        act_nblk = half_tiles
-                        if half_tiles > Int32(0):
-                            score = act_nblk * (b0 + b1 + b2)
-                            expert = ce
-                            key = (score << Int32(8)) | (Int32(63) - rb)
-
-            st_shared_i32(tmp_smem + Int32(self.TMP_KEY) + rb * Int32(4), key)
-            st_shared_i32(tmp_smem + Int32(self.TMP_EXPERT) + rb * Int32(4), expert)
+                            live_w = _gw_ld_global_nc_i32(
+                                get_ptr_as_int64(
+                                    descriptor_map,
+                                    Int64(3) * tot_i64 + ce_i64,
+                                )
+                            )
+                        half_t = live_w // Int32(128)
+                        if half_t > Int32(0):
+                            score = half_t * (b0 + b1 + b2)
+                            my_ce = ce
+                            my_half = half_t
+                            my_key = (score << Int32(8)) | (Int32(63) - rb)
             st_shared_i32(
-                tmp_smem + Int32(self.TMP_FC1_TILES) + rb * Int32(4), fc1_tiles
-            )
-            st_shared_i32(
-                tmp_smem + Int32(self.TMP_HALF_TILES) + rb * Int32(4), half_tiles
-            )
-            st_shared_i32(
-                tmp_smem + Int32(self.TMP_ACT_NBLK) + rb * Int32(4), act_nblk
-            )
-            st_shared_i32(
-                tmp_smem + Int32(self.TMP_LIVE_CNT) + rb * Int32(4), live_cnt
-            )
-            st_shared_i32(
-                tmp_smem + Int32(self.TMP_SORTED_FC1) + rb * Int32(4), Int32(0)
-            )
-            st_shared_i32(
-                tmp_smem + Int32(self.TMP_SORTED_CNT) + rb * Int32(4), Int32(0)
+                tmp_smem + Int32(self.TMP_KEY) + rb * Int32(4), my_key
             )
 
         cute.arch.sync_threads()
 
         if tid < Int32(64):
-            my_key = ld_shared_i32_relaxed(
-                tmp_smem + Int32(self.TMP_KEY) + tid * Int32(4)
-            )
             d_valid = Int32(0)
             rk = Int32(0)
             for j4 in cutlass.range_constexpr(16):
@@ -2058,93 +2143,27 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     + (i2 > my_key).to(Int32)
                     + (i3 > my_key).to(Int32)
                 )
-
-            if d_valid > Int32(0):
-                num_groups = self._select_group_count(d_valid, total_workers)
-                workers_per_group = total_workers // num_groups
-                q_grp = d_valid // num_groups
-                r_grp = d_valid - q_grp * num_groups
-
-                if tid <= num_groups:
-                    extra = tid
-                    if (q_grp & Int32(1)) == Int32(0):
-                        if extra > r_grp:
-                            extra = r_grp
-                    else:
-                        extra = tid - (num_groups - r_grp)
-                        if extra < Int32(0):
-                            extra = Int32(0)
-                    st_shared_i32(
-                        sched_smem
-                        + Int32(self.OFF_GRP_RB_PREFIX)
-                        + tid * Int32(4),
-                        tid * q_grp + extra,
-                    )
-
-                if my_key >= Int32(0):
-                    row_in_grp = rk // num_groups
-                    rem = rk - row_in_grp * num_groups
-                    grp = rem
-                    if (row_in_grp & Int32(1)) != Int32(0):
-                        grp = num_groups - Int32(1) - rem
-                    extra_g = grp
-                    if (q_grp & Int32(1)) == Int32(0):
-                        if extra_g > r_grp:
-                            extra_g = r_grp
-                    else:
-                        extra_g = grp - (num_groups - r_grp)
-                        if extra_g < Int32(0):
-                            extra_g = Int32(0)
-                    pos = grp * q_grp + extra_g + row_in_grp
-                    st_shared_i32(
-                        sched_smem + Int32(self.OFF_SORTED_RB) + pos * Int32(4),
-                        tid,
-                    )
-                    st_shared_i32(
-                        sched_smem
-                        + Int32(self.OFF_SORTED_EXPERT)
-                        + pos * Int32(4),
-                        ld_shared_i32_relaxed(
-                            tmp_smem + Int32(self.TMP_EXPERT) + tid * Int32(4)
-                        ),
-                    )
-                    st_shared_i32(
-                        sched_smem
-                        + Int32(self.OFF_SORTED_HALF_TILES)
-                        + pos * Int32(4),
-                        ld_shared_i32_relaxed(
-                            tmp_smem
-                            + Int32(self.TMP_HALF_TILES)
-                            + tid * Int32(4)
-                        ),
-                    )
-                    st_shared_i32(
-                        tmp_smem + Int32(self.TMP_SORTED_FC1) + pos * Int32(4),
-                        ld_shared_i32_relaxed(
-                            tmp_smem
-                            + Int32(self.TMP_FC1_TILES)
-                            + tid * Int32(4)
-                        ),
-                    )
-                    st_shared_i32(
-                        tmp_smem + Int32(self.TMP_SORTED_CNT) + pos * Int32(4),
-                        ld_shared_i32_relaxed(
-                            tmp_smem + Int32(self.TMP_LIVE_CNT) + tid * Int32(4)
-                        ),
-                    )
-                if tid == Int32(0):
-                    st_shared_i32(sched_smem + Int32(self.OFF_HDR + 0), d_valid)
-                    st_shared_i32(
-                        sched_smem + Int32(self.OFF_HDR + 4), num_groups
-                    )
-                    st_shared_i32(
-                        sched_smem + Int32(self.OFF_HDR + 8), workers_per_group
-                    )
-            else:
-                if tid == Int32(0):
-                    st_shared_i32(
-                        sched_smem + Int32(self.OFF_HDR + 0), Int32(0)
-                    )
+            if my_key >= Int32(0):
+                rk_meta = (
+                    Uint32(tid)
+                    | (Uint32(my_ce) << Uint32(6))
+                    | (Uint32(my_half) << Uint32(17))
+                    | (Uint32(my_cnt - Int32(1)) << Uint32(29))
+                )
+                _gw_st_shared_u32(
+                    tmp_smem + Int32(self.TMP_RK_META) + rk * Int32(4),
+                    rk_meta,
+                )
+                _gw_st_shared_u32(
+                    tmp_smem + Int32(self.TMP_RK_RLO) + rk * Int32(4),
+                    my_rlo,
+                )
+                _gw_st_shared_u32(
+                    tmp_smem + Int32(self.TMP_RK_RHI) + rk * Int32(4),
+                    my_rhi,
+                )
+            if tid == Int32(0):
+                st_shared_i32(sched_smem + Int32(self.OFF_HDR + 0), d_valid)
 
         cute.arch.sync_threads()
 
@@ -2152,29 +2171,305 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         if d_valid_cta > Int32(0):
             if tid < Int32(32):
                 lane = tid
-                num_groups_w = ld_shared_i32_relaxed(
-                    sched_smem + Int32(self.OFF_HDR + 4)
+                cand_g = Int32(0)
+                grp_id = Int32(0)
+                partner = lane
+                if lane < Int32(4):
+                    cand_g = Int32(4)
+                    grp_id = lane
+                    partner = Int32(3) - lane
+                elif lane < Int32(10):
+                    cand_g = Int32(6)
+                    grp_id = lane - Int32(4)
+                    partner = Int32(13) - lane
+                elif lane < Int32(18):
+                    cand_g = Int32(8)
+                    grp_id = lane - Int32(10)
+                    partner = Int32(27) - lane
+                elif lane < Int32(30):
+                    cand_g = Int32(12)
+                    grp_id = lane - Int32(18)
+                    partner = Int32(47) - lane
+
+                elig = Int32(0)
+                wpg_cand = Int32(1)
+                if (
+                    cand_g > Int32(0)
+                    and cand_g <= Int32(self.max_groups)
+                    and d_valid_cta >= cand_g
+                ):
+                    if (total_workers % cand_g) == Int32(0):
+                        wpg_tmp = total_workers // cand_g
+                        if wpg_tmp >= Int32(8):
+                            elig = Int32(1)
+                            wpg_cand = wpg_tmp
+
+                e4 = cute.arch.shuffle_sync(elig, Int32(0))
+                e6 = cute.arch.shuffle_sync(elig, Int32(4))
+                e8 = cute.arch.shuffle_sync(elig, Int32(10))
+                e12 = cute.arch.shuffle_sync(elig, Int32(18))
+                if (e6 | e8 | e12) != Int32(0):
+                    e4 = Int32(0)
+                    if cand_g == Int32(4):
+                        elig = Int32(0)
+
+                my_serial = Int32(0)
+                my_actual = Int32(0)
+                if elig != Int32(0):
+                    s_half = Int32(0)
+                    m_half = Int32(0)
+                    cnt_g = Int32(0)
+                    for row_c in cutlass.range_constexpr(16):
+                        rk_c = Int32(row_c) * cand_g + (
+                            grp_id
+                            if (row_c & 1) == 0
+                            else (cand_g - Int32(1) - grp_id)
+                        )
+                        if rk_c < d_valid_cta:
+                            m_c = ld_shared_u32(
+                                tmp_smem
+                                + Int32(self.TMP_RK_META)
+                                + rk_c * Int32(4)
+                            )
+                            h_c = Int32((m_c >> Uint32(17)) & Uint32(0x3F))
+                            s_half += h_c
+                            if h_c > m_half:
+                                m_half = h_c
+                            cnt_g += Int32(1)
+                    fc1_t = s_half * Int32(2)
+                    q1 = fc1_t // wpg_cand
+                    r1 = fc1_t - q1 * wpg_cand
+                    w1 = q1 * Int32(2)
+                    if r1 > Int32(0):
+                        if r1 * Int32(2) <= wpg_cand:
+                            w1 = q1 * Int32(2) + Int32(1)
+                        else:
+                            w1 = q1 * Int32(2) + Int32(2)
+                    fc2_nt = Int32(self.gemm_fc2_n_tiles)
+                    fc1_kt = Int32(self.gemm_fc1_k_tiles)
+                    fc2_t = cnt_g * fc2_nt
+                    q2 = fc2_t // wpg_cand
+                    r2 = fc2_t - q2 * wpg_cand
+                    w2 = q2 * Int32(2)
+                    if r2 > Int32(0):
+                        if r2 * Int32(2) <= wpg_cand:
+                            w2 = q2 * Int32(2) + Int32(1)
+                        else:
+                            w2 = q2 * Int32(2) + Int32(2)
+                    c_safe = cnt_g
+                    if c_safe < Int32(1):
+                        c_safe = Int32(1)
+                    kt2_sum = s_half * Int32(2)
+                    fc2_ser = (
+                        (w2 * kt2_sum + c_safe - Int32(1)) // c_safe
+                        + (m_half * Int32(2) - kt2_sum // c_safe)
+                    )
+                    my_serial = w1 * fc1_kt + fc2_ser
+                    my_actual = (
+                        Int32(2) * fc1_t * fc1_kt
+                        + Int32(2) * fc2_nt * kt2_sum
+                    )
+
+                partner_actual = cute.arch.shuffle_sync(my_actual, partner)
+                my_pair_sm = (
+                    my_actual + partner_actual + wpg_cand - Int32(1)
+                ) // wpg_cand
+                st_shared_i32(
+                    tmp_smem + Int32(self.TMP_CAND_SERIAL) + lane * Int32(4),
+                    my_serial,
                 )
-                rb0 = lane
-                rb1 = lane + Int32(32)
-                f0 = Int32(0)
-                f1 = Int32(0)
-                c0_rt = Int32(0)
-                c1_rt = Int32(0)
-                if rb0 < d_valid_cta:
-                    f0 = ld_shared_i32_relaxed(
-                        tmp_smem + Int32(self.TMP_SORTED_FC1) + rb0 * Int32(4)
+                st_shared_i32(
+                    tmp_smem + Int32(self.TMP_CAND_PAIR) + lane * Int32(4),
+                    my_pair_sm,
+                )
+                cute.arch.sync_warp()
+
+                seg_cost = Int32(1 << 29)
+                if lane < Int32(4):
+                    seg_base = Int32(0)
+                    seg_len = Int32(4)
+                    seg_g = Int32(4)
+                    seg_el = e4
+                    if lane == Int32(1):
+                        seg_base = Int32(4)
+                        seg_len = Int32(6)
+                        seg_g = Int32(6)
+                        seg_el = e6
+                    elif lane == Int32(2):
+                        seg_base = Int32(10)
+                        seg_len = Int32(8)
+                        seg_g = Int32(8)
+                        seg_el = e8
+                    elif lane == Int32(3):
+                        seg_base = Int32(18)
+                        seg_len = Int32(12)
+                        seg_g = Int32(12)
+                        seg_el = e12
+                    if seg_el != Int32(0):
+                        grp_max = Int32(0)
+                        pair_max = Int32(0)
+                        kk_s = Int32(0)
+                        while kk_s < seg_len:
+                            idx_s = seg_base + kk_s
+                            sv = ld_shared_i32_relaxed(
+                                tmp_smem
+                                + Int32(self.TMP_CAND_SERIAL)
+                                + idx_s * Int32(4)
+                            )
+                            pv = ld_shared_i32_relaxed(
+                                tmp_smem
+                                + Int32(self.TMP_CAND_PAIR)
+                                + idx_s * Int32(4)
+                            )
+                            if sv > grp_max:
+                                grp_max = sv
+                            if pv > pair_max:
+                                pair_max = pv
+                            kk_s += Int32(1)
+                        seg_cost = (
+                            grp_max * Int32(2)
+                            + pair_max
+                            + (total_workers // seg_g) * Int32(3)
+                        )
+
+                c0 = cute.arch.shuffle_sync(seg_cost, Int32(0))
+                c1 = cute.arch.shuffle_sync(seg_cost, Int32(1))
+                c2 = cute.arch.shuffle_sync(seg_cost, Int32(2))
+                c3 = cute.arch.shuffle_sync(seg_cost, Int32(3))
+                best_cost = Int32(1 << 29)
+                num_groups = Int32(0)
+                if c0 < best_cost:
+                    best_cost = c0
+                    num_groups = Int32(4)
+                if c1 <= best_cost and c1 < Int32(1 << 29):
+                    best_cost = c1
+                    num_groups = Int32(6)
+                if c2 <= best_cost and c2 < Int32(1 << 29):
+                    best_cost = c2
+                    num_groups = Int32(8)
+                if c3 <= best_cost and c3 < Int32(1 << 29):
+                    best_cost = c3
+                    num_groups = Int32(12)
+                if num_groups == Int32(0):
+                    if (
+                        cutlass.const_expr(4 <= self.max_groups)
+                        and d_valid_cta >= Int32(4)
+                        and (total_workers % Int32(4)) == Int32(0)
+                    ):
+                        num_groups = Int32(4)
+                    elif (
+                        cutlass.const_expr(2 <= self.max_groups)
+                        and d_valid_cta >= Int32(2)
+                        and (total_workers % Int32(2)) == Int32(0)
+                    ):
+                        num_groups = Int32(2)
+                    else:
+                        num_groups = Int32(1)
+
+                workers_per_group = total_workers // num_groups
+                q_grp = d_valid_cta // num_groups
+                r_grp = d_valid_cta - q_grp * num_groups
+
+                if lane <= num_groups:
+                    extra = lane
+                    if (q_grp & Int32(1)) == Int32(0):
+                        if extra > r_grp:
+                            extra = r_grp
+                    else:
+                        extra = lane - (num_groups - r_grp)
+                        if extra < Int32(0):
+                            extra = Int32(0)
+                    st_shared_i32(
+                        sched_smem
+                        + Int32(self.OFF_GRP_RB_PREFIX)
+                        + lane * Int32(4),
+                        lane * q_grp + extra,
                     )
-                    c0_rt = ld_shared_i32_relaxed(
-                        tmp_smem + Int32(self.TMP_SORTED_CNT) + rb0 * Int32(4)
+                if lane == Int32(0):
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_HDR + 4), num_groups
                     )
-                if rb1 < d_valid_cta:
-                    f1 = ld_shared_i32_relaxed(
-                        tmp_smem + Int32(self.TMP_SORTED_FC1) + rb1 * Int32(4)
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_HDR + 8), workers_per_group
                     )
-                    c1_rt = ld_shared_i32_relaxed(
-                        tmp_smem + Int32(self.TMP_SORTED_CNT) + rb1 * Int32(4)
-                    )
+
+                st_shared_i32(
+                    tmp_smem + Int32(self.TMP_POS_FC1) + lane * Int32(4),
+                    Int32(0),
+                )
+                st_shared_i32(
+                    tmp_smem
+                    + Int32(self.TMP_POS_FC1)
+                    + (lane + Int32(32)) * Int32(4),
+                    Int32(0),
+                )
+                st_shared_i32(
+                    tmp_smem + Int32(self.TMP_POS_CNT) + lane * Int32(4),
+                    Int32(0),
+                )
+                st_shared_i32(
+                    tmp_smem
+                    + Int32(self.TMP_POS_CNT)
+                    + (lane + Int32(32)) * Int32(4),
+                    Int32(0),
+                )
+                cute.arch.sync_warp()
+
+                for half_rk in cutlass.range_constexpr(2):
+                    rk_s = lane + Int32(half_rk * 32)
+                    if rk_s < d_valid_cta:
+                        row_in_grp = rk_s // num_groups
+                        rem = rk_s - row_in_grp * num_groups
+                        grp = rem
+                        if (row_in_grp & Int32(1)) != Int32(0):
+                            grp = num_groups - Int32(1) - rem
+                        grp_base = ld_shared_i32_relaxed(
+                            sched_smem
+                            + Int32(self.OFF_GRP_RB_PREFIX)
+                            + grp * Int32(4)
+                        )
+                        pos_s = grp_base + row_in_grp
+                        m_s = ld_shared_u32(
+                            tmp_smem
+                            + Int32(self.TMP_RK_META)
+                            + rk_s * Int32(4)
+                        )
+                        h_s = Int32((m_s >> Uint32(17)) & Uint32(0x3F))
+                        cnt_s = Int32(m_s >> Uint32(29)) + Int32(1)
+                        st_shared_i32(
+                            tmp_smem
+                            + Int32(self.TMP_POS_FC1)
+                            + pos_s * Int32(4),
+                            h_s * Int32(2),
+                        )
+                        st_shared_i32(
+                            tmp_smem
+                            + Int32(self.TMP_POS_CNT)
+                            + pos_s * Int32(4),
+                            cnt_s,
+                        )
+                        st_shared_i32(
+                            tmp_smem
+                            + Int32(self.TMP_POS_RK)
+                            + pos_s * Int32(4),
+                            rk_s,
+                        )
+                cute.arch.sync_warp()
+
+                pos0 = lane
+                pos1 = lane + Int32(32)
+                f0 = ld_shared_i32_relaxed(
+                    tmp_smem + Int32(self.TMP_POS_FC1) + pos0 * Int32(4)
+                )
+                f1 = ld_shared_i32_relaxed(
+                    tmp_smem + Int32(self.TMP_POS_FC1) + pos1 * Int32(4)
+                )
+                c0_rt = ld_shared_i32_relaxed(
+                    tmp_smem + Int32(self.TMP_POS_CNT) + pos0 * Int32(4)
+                )
+                c1_rt = ld_shared_i32_relaxed(
+                    tmp_smem + Int32(self.TMP_POS_CNT) + pos1 * Int32(4)
+                )
 
                 inc_f0 = _gw_warp_scan_inc_i32(f0, lane)
                 exc_f0 = inc_f0 - f0
@@ -2184,11 +2479,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 tot_f = tot_f0 + cute.arch.shuffle_sync(inc_f1, Int32(31))
 
                 st_shared_i32(
-                    sched_smem + Int32(self.OFF_FC1_PREFIX) + rb0 * Int32(4),
+                    sched_smem + Int32(self.OFF_FC1_PREFIX) + pos0 * Int32(4),
                     exc_f0,
                 )
                 st_shared_i32(
-                    sched_smem + Int32(self.OFF_FC1_PREFIX) + rb1 * Int32(4),
+                    sched_smem + Int32(self.OFF_FC1_PREFIX) + pos1 * Int32(4),
                     exc_f1,
                 )
 
@@ -2200,11 +2495,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 tot_c = tot_c0 + cute.arch.shuffle_sync(inc_c1, Int32(31))
 
                 st_shared_i32(
-                    tmp_smem + Int32(self.TMP_RT_PREFIX) + rb0 * Int32(4),
+                    tmp_smem + Int32(self.TMP_RT_PREFIX) + pos0 * Int32(4),
                     exc_c0,
                 )
                 st_shared_i32(
-                    tmp_smem + Int32(self.TMP_RT_PREFIX) + rb1 * Int32(4),
+                    tmp_smem + Int32(self.TMP_RT_PREFIX) + pos1 * Int32(4),
                     exc_c1,
                 )
                 if lane == Int32(0):
@@ -2217,7 +2512,8 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         tot_c,
                     )
                 cute.arch.sync_warp()
-                if lane <= num_groups_w:
+
+                if lane <= num_groups:
                     rb_p = ld_shared_i32_relaxed(
                         sched_smem
                         + Int32(self.OFF_GRP_RB_PREFIX)
@@ -2233,39 +2529,56 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         rt_p,
                     )
 
-            cute.arch.sync_threads()
-
-            if tid < d_valid_cta:
-                pos_out = tid
-                orig_rb = ld_shared_i32_relaxed(
-                    sched_smem + Int32(self.OFF_SORTED_RB) + pos_out * Int32(4)
-                )
-                ce_out = ld_shared_i32_relaxed(
-                    sched_smem
-                    + Int32(self.OFF_SORTED_EXPERT)
-                    + pos_out * Int32(4)
-                )
-                nblk_out = ld_shared_i32_relaxed(
-                    tmp_smem + Int32(self.TMP_ACT_NBLK) + orig_rb * Int32(4)
-                )
-                rt_out = ld_shared_i32_relaxed(
-                    tmp_smem + Int32(self.TMP_RT_PREFIX) + pos_out * Int32(4)
-                )
-                packed_meta = (nblk_out << Int32(22)) | (ce_out << Int32(8))
-                for k_out in cutlass.range_constexpr(8):
-                    rk_out = ld_shared_i32_relaxed(
-                        tmp_smem
-                        + Int32(self.TMP_ROUTES)
-                        + (orig_rb * Int32(8) + Int32(k_out)) * Int32(4)
-                    )
-                    if rk_out >= Int32(0) and rk_out < live_routes:
-                        st_shared_i32(
-                            sched_smem
-                            + Int32(self.OFF_LIVE_ROUTES)
-                            + rt_out * Int32(4),
-                            packed_meta | rk_out,
+                for half_p in cutlass.range_constexpr(2):
+                    pos_out = lane + Int32(half_p * 32)
+                    rt_out = exc_c0 if half_p == 0 else exc_c1
+                    if pos_out < d_valid_cta:
+                        rk_p = ld_shared_i32_relaxed(
+                            tmp_smem
+                            + Int32(self.TMP_POS_RK)
+                            + pos_out * Int32(4)
                         )
-                        rt_out += Int32(1)
+                        m_p = ld_shared_u32(
+                            tmp_smem
+                            + Int32(self.TMP_RK_META)
+                            + rk_p * Int32(4)
+                        )
+                        rlo_p = ld_shared_u32(
+                            tmp_smem
+                            + Int32(self.TMP_RK_RLO)
+                            + rk_p * Int32(4)
+                        )
+                        rhi_p = ld_shared_u32(
+                            tmp_smem
+                            + Int32(self.TMP_RK_RHI)
+                            + rk_p * Int32(4)
+                        )
+                        full_meta = m_p | (Uint32(rt_out) << Uint32(23))
+                        _gw_st_shared_u32(
+                            sched_smem
+                            + Int32(self.OFF_SORTED_META)
+                            + pos_out * Int32(4),
+                            full_meta,
+                        )
+                        ce_out = Int32((m_p >> Uint32(6)) & Uint32(0x7FF))
+                        half_out = Int32((m_p >> Uint32(17)) & Uint32(0x3F))
+                        cnt_out = Int32(m_p >> Uint32(29)) + Int32(1)
+                        packed_meta = (half_out << Int32(22)) | (
+                            ce_out << Int32(8)
+                        )
+                        for k_out in cutlass.range_constexpr(8):
+                            if Int32(k_out) < cnt_out:
+                                word_out = rlo_p if k_out < 4 else rhi_p
+                                sh_out = Uint32((k_out & 3) * 8)
+                                r_byte = Int32(
+                                    (word_out >> sh_out) & Uint32(0xFF)
+                                )
+                                st_shared_i32(
+                                    sched_smem
+                                    + Int32(self.OFF_LIVE_ROUTES)
+                                    + (rt_out + Int32(k_out)) * Int32(4),
+                                    packed_meta | r_byte,
+                                )
 
             cute.arch.sync_threads()
         return d_valid_cta
@@ -2377,7 +2690,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         unit = cta * warps_per_cta + (tid >> Int32(5))
         unit_stride = grid_x * warps_per_cta
         total_units = active_m * groups
-        exp_regs = cute.make_rmem_tensor((self.top_k,), Int32)
+        route_lim_i64 = route_num_experts.to(Int64)
 
         while unit < total_units:
             token = unit // groups
@@ -2387,19 +2700,17 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             last_blk = first_blk + Int32(_ROTATION_BLOCKS_PER_UNIT)
             if last_blk > nblk:
                 last_blk = nblk
-            for j in cutlass.range_constexpr(self.top_k):
-                global_expert = raw_topk_ids[
-                    token * Int32(self.top_k) + Int32(j)
-                ].to(Int32)
-                route_expert = Int32(-1)
-                if (
-                    global_expert >= Int32(0)
-                    and global_expert < route_num_experts
-                ):
-                    route_expert = global_to_combined[global_expert].to(Int32)
-                if route_expert >= total_experts:
-                    route_expert = Int32(-1)
-                exp_regs[j] = route_expert
+            lane_exp = Int32(-1)
+            if lane < Int32(self.top_k):
+                raw_id_i64 = raw_topk_ids[
+                    token * Int32(self.top_k) + lane
+                ].to(Int64)
+                if raw_id_i64 >= Int64(0) and raw_id_i64 < route_lim_i64:
+                    ce_tmp = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(global_to_combined, raw_id_i64)
+                    )
+                    if ce_tmp >= Int32(0) and ce_tmp < total_experts:
+                        lane_exp = ce_tmp
 
             blk = first_blk
             while blk < last_blk:
@@ -2413,7 +2724,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 x0, x1 = f16x2_to_f32x2(xh0)
                 x2, x3 = f16x2_to_f32x2(xh1)
                 for jr in cutlass.range_constexpr(self.top_k):
-                    exp_j = exp_regs[jr]
+                    exp_j = cute.arch.shuffle_sync(lane_exp, Int32(jr))
                     if exp_j >= Int32(0):
                         route = token * Int32(self.top_k) + Int32(jr)
                         s_off = exp_j.to(Int64) * Int64(
@@ -2663,36 +2974,47 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         unit = cta * warps_per_cta + (tid >> Int32(5))
         unit_stride = grid_x * warps_per_cta
         total_units = live_routes * nblk
+        route_lim_i64 = route_num_experts.to(Int64)
 
         while unit < total_units:
             route = unit // nblk
             blk = unit - route * nblk
-            global_expert = raw_topk_ids[route].to(Int32)
-            if global_expert >= Int32(0) and global_expert < route_num_experts:
-                expert = global_to_combined[global_expert].to(Int32)
-                if expert >= Int32(0) and expert < total_experts:
-                    live_nblk = nblk
-                    if cutlass.const_expr(
-                        self.compact_weights and not self.full_compact
-                    ):
-                        live_nblk = (
-                            descriptor_map[
-                                Int64(3) * total_experts.to(Int64)
-                                + expert.to(Int64)
-                            ].to(Int32)
-                            // Int32(128)
-                        )
-                    if blk < live_nblk:
-                        self._activate_one_block(
-                            fc1,
-                            activated,
-                            intermediate_rotations,
-                            route,
-                            expert,
-                            blk,
-                            lane,
-                            elem,
-                        )
+            meta0 = Int32(-1)
+            if lane == Int32(0):
+                raw_id_i64 = raw_topk_ids[route].to(Int64)
+                if raw_id_i64 >= Int64(0) and raw_id_i64 < route_lim_i64:
+                    ce_act = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(global_to_combined, raw_id_i64)
+                    )
+                    if ce_act >= Int32(0) and ce_act < total_experts:
+                        live_nblk = nblk
+                        if cutlass.const_expr(
+                            self.compact_weights and not self.full_compact
+                        ):
+                            live_nblk = (
+                                _gw_ld_global_nc_i32(
+                                    get_ptr_as_int64(
+                                        descriptor_map,
+                                        Int64(3) * total_experts.to(Int64)
+                                        + ce_act.to(Int64),
+                                    )
+                                )
+                                // Int32(128)
+                            )
+                        if blk < live_nblk:
+                            meta0 = ce_act
+            expert = cute.arch.shuffle_sync(meta0, Int32(0))
+            if expert >= Int32(0):
+                self._activate_one_block(
+                    fc1,
+                    activated,
+                    intermediate_rotations,
+                    route,
+                    expert,
+                    blk,
+                    lane,
+                    elem,
+                )
             unit += unit_stride
 
     @cute.jit
@@ -2703,33 +3025,32 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         b_flat: cute.Tensor,
         local_expert: Int32,
         output_n_tile: Int32,
+        half64: Int32,
         weight_offset: Int64,
         live_width: Int32,
         tier_gate_experts: Int32,
     ):
         tile_u32 = 8 * int(bits)
         fc1_half_tiles = Int32(self.gemm_fc1_half_tiles)
+        n16_in_proj = output_n_tile
+        if cutlass.const_expr(is_fc1):
+            if output_n_tile >= fc1_half_tiles:
+                n16_in_proj = output_n_tile - fc1_half_tiles
+        local_n16 = (n16_in_proj * Int32(8) + half64 * Int32(4)).to(Int64)
         b_base_u32 = Int64(0)
         b_stride_u32 = Int64(0)
         if cutlass.const_expr(self.compact_weights):
             if cutlass.const_expr(is_fc1):
                 compact_n16 = Int64(self.intermediate_size // 16)
                 if cutlass.const_expr(not self.full_compact):
-                    compact_n16 = live_width.to(Int64) // Int64(16)
-                local_n16 = (output_n_tile % fc1_half_tiles).to(Int64) * Int64(
-                    8
-                )
+                    compact_n16 = live_width.to(Int64) >> Int64(4)
             else:
                 compact_n16 = Int64(self.hidden_size // 16)
-                local_n16 = output_n_tile.to(Int64) * Int64(8)
             b_base_u32 = weight_offset + local_n16 * Int64(tile_u32)
             b_stride_u32 = compact_n16 * Int64(tile_u32)
         elif cutlass.const_expr(is_fc1):
             half_n16 = self.intermediate_size // 16
             proj = (output_n_tile >= fc1_half_tiles).to(Int64)
-            local_n16 = (
-                output_n_tile - proj.to(Int32) * fc1_half_tiles
-            ).to(Int64) * Int64(8)
             proj_expert_u32 = Int64(
                 (self.hidden_size // 16) * half_n16 * tile_u32
             )
@@ -2745,9 +3066,10 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             expert_u32 = Int64(
                 (self.intermediate_size // 16) * n16 * tile_u32
             )
-            b_base_u32 = local_expert.to(Int64) * expert_u32 + output_n_tile.to(
-                Int64
-            ) * Int64(8 * tile_u32)
+            b_base_u32 = (
+                local_expert.to(Int64) * expert_u32
+                + local_n16 * Int64(tile_u32)
+            )
             b_stride_u32 = Int64(n16 * tile_u32)
         return (
             get_ptr_as_int64(b_flat, b_base_u32),
@@ -2761,10 +3083,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         a_flat: cute.Tensor,
         a_alt_flat: cute.Tensor,
         t0_b_flat: cute.Tensor,
-        t0_global_scale: cute.Tensor,
         t1_b_flat: cute.Tensor,
-        t1_global_scale: cute.Tensor,
-        c_flat: cute.Tensor,
         packed_route_indices: cute.Tensor,
         block_expert_ids: cute.Tensor,
         descriptor_map: cute.Tensor,
@@ -2774,6 +3093,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         b_begin: Int32,
         b_end: Int32,
         base_fc1_t: Int32,
+        full_n128: Int32,
         start_task: Int32,
         task_step: Int32,
         task_limit: Int32,
@@ -2792,13 +3112,12 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         out_kt = Int32(
             self.gemm_fc1_k_tiles if is_fc1 else self.gemm_fc2_k_tiles
         )
+        out_is_n64 = Int32(0)
         out_b_byte = Int64(0)
         out_b_stride = Int64(0)
         out_a_base = Int64(0)
         out_a_valid = Int32(0)
-        out_epi_addr = Int64(0)
-        out_epi_valid = Int32(0)
-        out_scale = cutlass.Float32(0.0)
+        out_epi_meta = Uint32(0)
 
         fc1_half_tiles = Int32(self.gemm_fc1_half_tiles)
         n_tiles = Int32(
@@ -2807,14 +3126,27 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         cand = start_task
         while cand < task_limit:
             next_cand = cand + task_step
+            is_n64 = Int32(0)
+            n128_idx = cand
+            half64 = Int32(0)
+            if cand >= full_n128:
+                tail = cand - full_n128
+                is_n64 = Int32(1)
+                n128_idx = full_n128 + (tail >> Int32(1))
+                half64 = tail & Int32(1)
+
             rb = Int32(0)
+            pos = Int32(0)
             ce = Int32(-1)
+            live_half = fc1_half_tiles
+            rt_begin = Int32(0)
+            live_cnt = Int32(0)
             output_n_tile = Int32(0)
             if mode_groupwise != Int32(0):
                 if cutlass.const_expr(
                     is_fc1 and self.compact_weights and not self.full_compact
                 ):
-                    target = base_fc1_t + cand
+                    target = base_fc1_t + n128_idx
                     lo = b_begin
                     hi = b_end
                     for _ in cutlass.range_constexpr(6):
@@ -2836,39 +3168,49 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         + pos * Int32(4)
                     )
                     local_t = target - pos_base
-                    live_half = ld_shared_i32_relaxed(
+                    meta_u32 = ld_shared_u32(
                         sched_smem
-                        + Int32(self.OFF_SORTED_HALF_TILES)
+                        + Int32(self.OFF_SORTED_META)
                         + pos * Int32(4)
                     )
+                    rb = Int32(meta_u32 & Uint32(0x3F))
+                    ce = Int32((meta_u32 >> Uint32(6)) & Uint32(0x7FF))
+                    live_half = Int32((meta_u32 >> Uint32(17)) & Uint32(0x3F))
+                    rt_begin = Int32((meta_u32 >> Uint32(23)) & Uint32(0x3F))
+                    live_cnt = Int32(meta_u32 >> Uint32(29)) + Int32(1)
                     output_n_tile = local_t
                     if local_t >= live_half:
                         output_n_tile = fc1_half_tiles + (local_t - live_half)
-                    rb = ld_shared_i32_relaxed(
-                        sched_smem + Int32(self.OFF_SORTED_RB) + pos * Int32(4)
-                    )
-                    ce = ld_shared_i32_relaxed(
-                        sched_smem
-                        + Int32(self.OFF_SORTED_EXPERT)
-                        + pos * Int32(4)
-                    )
                 else:
-                    local_b = cand // n_tiles
-                    output_n_tile = cand - local_b * n_tiles
+                    local_b = n128_idx // n_tiles
+                    output_n_tile = n128_idx - local_b * n_tiles
                     pos = b_begin + local_b
-                    rb = ld_shared_i32_relaxed(
-                        sched_smem + Int32(self.OFF_SORTED_RB) + pos * Int32(4)
-                    )
-                    ce = ld_shared_i32_relaxed(
+                    meta_u32 = ld_shared_u32(
                         sched_smem
-                        + Int32(self.OFF_SORTED_EXPERT)
+                        + Int32(self.OFF_SORTED_META)
                         + pos * Int32(4)
                     )
+                    rb = Int32(meta_u32 & Uint32(0x3F))
+                    ce = Int32((meta_u32 >> Uint32(6)) & Uint32(0x7FF))
+                    live_half = Int32((meta_u32 >> Uint32(17)) & Uint32(0x3F))
+                    rt_begin = Int32((meta_u32 >> Uint32(23)) & Uint32(0x3F))
+                    live_cnt = Int32(meta_u32 >> Uint32(29)) + Int32(1)
             else:
                 if cutlass.const_expr(self.size_m > 8):
-                    rb = cand // n_tiles
-                    output_n_tile = cand - rb * n_tiles
-                    ce = block_expert_ids[rb].to(Int32)
+                    rb = n128_idx // n_tiles
+                    raw_nt = n128_idx - rb * n_tiles
+                    sh_nt = (
+                        rb
+                        + (rb >> Int32(2))
+                        + (rb >> Int32(3))
+                        + (rb >> Int32(4))
+                    ) % n_tiles
+                    output_n_tile = raw_nt + sh_nt
+                    if output_n_tile >= n_tiles:
+                        output_n_tile = output_n_tile - n_tiles
+                    ce = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(block_expert_ids, rb)
+                    )
 
             if ce >= Int32(0) and ce < total_experts:
                 descriptor_row = Int32(2)
@@ -2878,9 +3220,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         descriptor_row = Int32(1)
                 tot_i64 = total_experts.to(Int64)
                 ce_i64 = ce.to(Int64)
-                descriptor = descriptor_map[
-                    descriptor_row.to(Int64) * tot_i64 + ce_i64
-                ].to(Int32)
+                descriptor = _gw_ld_global_nc_i32(
+                    get_ptr_as_int64(
+                        descriptor_map, descriptor_row.to(Int64) * tot_i64 + ce_i64
+                    )
+                )
                 live_width = Int32(self.intermediate_size)
                 weight_offset = Int64(0)
                 cand_kt = Int32(
@@ -2888,22 +3232,31 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 )
                 if cutlass.const_expr(self.compact_weights):
                     if cutlass.const_expr(not self.full_compact):
-                        live_width = descriptor_map[
-                            Int64(3) * tot_i64 + ce_i64
-                        ].to(Int32)
+                        if mode_groupwise != Int32(0):
+                            live_width = live_half << Int32(7)
+                        else:
+                            live_width = _gw_ld_global_nc_i32(
+                                get_ptr_as_int64(
+                                    descriptor_map, Int64(3) * tot_i64 + ce_i64
+                                )
+                            )
                         if cutlass.const_expr(is_fc1):
-                            if (output_n_tile % fc1_half_tiles) >= (
-                                live_width // Int32(128)
-                            ):
+                            proj_nt = output_n_tile
+                            if proj_nt >= fc1_half_tiles:
+                                proj_nt = proj_nt - fc1_half_tiles
+                            if proj_nt >= (live_width >> Int32(7)):
                                 descriptor = Int32(-1)
                         else:
-                            cand_kt = live_width // Int32(64)
+                            cand_kt = live_width >> Int32(6)
                             if cand_kt < Int32(2):
                                 descriptor = Int32(-1)
-                    weight_offset = descriptor_map[
-                        (descriptor_row.to(Int64) + Int64(4)) * tot_i64
-                        + ce_i64
-                    ].to(Int64)
+                    weight_offset = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(
+                            descriptor_map,
+                            (descriptor_row.to(Int64) + Int64(4)) * tot_i64
+                            + ce_i64,
+                        )
+                    ).to(Int64)
 
                 if descriptor >= Int32(0) and cand_kt >= Int32(2):
                     cand_tier = descriptor >> Int32(self.descriptor_bits)
@@ -2931,10 +3284,8 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         out_task = cand
                         out_tier = cand_tier
                         out_kt = cand_kt
+                        out_is_n64 = is_n64
                         if cand_tier == Int32(0):
-                            out_scale = t0_global_scale[local_expert].to(
-                                cutlass.Float32
-                            )
                             out_b_byte, out_b_stride = (
                                 self._compute_tier_b_addr_and_stride(
                                     is_fc1,
@@ -2942,15 +3293,13 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                                     t0_b_flat,
                                     local_expert,
                                     output_n_tile,
+                                    half64,
                                     weight_offset,
                                     live_width,
                                     tier0_gate_experts,
                                 )
                             )
                         else:
-                            out_scale = t1_global_scale[local_expert].to(
-                                cutlass.Float32
-                            )
                             out_b_byte, out_b_stride = (
                                 self._compute_tier_b_addr_and_stride(
                                     is_fc1,
@@ -2958,6 +3307,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                                     t1_b_flat,
                                     local_expert,
                                     output_n_tile,
+                                    half64,
                                     weight_offset,
                                     live_width,
                                     tier1_gate_experts,
@@ -2966,18 +3316,30 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
 
                         a_row = (sub_tid >> Int32(3)) & Int32(7)
                         a_col_int4 = sub_tid & Int32(7)
-                        a_route = packed_route_indices[
-                            rb * Int32(8) + a_row
-                        ].to(Int32)
-                        if (
-                            sub_tid < Int32(64)
-                            and a_route >= Int32(0)
-                            and a_route < live_routes
-                        ):
-                            out_a_valid = Int32(1)
-                        safe_a_route = a_route
-                        if out_a_valid == Int32(0):
-                            safe_a_route = Int32(0)
+                        safe_a_route = Int32(0)
+                        if mode_groupwise != Int32(0):
+                            if sub_tid < Int32(64) and a_row < live_cnt:
+                                out_a_valid = Int32(1)
+                                safe_a_route = ld_shared_i32_relaxed(
+                                    sched_smem
+                                    + Int32(self.OFF_LIVE_ROUTES)
+                                    + (rt_begin + a_row) * Int32(4)
+                                ) & Int32(0xFF)
+                        else:
+                            if cutlass.const_expr(self.size_m > 8):
+                                if sub_tid < Int32(64):
+                                    a_route = _gw_ld_global_nc_i32(
+                                        get_ptr_as_int64(
+                                            packed_route_indices,
+                                            rb * Int32(8) + a_row,
+                                        )
+                                    )
+                                    if (
+                                        a_route >= Int32(0)
+                                        and a_route < live_routes
+                                    ):
+                                        out_a_valid = Int32(1)
+                                        safe_a_route = a_route
                         if cutlass.const_expr(is_fc1):
                             a_off = safe_a_route.to(Int64) * Int64(
                                 self.hidden_size
@@ -2991,24 +3353,15 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                             ) + Int64(a_col_int4 * 8)
                             out_a_base = get_ptr_as_int64(a_flat, a_off)
 
-                        epi_row = sub_tid >> Int32(4)
-                        epi_col_int4 = sub_tid & Int32(15)
-                        epi_route = packed_route_indices[
-                            rb * Int32(8) + epi_row
-                        ].to(Int32)
-                        if epi_route >= Int32(0) and epi_route < live_routes:
-                            out_epi_valid = Int32(1)
-                        safe_epi_route = epi_route
-                        if out_epi_valid == Int32(0):
-                            safe_epi_route = Int32(0)
-                        c_cols = (
-                            self.driver.fc1_cols if is_fc1 else self.hidden_size
+                        rb_or_pos = pos
+                        if mode_groupwise == Int32(0):
+                            rb_or_pos = rb
+                        n16_col = output_n_tile * Int32(8) + half64 * Int32(4)
+                        out_epi_meta = (
+                            (Uint32(local_expert) << Uint32(22))
+                            | (Uint32(n16_col) << Uint32(12))
+                            | Uint32(rb_or_pos)
                         )
-                        c_off = safe_epi_route.to(Int64) * Int64(c_cols) + (
-                            output_n_tile.to(Int64) * Int64(16)
-                            + epi_col_int4.to(Int64)
-                        ) * Int64(8)
-                        out_epi_addr = get_ptr_as_int64(c_flat, c_off)
 
             cand = next_cand
 
@@ -3017,14 +3370,208 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             out_task,
             out_tier,
             out_kt,
+            out_is_n64,
             out_b_byte,
             out_b_stride,
             out_a_base,
             out_a_valid,
-            out_epi_addr,
-            out_epi_valid,
-            out_scale,
+            out_epi_meta,
         )
+
+    @cute.jit
+    def _stage_sub_a_only(
+        self,
+        worker_smem_base: Int32,
+        sub_tid: Int32,
+        dst_pipe: Int32,
+        k_step: Int32,
+        a_base_addr: Int64,
+        a_valid: Int32,
+    ):
+        if sub_tid < Int32(64):
+            a_row = sub_tid >> Int32(3)
+            a_col = sub_tid & Int32(7)
+            a_swz = (a_row << Int32(3)) + (a_col ^ a_row)
+            a_dst = (
+                worker_smem_base
+                + Int32(self.sub_sh_a_off)
+                + dst_pipe * Int32(self.SUB_A_STAGE_BYTES)
+                + a_swz * Int32(16)
+            )
+            _gw_cp_async4_zfill_shared_global(
+                a_dst,
+                a_base_addr + k_step.to(Int64) * Int64(128),
+                a_valid,
+            )
+
+    @cute.jit
+    def _stage_sub_b_only_bits(
+        self,
+        worker_smem_base: Int32,
+        sub_tid: Int32,
+        dst_pipe: Int32,
+        k_step: Int32,
+        b_byte_addr: Int64,
+        b_k16_byte_stride: Int64,
+        is_n64: Int32,
+        b_l2_policy: Uint64,
+        bits: cutlass.Constexpr[int],
+    ):
+        b_stage_dst = (
+            worker_smem_base
+            + Int32(self.sub_sh_b_off)
+            + dst_pipe * Int32(self.sub_b_stage_bytes)
+        )
+        b_dst_tid = cute.arch.shuffle_sync(
+            b_stage_dst + sub_tid * Int32(16), sub_tid & Int32(31)
+        )
+        b_row_base = b_byte_addr + (k_step.to(Int64) << Int64(2)) * b_k16_byte_stride
+        if is_n64 == Int32(0):
+            if cutlass.const_expr(int(bits) == 4):
+                kt0 = sub_tid >> Int32(6)
+                in0 = (sub_tid & Int32(63)).to(Int64) * Int64(16)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base + kt0.to(Int64) * b_k16_byte_stride + in0,
+                    b_l2_policy,
+                    0,
+                )
+                kt1 = kt0 + Int32(2)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base + kt1.to(Int64) * b_k16_byte_stride + in0,
+                    b_l2_policy,
+                    2048,
+                )
+            elif cutlass.const_expr(int(bits) == 5):
+                kt0 = (sub_tid >= Int32(80)).to(Int32)
+                in0 = sub_tid - kt0 * Int32(80)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt0.to(Int64) * b_k16_byte_stride
+                    + in0.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    0,
+                )
+                c1 = sub_tid + Int32(128)
+                kt1 = (
+                    Int32(1)
+                    + (sub_tid >= Int32(32)).to(Int32)
+                    + (sub_tid >= Int32(112)).to(Int32)
+                )
+                in1 = c1 - kt1 * Int32(80)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt1.to(Int64) * b_k16_byte_stride
+                    + in1.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    2048,
+                )
+                in2 = sub_tid + Int32(16)
+                _gw_cp_async4_shared_global_pred_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + Int64(3) * b_k16_byte_stride
+                    + in2.to(Int64) * Int64(16),
+                    (sub_tid < Int32(64)).to(Int32),
+                    b_l2_policy,
+                    4096,
+                )
+            else:
+                kt0 = (sub_tid >= Int32(96)).to(Int32)
+                in0 = sub_tid - kt0 * Int32(96)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt0.to(Int64) * b_k16_byte_stride
+                    + in0.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    0,
+                )
+                c1 = sub_tid + Int32(128)
+                kt1 = Int32(1) + (sub_tid >= Int32(64)).to(Int32)
+                in1 = c1 - kt1 * Int32(96)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt1.to(Int64) * b_k16_byte_stride
+                    + in1.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    2048,
+                )
+                c2 = sub_tid + Int32(256)
+                kt2 = Int32(2) + (sub_tid >= Int32(32)).to(Int32)
+                in2 = c2 - kt2 * Int32(96)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt2.to(Int64) * b_k16_byte_stride
+                    + in2.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    4096,
+                )
+        else:
+            if cutlass.const_expr(int(bits) == 4):
+                kt0 = sub_tid >> Int32(5)
+                in0 = (sub_tid & Int32(31)).to(Int64) * Int64(16)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base + kt0.to(Int64) * b_k16_byte_stride + in0,
+                    b_l2_policy,
+                    0,
+                )
+            elif cutlass.const_expr(int(bits) == 5):
+                kt0 = (
+                    (sub_tid >= Int32(40)).to(Int32)
+                    + (sub_tid >= Int32(80)).to(Int32)
+                    + (sub_tid >= Int32(120)).to(Int32)
+                )
+                in0 = sub_tid - kt0 * Int32(40)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt0.to(Int64) * b_k16_byte_stride
+                    + in0.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    0,
+                )
+                in1 = sub_tid + Int32(8)
+                _gw_cp_async4_shared_global_pred_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + Int64(3) * b_k16_byte_stride
+                    + in1.to(Int64) * Int64(16),
+                    (sub_tid < Int32(32)).to(Int32),
+                    b_l2_policy,
+                    2048,
+                )
+            else:
+                kt0 = (sub_tid >= Int32(48)).to(Int32) + (
+                    sub_tid >= Int32(96)
+                ).to(Int32)
+                in0 = sub_tid - kt0 * Int32(48)
+                _gw_cp_async4_shared_global_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt0.to(Int64) * b_k16_byte_stride
+                    + in0.to(Int64) * Int64(16),
+                    b_l2_policy,
+                    0,
+                )
+                c1 = sub_tid + Int32(128)
+                kt1 = Int32(2) + (sub_tid >= Int32(16)).to(Int32)
+                in1 = c1 - kt1 * Int32(48)
+                _gw_cp_async4_shared_global_pred_l2hint_off(
+                    b_dst_tid,
+                    b_row_base
+                    + kt1.to(Int64) * b_k16_byte_stride
+                    + in1.to(Int64) * Int64(16),
+                    (sub_tid < Int32(64)).to(Int32),
+                    b_l2_policy,
+                    2048,
+                )
 
     @cute.jit
     def _stage_sub_k_tile_bits(
@@ -3037,57 +3584,29 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         b_k16_byte_stride: Int64,
         a_base_addr: Int64,
         a_valid: Int32,
+        is_n64: Int32,
         b_l2_policy: Uint64,
         bits: cutlass.Constexpr[int],
     ):
-        a_row = sub_tid >> Int32(3)
-        a_col = sub_tid & Int32(7)
-        a_swz = (a_row << Int32(3)) + (a_col ^ a_row)
-        a_dst = (
-            worker_smem_base
-            + Int32(self.sub_sh_a_off)
-            + dst_pipe * Int32(self.SUB_A_STAGE_BYTES)
-            + a_swz * Int32(16)
+        self._stage_sub_a_only(
+            worker_smem_base,
+            sub_tid,
+            dst_pipe,
+            k_step,
+            a_base_addr,
+            a_valid,
         )
-        if sub_tid < Int32(64):
-            cp_async4_shared_global_pred(
-                a_dst,
-                a_base_addr + k_step.to(Int64) * Int64(128),
-                a_valid,
-            )
-
-        chunks_per_kt = 8 * (2 * int(bits))
-        total_chunks = 4 * chunks_per_kt
-        iters = (total_chunks + 127) // 128
-        b_stage_dst = (
-            worker_smem_base
-            + Int32(self.sub_sh_b_off)
-            + dst_pipe * Int32(self.sub_b_stage_bytes)
+        self._stage_sub_b_only_bits(
+            worker_smem_base,
+            sub_tid,
+            dst_pipe,
+            k_step,
+            b_byte_addr,
+            b_k16_byte_stride,
+            is_n64,
+            b_l2_policy,
+            bits,
         )
-        k16_base = k_step.to(Int64) * Int64(4)
-        for i in cutlass.range_constexpr(iters):
-            chunk = sub_tid + Int32(i * 128)
-            if cutlass.const_expr(int(bits) == 4):
-                kt_off = chunk >> Int32(6)
-                in_kt = chunk & Int32(63)
-            else:
-                kt_off = chunk // Int32(chunks_per_kt)
-                in_kt = chunk - kt_off * Int32(chunks_per_kt)
-            b_dst = b_stage_dst + chunk * Int32(16)
-            b_src = (
-                b_byte_addr
-                + (k16_base + kt_off.to(Int64)) * b_k16_byte_stride
-                + in_kt.to(Int64) * Int64(16)
-            )
-            if cutlass.const_expr((i + 1) * 128 <= total_chunks):
-                _gw_cp_async4_shared_global_l2hint(b_dst, b_src, b_l2_policy)
-            else:
-                cp_async4_shared_global_pred_l2hint(
-                    b_dst,
-                    b_src,
-                    (chunk < Int32(total_chunks)).to(Int32),
-                    b_l2_policy,
-                )
 
     @cute.jit
     def _load_sub_a_regs(
@@ -3125,36 +3644,56 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         i2: Int32,
         s2: Int32,
         delta: Int32,
+        cur_is_n64: Int32,
         pipe: Int32,
         kk: cutlass.Constexpr[int],
         bits: cutlass.Constexpr[int],
     ):
         tile_u32 = 8 * int(bits)
         kt_local = (warp_row << Int32(1)) + Int32(int(kk))
-        base_u32 = ((kt_local << Int32(3)) + (w_n << Int32(2))) * Int32(
-            tile_u32
-        )
+        n_log = Int32(1) - cur_is_n64
+        base_u32 = (
+            (kt_local << (Int32(2) + n_log)) + (w_n << (Int32(1) + n_log))
+        ) * Int32(tile_u32)
         b_region = (
             worker_smem_base
             + Int32(self.sub_sh_b_off)
             + pipe * Int32(self.sub_b_stage_bytes)
         )
         if cutlass.const_expr(int(bits) == 4):
-            for jj in cutlass.range_constexpr(4):
-                tbase = base_u32 + Int32(jj * tile_u32)
-                b = ld_shared_u32(b_region + (tbase + lane) * Int32(4))
-                a = cute.arch.shuffle_sync(b, prev_lane)
-                b_regs[0, jj] = b
-                b_regs[1, jj] = (a << Uint32(16)) | (b >> Uint32(16))
+            for jj0 in cutlass.range_constexpr(2):
+                tbase0 = base_u32 + Int32(jj0 * tile_u32)
+                b0 = ld_shared_u32(b_region + (tbase0 + lane) * Int32(4))
+                a0 = cute.arch.shuffle_sync(b0, prev_lane)
+                b_regs[0, jj0] = b0
+                b_regs[1, jj0] = (a0 << Uint32(16)) | (b0 >> Uint32(16))
+            if cur_is_n64 == Int32(0):
+                for jj1 in cutlass.range_constexpr(2):
+                    jj_hi = 2 + jj1
+                    tbase1 = base_u32 + Int32(jj_hi * tile_u32)
+                    b1 = ld_shared_u32(b_region + (tbase1 + lane) * Int32(4))
+                    a1 = cute.arch.shuffle_sync(b1, prev_lane)
+                    b_regs[0, jj_hi] = b1
+                    b_regs[1, jj_hi] = (a1 << Uint32(16)) | (b1 >> Uint32(16))
         else:
-            for jj in cutlass.range_constexpr(4):
-                tbase = base_u32 + Int32(jj * tile_u32)
-                z0 = ld_shared_u32(b_region + (tbase + i0) * Int32(4))
-                z1 = ld_shared_u32(b_region + (tbase + i1) * Int32(4))
-                z2 = ld_shared_u32(b_region + (tbase + i2) * Int32(4))
+            for jj0 in cutlass.range_constexpr(2):
+                tbase0 = base_u32 + Int32(jj0 * tile_u32)
+                z0 = ld_shared_u32(b_region + (tbase0 + i0) * Int32(4))
+                z1 = ld_shared_u32(b_region + (tbase0 + i1) * Int32(4))
+                z2 = ld_shared_u32(b_region + (tbase0 + i2) * Int32(4))
                 wa, wb = trellis_align_stream_u32x2(z0, z1, z2, s2, delta)
-                b_regs[0, jj] = wa
-                b_regs[1, jj] = wb
+                b_regs[0, jj0] = wa
+                b_regs[1, jj0] = wb
+            if cur_is_n64 == Int32(0):
+                for jj1 in cutlass.range_constexpr(2):
+                    jj_hi = 2 + jj1
+                    tbase1 = base_u32 + Int32(jj_hi * tile_u32)
+                    z0 = ld_shared_u32(b_region + (tbase1 + i0) * Int32(4))
+                    z1 = ld_shared_u32(b_region + (tbase1 + i1) * Int32(4))
+                    z2 = ld_shared_u32(b_region + (tbase1 + i2) * Int32(4))
+                    wa, wb = trellis_align_stream_u32x2(z0, z1, z2, s2, delta)
+                    b_regs[0, jj_hi] = wa
+                    b_regs[1, jj_hi] = wb
 
     @cute.jit
     def _dequant_and_mma_sub_step(
@@ -3162,22 +3701,23 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         acc,
         b_cur: cute.Tensor,
         a_cur: cute.Tensor,
+        cur_is_n64: Int32,
         bits: cutlass.Constexpr[int],
     ):
-        for jj in cutlass.range_constexpr(4):
+        for jj0 in cutlass.range_constexpr(2):
             if cutlass.const_expr(int(bits) == 4):
                 o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
-                    b_cur[0, jj], b_cur[1, jj], 4
+                    b_cur[0, jj0], b_cur[1, jj0], 4
                 )
             else:
                 o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
-                    b_cur[0, jj], b_cur[1, jj], int(bits)
+                    b_cur[0, jj0], b_cur[1, jj0], int(bits)
                 )
             d0, d1, d2, d3 = f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
-                acc[jj * 4 + 0][0],
-                acc[jj * 4 + 1][0],
-                acc[jj * 4 + 2][0],
-                acc[jj * 4 + 3][0],
+                acc[jj0 * 4 + 0][0],
+                acc[jj0 * 4 + 1][0],
+                acc[jj0 * 4 + 2][0],
+                acc[jj0 * 4 + 3][0],
                 o0,
                 o2,
                 o1,
@@ -3185,10 +3725,37 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 a_cur[0],
                 a_cur[1],
             )
-            acc[jj * 4 + 0][0] = d0
-            acc[jj * 4 + 1][0] = d1
-            acc[jj * 4 + 2][0] = d2
-            acc[jj * 4 + 3][0] = d3
+            acc[jj0 * 4 + 0][0] = d0
+            acc[jj0 * 4 + 1][0] = d1
+            acc[jj0 * 4 + 2][0] = d2
+            acc[jj0 * 4 + 3][0] = d3
+        if cur_is_n64 == Int32(0):
+            for jj1 in cutlass.range_constexpr(2):
+                jj_hi = 2 + jj1
+                if cutlass.const_expr(int(bits) == 4):
+                    o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+                        b_cur[0, jj_hi], b_cur[1, jj_hi], 4
+                    )
+                else:
+                    o0, o1, o2, o3 = packed_dequant_trellis_stream_to_half2x4(
+                        b_cur[0, jj_hi], b_cur[1, jj_hi], int(bits)
+                    )
+                d0, d1, d2, d3 = f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
+                    acc[jj_hi * 4 + 0][0],
+                    acc[jj_hi * 4 + 1][0],
+                    acc[jj_hi * 4 + 2][0],
+                    acc[jj_hi * 4 + 3][0],
+                    o0,
+                    o2,
+                    o1,
+                    o3,
+                    a_cur[0],
+                    a_cur[1],
+                )
+                acc[jj_hi * 4 + 0][0] = d0
+                acc[jj_hi * 4 + 1][0] = d1
+                acc[jj_hi * 4 + 2][0] = d2
+                acc[jj_hi * 4 + 3][0] = d3
 
     @cute.jit
     def _run_sub_gemm_k_loop(
@@ -3199,6 +3766,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         sub_bar_id: Int32,
         base_pipe: Int32,
         cur_kt: Int32,
+        cur_is_n64: Int32,
         cur_b_byte: Int64,
         cur_b_stride: Int64,
         cur_a_base: Int64,
@@ -3206,6 +3774,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         next_valid: Int32,
         next_tier: Int32,
         next_kt: Int32,
+        next_is_n64: Int32,
         next_b_byte: Int64,
         next_b_stride: Int64,
         next_a_base: Int64,
@@ -3238,6 +3807,8 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
 
         b_cur = cute.make_rmem_tensor((2, 4), Uint32)
         b_next = cute.make_rmem_tensor((2, 4), Uint32)
+        b_cur.fill(Uint32(0))
+        b_next.fill(Uint32(0))
         a_cur = cute.make_rmem_tensor((2,), Uint32)
         a_next = cute.make_rmem_tensor((2,), Uint32)
 
@@ -3253,6 +3824,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             i2,
             s2,
             delta,
+            cur_is_n64,
             base_pipe,
             0,
             bits,
@@ -3282,6 +3854,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 i2,
                 s2,
                 delta,
+                cur_is_n64,
                 cur_pipe,
                 1,
                 bits,
@@ -3302,6 +3875,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     cur_b_stride,
                     cur_a_base,
                     cur_a_valid,
+                    cur_is_n64,
                     b_l2_policy,
                     bits,
                 )
@@ -3319,6 +3893,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                             next_b_stride,
                             next_a_base,
                             next_a_valid,
+                            next_is_n64,
                             b_l2_policy,
                             self.tier0_bits,
                         )
@@ -3332,6 +3907,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                             next_b_stride,
                             next_a_base,
                             next_a_valid,
+                            next_is_n64,
                             b_l2_policy,
                             self.tier1_bits,
                         )
@@ -3341,7 +3917,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 cute.arch.cp_async_wait_group(2)
                 self._worker_sync(sub_bar_id)
 
-            self._dequant_and_mma_sub_step(acc, b_cur, a_cur, bits)
+            self._dequant_and_mma_sub_step(acc, b_cur, a_cur, cur_is_n64, bits)
             for jj in cutlass.range_constexpr(4):
                 b_cur[0, jj] = b_next[0, jj]
                 b_cur[1, jj] = b_next[1, jj]
@@ -3362,6 +3938,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     i2,
                     s2,
                     delta,
+                    cur_is_n64,
                     next_pipe,
                     0,
                     bits,
@@ -3375,7 +3952,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     0,
                 )
 
-            self._dequant_and_mma_sub_step(acc, b_cur, a_cur, bits)
+            self._dequant_and_mma_sub_step(acc, b_cur, a_cur, cur_is_n64, bits)
             if tile_idx + Int32(1) < cur_kt:
                 for jj2 in cutlass.range_constexpr(4):
                     b_cur[0, jj2] = b_next[0, jj2]
@@ -3399,6 +3976,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                             next_b_stride,
                             next_a_base,
                             next_a_valid,
+                            next_is_n64,
                             b_l2_policy,
                             self.tier0_bits,
                         )
@@ -3412,6 +3990,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                             next_b_stride,
                             next_a_base,
                             next_a_valid,
+                            next_is_n64,
                             b_l2_policy,
                             self.tier1_bits,
                         )
@@ -3420,100 +3999,221 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
     @cute.jit
     def _epilogue_sub_tile(
         self,
+        is_fc1: cutlass.Constexpr[bool],
         acc,
+        t0_global_scale: cute.Tensor,
+        t1_global_scale: cute.Tensor,
+        c_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
         worker_smem_base: Int32,
+        sched_smem: Int32,
         sub_tid: Int32,
         sub_bar_id: Int32,
-        epi_out_addr: Int64,
-        epi_valid: Int32,
-        scale_f32: cutlass.Float32,
+        mode_groupwise: Int32,
+        live_routes: Int32,
+        base_pipe: Int32,
+        cur_kt: Int32,
+        cur_tier: Int32,
+        cur_is_n64: Int32,
+        cur_epi_meta: Uint32,
     ):
-        fold_base = worker_smem_base + Int32(self.sub_sh_fold_off)
-        out_base = worker_smem_base + Int32(self.sub_sh_out_off)
-        if cutlass.const_expr(self.disjoint_fold_out):
-            if sub_tid >= Int32(64):
-                wr_tid = sub_tid - Int32(64)
-                for jjw in cutlass.range_constexpr(4):
-                    st_shared_v4_f32(
-                        fold_base + (Int32(jjw * 64) + wr_tid) * Int32(16),
-                        acc[jjw * 4 + 0][0],
-                        acc[jjw * 4 + 1][0],
-                        acc[jjw * 4 + 2][0],
-                        acc[jjw * 4 + 3][0],
-                    )
-            self._worker_sync(sub_bar_id)
-            if sub_tid < Int32(64):
-                for jjr in cutlass.range_constexpr(4):
-                    r0, r1, r2, r3 = ld_shared_v4_f32(
-                        fold_base + (Int32(jjr * 64) + sub_tid) * Int32(16)
-                    )
-                    acc[jjr * 4 + 0][0] = acc[jjr * 4 + 0][0] + r0
-                    acc[jjr * 4 + 1][0] = acc[jjr * 4 + 1][0] + r1
-                    acc[jjr * 4 + 2][0] = acc[jjr * 4 + 2][0] + r2
-                    acc[jjr * 4 + 3][0] = acc[jjr * 4 + 3][0] + r3
+        epi_base = worker_smem_base + Int32(self.sub_sh_epi_off)
+        slice_stride = 2048 if self.full_fold_epi else 1024
+        free_b_base = Int32(0)
+        if cutlass.const_expr(not self.full_fold_epi):
+            free_b_pipe = (base_pipe + cur_kt + Int32(3)) & Int32(3)
+            free_b_base = (
+                worker_smem_base
+                + Int32(self.sub_sh_b_off)
+                + free_b_pipe * Int32(self.sub_b_stage_bytes)
+            )
+
+        scale_f32 = cutlass.Float32(0.0)
+        if sub_tid < Int32(64):
+            local_expert = Int32(cur_epi_meta >> Uint32(22))
+            if cur_tier == Int32(0):
+                scale_f32 = ld_global_nc_f32(
+                    get_ptr_as_int64(t0_global_scale, local_expert)
+                )
+            else:
+                scale_f32 = ld_global_nc_f32(
+                    get_ptr_as_int64(t1_global_scale, local_expert)
+                )
         else:
-            for half in cutlass.range_constexpr(2):
-                if sub_tid >= Int32(64):
-                    wr_tid = sub_tid - Int32(64)
-                    for jlw in cutlass.range_constexpr(2):
-                        jjhw = 2 * half + jlw
+            wr_tid = sub_tid - Int32(64)
+            wr_w = wr_tid >> Int32(5)
+            wr_lane = wr_tid & Int32(31)
+            wr_slice = epi_base + wr_w * Int32(slice_stride)
+            for jj0 in cutlass.range_constexpr(2):
+                st_shared_v4_f32(
+                    wr_slice + (Int32(jj0 * 32) + wr_lane) * Int32(16),
+                    acc[jj0 * 4 + 0][0],
+                    acc[jj0 * 4 + 1][0],
+                    acc[jj0 * 4 + 2][0],
+                    acc[jj0 * 4 + 3][0],
+                )
+            if cur_is_n64 == Int32(0):
+                for jj1 in cutlass.range_constexpr(2):
+                    jj_hi = 2 + jj1
+                    if cutlass.const_expr(self.full_fold_epi):
                         st_shared_v4_f32(
-                            fold_base + (Int32(jlw * 64) + wr_tid) * Int32(16),
-                            acc[jjhw * 4 + 0][0],
-                            acc[jjhw * 4 + 1][0],
-                            acc[jjhw * 4 + 2][0],
-                            acc[jjhw * 4 + 3][0],
+                            wr_slice
+                            + (Int32(jj_hi * 32) + wr_lane) * Int32(16),
+                            acc[jj_hi * 4 + 0][0],
+                            acc[jj_hi * 4 + 1][0],
+                            acc[jj_hi * 4 + 2][0],
+                            acc[jj_hi * 4 + 3][0],
                         )
-                self._worker_sync(sub_bar_id)
-                if sub_tid < Int32(64):
-                    for jlr in cutlass.range_constexpr(2):
-                        jjhr = 2 * half + jlr
-                        r0, r1, r2, r3 = ld_shared_v4_f32(
-                            fold_base
-                            + (Int32(jlr * 64) + sub_tid) * Int32(16)
+                    else:
+                        b_fold_off = (
+                            Int32(3072 if jj1 == 0 else 4608)
+                            + wr_w * Int32(768)
+                            + wr_lane * Int32(16)
                         )
-                        acc[jjhr * 4 + 0][0] = acc[jjhr * 4 + 0][0] + r0
-                        acc[jjhr * 4 + 1][0] = acc[jjhr * 4 + 1][0] + r1
-                        acc[jjhr * 4 + 2][0] = acc[jjhr * 4 + 2][0] + r2
-                        acc[jjhr * 4 + 3][0] = acc[jjhr * 4 + 3][0] + r3
-                self._worker_sync(sub_bar_id)
+                        st_shared_v4_f32(
+                            free_b_base + b_fold_off,
+                            acc[jj_hi * 4 + 0][0],
+                            acc[jj_hi * 4 + 1][0],
+                            acc[jj_hi * 4 + 2][0],
+                            acc[jj_hi * 4 + 3][0],
+                        )
+
+        self._worker_sync(sub_bar_id)
 
         if sub_tid < Int32(64):
             lane = sub_tid & Int32(31)
             w_n = sub_tid >> Int32(5)
-            c_sh_wr = (
-                Int32(136) * ((lane & Int32(3)) << Int32(1))
-                + (lane >> Int32(2))
-                + (w_n << Int32(6))
+            wn_slice = epi_base + w_n * Int32(slice_stride)
+            for jjr0 in cutlass.range_constexpr(2):
+                r0, r1, r2, r3 = ld_shared_v4_f32(
+                    wn_slice + (Int32(jjr0 * 32) + lane) * Int32(16)
+                )
+                acc[jjr0 * 4 + 0][0] = acc[jjr0 * 4 + 0][0] + r0
+                acc[jjr0 * 4 + 1][0] = acc[jjr0 * 4 + 1][0] + r1
+                acc[jjr0 * 4 + 2][0] = acc[jjr0 * 4 + 2][0] + r2
+                acc[jjr0 * 4 + 3][0] = acc[jjr0 * 4 + 3][0] + r3
+            if cur_is_n64 == Int32(0):
+                for jjr1 in cutlass.range_constexpr(2):
+                    jj_rhi = 2 + jjr1
+                    if cutlass.const_expr(self.full_fold_epi):
+                        r0, r1, r2, r3 = ld_shared_v4_f32(
+                            wn_slice + (Int32(jj_rhi * 32) + lane) * Int32(16)
+                        )
+                    else:
+                        b_rd_off = (
+                            Int32(3072 if jjr1 == 0 else 4608)
+                            + w_n * Int32(768)
+                            + lane * Int32(16)
+                        )
+                        r0, r1, r2, r3 = ld_shared_v4_f32(
+                            free_b_base + b_rd_off
+                        )
+                    acc[jj_rhi * 4 + 0][0] = acc[jj_rhi * 4 + 0][0] + r0
+                    acc[jj_rhi * 4 + 1][0] = acc[jj_rhi * 4 + 1][0] + r1
+                    acc[jj_rhi * 4 + 2][0] = acc[jj_rhi * 4 + 2][0] + r2
+                    acc[jj_rhi * 4 + 3][0] = acc[jj_rhi * 4 + 3][0] + r3
+
+            row0 = (lane & Int32(3)) << Int32(1)
+            row_xor = row0 ^ (w_n << Int32(2))
+            wr_row_base = (
+                wn_slice
+                + (row0 << Int32(7))
+                + ((lane >> Int32(2)) << Int32(1))
             )
-            for jjo in cutlass.range_constexpr(4):
-                wr = c_sh_wr + Int32(16 * jjo)
-                st_shared_f16_from_f32(
-                    out_base + wr * Int32(2),
-                    acc[jjo * 4 + 0][0] * scale_f32,
+            for jjo0 in cutlass.range_constexpr(2):
+                swz0 = Int32(2 * jjo0) ^ row_xor
+                wr0 = wr_row_base + (swz0 << Int32(4))
+                _gw_st_shared_f16_from_f32_off(
+                    wr0, acc[jjo0 * 4 + 0][0] * scale_f32, 0
                 )
-                st_shared_f16_from_f32(
-                    out_base + (wr + Int32(136)) * Int32(2),
-                    acc[jjo * 4 + 1][0] * scale_f32,
+                _gw_st_shared_f16_from_f32_off(
+                    wr0, acc[jjo0 * 4 + 1][0] * scale_f32, 144
                 )
-                st_shared_f16_from_f32(
-                    out_base + (wr + Int32(8)) * Int32(2),
-                    acc[jjo * 4 + 2][0] * scale_f32,
+                _gw_st_shared_f16_from_f32_off(
+                    wr0, acc[jjo0 * 4 + 2][0] * scale_f32, 16
                 )
-                st_shared_f16_from_f32(
-                    out_base + (wr + Int32(144)) * Int32(2),
-                    acc[jjo * 4 + 3][0] * scale_f32,
+                _gw_st_shared_f16_from_f32_off(
+                    wr0, acc[jjo0 * 4 + 3][0] * scale_f32, 128
                 )
+            if cur_is_n64 == Int32(0):
+                for jjo1 in cutlass.range_constexpr(2):
+                    jj_ohi = 2 + jjo1
+                    swz1 = Int32(2 * jj_ohi) ^ row_xor
+                    wr1 = wr_row_base + (swz1 << Int32(4))
+                    _gw_st_shared_f16_from_f32_off(
+                        wr1, acc[jj_ohi * 4 + 0][0] * scale_f32, 0
+                    )
+                    _gw_st_shared_f16_from_f32_off(
+                        wr1, acc[jj_ohi * 4 + 1][0] * scale_f32, 144
+                    )
+                    _gw_st_shared_f16_from_f32_off(
+                        wr1, acc[jj_ohi * 4 + 2][0] * scale_f32, 16
+                    )
+                    _gw_st_shared_f16_from_f32_off(
+                        wr1, acc[jj_ohi * 4 + 3][0] * scale_f32, 128
+                    )
+
+        epi_row = sub_tid >> Int32(4)
+        epi_col_int4 = sub_tid & Int32(15)
+        epi_valid = Int32(0)
+        epi_route = Int32(0)
+        col_ok = Int32(1)
+        if cur_is_n64 != Int32(0):
+            if epi_col_int4 >= Int32(8):
+                col_ok = Int32(0)
+        if col_ok != Int32(0):
+            if mode_groupwise != Int32(0):
+                pos_e = Int32(cur_epi_meta & Uint32(0xFFF))
+                meta_e = ld_shared_u32(
+                    sched_smem + Int32(self.OFF_SORTED_META) + pos_e * Int32(4)
+                )
+                rt_beg_e = Int32((meta_e >> Uint32(23)) & Uint32(0x3F))
+                cnt_e = Int32(meta_e >> Uint32(29)) + Int32(1)
+                if epi_row < cnt_e:
+                    epi_valid = Int32(1)
+                    epi_route = (
+                        ld_shared_i32_relaxed(
+                            sched_smem
+                            + Int32(self.OFF_LIVE_ROUTES)
+                            + (rt_beg_e + epi_row) * Int32(4)
+                        )
+                        & Int32(0xFF)
+                    )
+            else:
+                if cutlass.const_expr(self.size_m > 8):
+                    rb_e = Int32(cur_epi_meta & Uint32(0xFFF))
+                    r_e = _gw_ld_global_nc_i32(
+                        get_ptr_as_int64(
+                            packed_route_indices, rb_e * Int32(8) + epi_row
+                        )
+                    )
+                    if r_e >= Int32(0) and r_e < live_routes:
+                        epi_valid = Int32(1)
+                        epi_route = r_e
 
         cute.arch.cp_async_wait_group(2)
         self._worker_sync(sub_bar_id)
 
         if epi_valid != Int32(0):
-            c_sh_rd_bytes = (
-                (sub_tid >> Int32(4)) * Int32(17) + (sub_tid & Int32(15))
-            ) * Int32(16)
-            q0, q1, q2, q3 = ld_shared_v4_u32(out_base + c_sh_rd_bytes)
-            st_global_v4_u32(epi_out_addr, q0, q1, q2, q3)
+            w_sel = epi_col_int4 >> Int32(3)
+            c8 = epi_col_int4 & Int32(7)
+            if cur_is_n64 != Int32(0):
+                w_sel = (epi_col_int4 >> Int32(2)) & Int32(1)
+                c8 = epi_col_int4 & Int32(3)
+            swz_rd_c8 = c8 ^ epi_row ^ (w_sel << Int32(2))
+            rd_addr = (
+                epi_base
+                + w_sel * Int32(slice_stride)
+                + (epi_row << Int32(7))
+                + (swz_rd_c8 << Int32(4))
+            )
+            n16_col = Int32((cur_epi_meta >> Uint32(12)) & Uint32(0x3FF))
+            c_cols = self.driver.fc1_cols if is_fc1 else self.hidden_size
+            c_off = epi_route.to(Int64) * Int64(c_cols) + (
+                n16_col * Int32(2) + epi_col_int4
+            ).to(Int64) * Int64(8)
+            q0, q1, q2, q3 = ld_shared_v4_u32(rd_addr)
+            st_global_v4_u32(get_ptr_as_int64(c_flat, c_off), q0, q1, q2, q3)
 
     @cute.jit
     def _run_sub_gemm_phase(
@@ -3537,7 +4237,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         b_begin: Int32,
         b_end: Int32,
         base_fc1_t: Int32,
-        task_start: Int32,
+        full_n128: Int32,
         task_step: Int32,
         task_limit: Int32,
         live_routes: Int32,
@@ -3548,8 +4248,18 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         tier1_gate_experts: Int32,
         tier0_up_experts: Int32,
         tier1_up_experts: Int32,
+        b_l2_policy: Uint64,
+        cur_valid: Int32,
+        cur_task: Int32,
+        cur_tier: Int32,
+        cur_kt: Int32,
+        cur_is_n64: Int32,
+        cur_b_byte: Int64,
+        cur_b_stride: Int64,
+        cur_a_base: Int64,
+        cur_a_valid: Int32,
+        cur_epi_meta: Uint32,
     ):
-        b_l2_policy = create_l2_evict_first_policy()
         can_have_kt2 = bool(
             (not is_fc1)
             and (
@@ -3557,63 +4267,31 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 or self.gemm_fc2_k_tiles == 2
             )
         )
-        (
-            cur_valid,
-            cur_task,
-            cur_tier,
-            cur_kt,
-            cur_b_byte,
-            cur_b_stride,
-            cur_a_base,
-            cur_a_valid,
-            cur_epi_addr,
-            cur_epi_valid,
-            cur_scale,
-        ) = self._find_next_valid_tile(
-            is_fc1,
-            a_flat,
-            a_alt_flat,
-            t0_b_flat,
-            t0_global_scale,
-            t1_b_flat,
-            t1_global_scale,
-            c_flat,
-            packed_route_indices,
-            block_expert_ids,
-            descriptor_map,
-            sched_smem,
-            sub_tid,
-            mode_groupwise,
-            b_begin,
-            b_end,
-            base_fc1_t,
-            task_start,
-            task_step,
-            task_limit,
-            live_routes,
-            total_experts,
-            tier0_fc2_experts,
-            tier1_fc2_experts,
-            tier0_gate_experts,
-            tier1_gate_experts,
-            tier0_up_experts,
-            tier1_up_experts,
-        )
-
         base_pipe = Int32(0)
         if cur_valid != Int32(0):
-            for p in cutlass.range_constexpr(3):
-                if Int32(p) < cur_kt:
+            self._stage_sub_a_only(
+                worker_smem_base,
+                sub_tid,
+                Int32(0),
+                Int32(0),
+                cur_a_base,
+                cur_a_valid,
+            )
+            cute.arch.cp_async_commit_group()
+            for p_sub in cutlass.range_constexpr(2):
+                p1 = p_sub + 1
+                if Int32(p1) < cur_kt:
                     if cur_tier == Int32(0):
                         self._stage_sub_k_tile_bits(
                             worker_smem_base,
                             sub_tid,
-                            Int32(p),
-                            Int32(p),
+                            Int32(p1),
+                            Int32(p1),
                             cur_b_byte,
                             cur_b_stride,
                             cur_a_base,
                             cur_a_valid,
+                            cur_is_n64,
                             b_l2_policy,
                             self.tier0_bits,
                         )
@@ -3621,12 +4299,13 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         self._stage_sub_k_tile_bits(
                             worker_smem_base,
                             sub_tid,
-                            Int32(p),
-                            Int32(p),
+                            Int32(p1),
+                            Int32(p1),
                             cur_b_byte,
                             cur_b_stride,
                             cur_a_base,
                             cur_a_valid,
+                            cur_is_n64,
                             b_l2_policy,
                             self.tier1_bits,
                         )
@@ -3643,22 +4322,18 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 next_task,
                 next_tier,
                 next_kt,
+                next_is_n64,
                 next_b_byte,
                 next_b_stride,
                 next_a_base,
                 next_a_valid,
-                next_epi_addr,
-                next_epi_valid,
-                next_scale,
+                next_epi_meta,
             ) = self._find_next_valid_tile(
                 is_fc1,
                 a_flat,
                 a_alt_flat,
                 t0_b_flat,
-                t0_global_scale,
                 t1_b_flat,
-                t1_global_scale,
-                c_flat,
                 packed_route_indices,
                 block_expert_ids,
                 descriptor_map,
@@ -3668,6 +4343,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 b_begin,
                 b_end,
                 base_fc1_t,
+                full_n128,
                 cur_task + task_step,
                 task_step,
                 task_limit,
@@ -3689,6 +4365,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     sub_bar_id,
                     base_pipe,
                     cur_kt,
+                    cur_is_n64,
                     cur_b_byte,
                     cur_b_stride,
                     cur_a_base,
@@ -3696,6 +4373,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     next_valid,
                     next_tier,
                     next_kt,
+                    next_is_n64,
                     next_b_byte,
                     next_b_stride,
                     next_a_base,
@@ -3712,6 +4390,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     sub_bar_id,
                     base_pipe,
                     cur_kt,
+                    cur_is_n64,
                     cur_b_byte,
                     cur_b_stride,
                     cur_a_base,
@@ -3719,6 +4398,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     next_valid,
                     next_tier,
                     next_kt,
+                    next_is_n64,
                     next_b_byte,
                     next_b_stride,
                     next_a_base,
@@ -3729,13 +4409,23 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                 )
 
             self._epilogue_sub_tile(
+                is_fc1,
                 acc,
+                t0_global_scale,
+                t1_global_scale,
+                c_flat,
+                packed_route_indices,
                 worker_smem_base,
+                sched_smem,
                 sub_tid,
                 sub_bar_id,
-                cur_epi_addr,
-                cur_epi_valid,
-                cur_scale,
+                mode_groupwise,
+                live_routes,
+                base_pipe,
+                cur_kt,
+                cur_tier,
+                cur_is_n64,
+                cur_epi_meta,
             )
 
             base_pipe = (base_pipe + cur_kt) & Int32(3)
@@ -3743,13 +4433,12 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             cur_task = next_task
             cur_tier = next_tier
             cur_kt = next_kt
+            cur_is_n64 = next_is_n64
             cur_b_byte = next_b_byte
             cur_b_stride = next_b_stride
             cur_a_base = next_a_base
             cur_a_valid = next_a_valid
-            cur_epi_addr = next_epi_addr
-            cur_epi_valid = next_epi_valid
-            cur_scale = next_scale
+            cur_epi_meta = next_epi_meta
 
         cute.arch.cp_async_wait_group(0)
 
@@ -3805,6 +4494,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         tid = Int32(tidx)
         cta = Int32(bidx)
         grid_x = Int32(grid_x_raw)
+        b_l2_policy = create_l2_evict_first_policy()
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -3819,7 +4509,9 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         sched_smem = smem_base + Int32(self.group_smem_off)
         total_experts = tier0_num_experts + tier1_num_experts
         live_routes = active_m * Int32(self.top_k)
-        raw_blocks = packed_route_count[Int32(0)].to(Int32) >> Int32(3)
+        raw_blocks = _gw_ld_global_nc_i32(
+            get_ptr_as_int64(packed_route_count, Int32(0))
+        ) >> Int32(3)
         if raw_blocks < Int32(0):
             raw_blocks = Int32(0)
 
@@ -3855,9 +4547,11 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
         b_begin = Int32(0)
         b_end = Int32(0)
         base_fc1_t = Int32(0)
+        fc1_full_n128 = Int32(0)
         fc1_task_start = wg_task_start
         fc1_task_step = total_workers
         fc1_task_limit = Int32(0)
+        fc2_full_n128 = Int32(0)
         fc2_task_start = wg_task_start
         fc2_task_step = total_workers
         fc2_task_limit = Int32(0)
@@ -3935,17 +4629,106 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                         + Int32(self.OFF_FC1_PREFIX)
                         + b_end * Int32(4)
                     )
-                    fc1_task_limit = end_fc1_t - base_fc1_t
+                    fc1_raw_n128 = end_fc1_t - base_fc1_t
                 else:
-                    fc1_task_limit = (b_end - b_begin) * Int32(
+                    fc1_raw_n128 = (b_end - b_begin) * Int32(
                         self.gemm_fc1_n_tiles
                     )
+                q1_w = fc1_raw_n128 // workers_per_group
+                r1_w = fc1_raw_n128 - q1_w * workers_per_group
+                fc1_full_n128 = fc1_raw_n128
+                fc1_task_limit = fc1_raw_n128
+                if r1_w > Int32(0) and r1_w * Int32(2) <= workers_per_group:
+                    fc1_full_n128 = q1_w * workers_per_group
+                    fc1_task_limit = fc1_full_n128 + r1_w * Int32(2)
+
                 fc2_task_start = sched_worker
                 fc2_task_step = workers_per_group
-                fc2_task_limit = (b_end - b_begin) * Int32(
+                fc2_raw_n128 = (b_end - b_begin) * Int32(
                     self.gemm_fc2_n_tiles
                 )
+                q2_w = fc2_raw_n128 // workers_per_group
+                r2_w = fc2_raw_n128 - q2_w * workers_per_group
+                fc2_full_n128 = fc2_raw_n128
+                fc2_task_limit = fc2_raw_n128
+                if r2_w > Int32(0) and r2_w * Int32(2) <= workers_per_group:
+                    fc2_full_n128 = q2_w * workers_per_group
+                    fc2_task_limit = fc2_full_n128 + r2_w * Int32(2)
+        else:
+            if cutlass.const_expr(self.size_m > 8):
+                fc1_full_n128 = raw_blocks * Int32(self.gemm_fc1_n_tiles)
+                fc1_task_limit = fc1_full_n128
+                fc2_full_n128 = raw_blocks * Int32(self.gemm_fc2_n_tiles)
+                fc2_task_limit = fc2_full_n128
 
+        (
+            fc1_cur_valid,
+            fc1_cur_task,
+            fc1_cur_tier,
+            fc1_cur_kt,
+            fc1_cur_is_n64,
+            fc1_cur_b_byte,
+            fc1_cur_b_stride,
+            fc1_cur_a_base,
+            fc1_cur_a_valid,
+            fc1_cur_epi_meta,
+        ) = self._find_next_valid_tile(
+            True,
+            rotation_gate,
+            rotation_up,
+            t0_w13,
+            t1_w13,
+            packed_route_indices,
+            block_expert_ids,
+            descriptor_map,
+            sched_smem,
+            sub_tid,
+            mode_groupwise,
+            b_begin,
+            b_end,
+            base_fc1_t,
+            fc1_full_n128,
+            fc1_task_start,
+            fc1_task_step,
+            fc1_task_limit,
+            live_routes,
+            total_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
+        )
+        if fc1_cur_valid != Int32(0):
+            if fc1_cur_tier == Int32(0):
+                self._stage_sub_b_only_bits(
+                    worker_smem_base,
+                    sub_tid,
+                    Int32(0),
+                    Int32(0),
+                    fc1_cur_b_byte,
+                    fc1_cur_b_stride,
+                    fc1_cur_is_n64,
+                    b_l2_policy,
+                    self.tier0_bits,
+                )
+            else:
+                self._stage_sub_b_only_bits(
+                    worker_smem_base,
+                    sub_tid,
+                    Int32(0),
+                    Int32(0),
+                    fc1_cur_b_byte,
+                    fc1_cur_b_stride,
+                    fc1_cur_is_n64,
+                    b_l2_policy,
+                    self.tier1_bits,
+                )
+            cute.arch.cp_async_commit_group()
+
+        if mode_groupwise != Int32(0):
+            if d_valid > Int32(0):
                 self._run_group_input_rotation(
                     rotation_input,
                     rotation_gate,
@@ -3984,8 +4767,6 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
                     active_m,
                 )
                 self.driver._grid_barrier(workspace, tid, grid_x)
-                fc1_task_limit = raw_blocks * Int32(self.gemm_fc1_n_tiles)
-                fc2_task_limit = raw_blocks * Int32(self.gemm_fc2_n_tiles)
 
         self._run_sub_gemm_phase(
             True,
@@ -4007,7 +4788,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             b_begin,
             b_end,
             base_fc1_t,
-            fc1_task_start,
+            fc1_full_n128,
             fc1_task_step,
             fc1_task_limit,
             live_routes,
@@ -4018,7 +4799,84 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             tier1_gate_experts,
             tier0_up_experts,
             tier1_up_experts,
+            b_l2_policy,
+            fc1_cur_valid,
+            fc1_cur_task,
+            fc1_cur_tier,
+            fc1_cur_kt,
+            fc1_cur_is_n64,
+            fc1_cur_b_byte,
+            fc1_cur_b_stride,
+            fc1_cur_a_base,
+            fc1_cur_a_valid,
+            fc1_cur_epi_meta,
         )
+
+        (
+            fc2_cur_valid,
+            fc2_cur_task,
+            fc2_cur_tier,
+            fc2_cur_kt,
+            fc2_cur_is_n64,
+            fc2_cur_b_byte,
+            fc2_cur_b_stride,
+            fc2_cur_a_base,
+            fc2_cur_a_valid,
+            fc2_cur_epi_meta,
+        ) = self._find_next_valid_tile(
+            False,
+            activated,
+            activated,
+            t0_w2,
+            t1_w2,
+            packed_route_indices,
+            block_expert_ids,
+            descriptor_map,
+            sched_smem,
+            sub_tid,
+            mode_groupwise,
+            b_begin,
+            b_end,
+            Int32(0),
+            fc2_full_n128,
+            fc2_task_start,
+            fc2_task_step,
+            fc2_task_limit,
+            live_routes,
+            total_experts,
+            tier0_fc2_experts,
+            tier1_fc2_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
+        )
+        if fc2_cur_valid != Int32(0):
+            if fc2_cur_tier == Int32(0):
+                self._stage_sub_b_only_bits(
+                    worker_smem_base,
+                    sub_tid,
+                    Int32(0),
+                    Int32(0),
+                    fc2_cur_b_byte,
+                    fc2_cur_b_stride,
+                    fc2_cur_is_n64,
+                    b_l2_policy,
+                    self.tier0_bits,
+                )
+            else:
+                self._stage_sub_b_only_bits(
+                    worker_smem_base,
+                    sub_tid,
+                    Int32(0),
+                    Int32(0),
+                    fc2_cur_b_byte,
+                    fc2_cur_b_stride,
+                    fc2_cur_is_n64,
+                    b_l2_policy,
+                    self.tier1_bits,
+                )
+            cute.arch.cp_async_commit_group()
 
         if mode_groupwise != Int32(0):
             if d_valid > Int32(0):
@@ -4087,7 +4945,7 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             b_begin,
             b_end,
             Int32(0),
-            fc2_task_start,
+            fc2_full_n128,
             fc2_task_step,
             fc2_task_limit,
             live_routes,
@@ -4098,6 +4956,17 @@ class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
             tier1_gate_experts,
             tier0_up_experts,
             tier1_up_experts,
+            b_l2_policy,
+            fc2_cur_valid,
+            fc2_cur_task,
+            fc2_cur_tier,
+            fc2_cur_kt,
+            fc2_cur_is_n64,
+            fc2_cur_b_byte,
+            fc2_cur_b_stride,
+            fc2_cur_a_base,
+            fc2_cur_a_valid,
+            fc2_cur_epi_meta,
         )
 
 
