@@ -1,5 +1,12 @@
 # Changes
 
+- SM120 native trellis body: prototype a 128x128 prefill tile for selected
+  BF16-ingress K6/K8 MCG projections. Preserve packed operands, H128 stages,
+  the ordered K128/K1024 accumulation and the launch ABI. Across selected
+  shapes, measured body time drops 10.1%/10.8% at 2752 rows (K6/K8) and
+  6.9%/7.3% at 4096, with 140 bitwise route and prefix checks. Existing
+  adjacent-band cliffs still need qualification; see tpurtell/cuteafd#2528.
+
 - DeepSeek V4 Flash on SM121: accelerate the ordered native MXFP4 m4096
   expert wave for the N=256, 288 and 320 Spark shards with a single-CTA route
   planner and expert-stationary 128-route FC1/FC2 tiles. Preserve the packed

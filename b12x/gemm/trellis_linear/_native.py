@@ -1005,6 +1005,16 @@ class NativeTrellisLinear:
         self.splits = g["splits"]
         self.decode_cta_warps = 2
         self.prefill_stages = _K8_PREFILL_STAGES if self.bits == 8 else _PREFILL_STAGES
+        # Keep the first body route confined to measured, wide projections.
+        self.prefill_128_body = (self.bits in (6, 8) and self.input_bf16
+                                 and g["codebook"] == "mcg"
+                                 and (self.k, self.n, g["sharded_side"]) in {
+                                     (16384, 4096, 1), (8192, 4096, 2),
+                                     (4096, 12288, 1), (4096, 6144, 1),
+                                     (12288, 4096, 1), (6144, 4096, 2),
+                                     (16384, 6144, 1), (8192, 6144, 2),
+                                     (12288, 7168, 1),
+                                 })
         self.ws_b_stage_bytes = 4096 if self.e4m3 else 8192
         self.ws_stage_bytes = _WS_A_STAGE_BYTES + self.ws_b_stage_bytes
         self.ws_bar_off = _WS_STAGES * self.ws_stage_bytes
@@ -1059,7 +1069,7 @@ class NativeTrellisLinear:
         }
         return cute.struct(Storage)
 
-    def _k8_prefill_128_storage(self):
+    def _prefill_128_storage(self):
         stage_bytes = _WS_A_STAGE_BYTES + 8192
         total_bytes = 2 * stage_bytes + 128 + (65536 if self.splits > 1 else 0)
         class Storage:
@@ -1097,13 +1107,14 @@ class NativeTrellisLinear:
             if cutlass.const_expr(self.max_rows >= _PREFILL_MIN_ROWS):
                 if rows >= Int32(_PREFILL_MIN_ROWS):
                     if cutlass.const_expr(
-                        self.bits == 8
-                        and not self.e4m3
-                        and (self.compact_head_shard or self.k * self.n * self.bits > 256 * 1024 * 1024 * 8)
-                        and self.n % 128 == 0
+                        self.prefill_128_body or (
+                            self.bits == 8 and not self.e4m3
+                            and (self.compact_head_shard or self.k * self.n * self.bits > 256 * 1024 * 1024 * 8)
+                            and self.n % 128 == 0
+                        )
                     ):
                         prefill_tiles_128 = ((rows + Int32(127)) // Int32(128)) * Int32(self.n // 128)
-                        self.multiply_prefill_k8_128(inputs, payload, scales, output, rows, rotation_id).launch(
+                        self.multiply_prefill_128(inputs, payload, scales, output, rows, rotation_id).launch(
                             grid=(min(prefill_tiles_128, max(Int32(1), cta_limit // Int32(4))), 1, 1),
                             block=(_WS_CONSUMER_THREADS + _WS_PRODUCER_THREADS, 1, 1),
                             min_blocks_per_mp=1, stream=stream)
@@ -4054,7 +4065,14 @@ class NativeTrellisLinear:
         return stage_cnt
 
     @cute.jit
-    def _prefill_produce_tile_k8_128(
+    def _prefill_128_words(self, ptr: Int64, offset: cutlass.Constexpr):
+        if cutlass.const_expr(self.bits == 6):
+            # A K6 lane can start on an odd word; vector loads need alignment.
+            return _ld_global_nc_u32_offset(ptr, offset), _ld_global_nc_u32_offset(ptr, offset + 4)
+        return _ld_global_nc_v2_u32_offset(ptr, offset)
+
+    @cute.jit
+    def _prefill_produce_tile_128(
         self,
         m_block: Int32,
         nb: Int32,
@@ -4077,13 +4095,18 @@ class NativeTrellisLinear:
         sz1 = ((m_row0 + Int32(32)) < rows).to(Int32) * Int32(16)
         sz2 = ((m_row0 + Int32(64)) < rows).to(Int32) * Int32(16)
         sz3 = ((m_row0 + Int32(96)) < rows).to(Int32) * Int32(16)
-        kb_byte_stride = Int64((self.n // 2 if self.input_units else 64) * 256)
+        tile_bytes = 32 * self.bits
+        kb_byte_stride = Int64((self.n // 2 if self.input_units else 64) * tile_bytes)
         base_unit_tile = (
             nb * Int32(64)
             if cutlass.const_expr(self.input_units)
             else nb * Int32(self.k // 16 * 8)
         )
-        p0 = payload_ptr + (base_unit_tile + pw * Int32(2)).to(Int64) * Int64(256) + lane.to(Int64) * Int64(8)
+        lane_byte = lane * Int32(8)
+        if cutlass.const_expr(self.bits == 6):
+            lane_byte = ((lane >> Int32(1)) * Int32(3) + (lane & Int32(1))) * Int32(4)
+        shift = ((lane & Int32(1)) ^ Int32(1)) << Int32(4)
+        p0 = payload_ptr + (base_unit_tile + pw * Int32(2)).to(Int64) * Int64(tile_bytes) + lane_byte.to(Int64)
         prev_lane = (lane + Int32(31)) & Int32(31)
         raw_u0 = cute.make_rmem_tensor(4, Uint32)
         raw_u1 = cute.make_rmem_tensor(4, Uint32)
@@ -4092,7 +4115,7 @@ class NativeTrellisLinear:
         for t in cutlass.range_constexpr(4):
             dk = t // 2
             j = t % 2
-            u0, u1 = _ld_global_nc_v2_u32_offset(p0, (dk * 8 + j) * 256)
+            u0, u1 = self._prefill_128_words(p0, (dk * 8 + j) * tile_bytes)
             raw_u0[t], raw_u1[t] = u0, u1
         num_kb = Int32(self.k // 128)
         for kb in cutlass.range(self.k // 128, unroll=1):
@@ -4107,8 +4130,8 @@ class NativeTrellisLinear:
                     for t in cutlass.range_constexpr(4):
                         dk = t // 2
                         j = t % 2
-                        u0, u1 = _ld_global_nc_v2_u32_offset(
-                            p0, ((2 * (sub + 1) + dk) * 8 + j) * 256
+                        u0, u1 = self._prefill_128_words(
+                            p0, ((2 * (sub + 1) + dk) * 8 + j) * tile_bytes
                         )
                         raw_u0[t], raw_u1[t] = u0, u1
                 else:
@@ -4117,7 +4140,7 @@ class NativeTrellisLinear:
                         for t in cutlass.range_constexpr(4):
                             dk = t // 2
                             j = t % 2
-                            u0, u1 = _ld_global_nc_v2_u32_offset(p0, (dk * 8 + j) * 256)
+                            u0, u1 = self._prefill_128_words(p0, (dk * 8 + j) * tile_bytes)
                             raw_u0[t], raw_u1[t] = u0, u1
                 _mbar_wait_ticks(bar_empty + Int32(s * 8), prod_parity)
                 cp_async4_zfill_shared_global_offset(
@@ -4140,10 +4163,14 @@ class NativeTrellisLinear:
                 for dk in cutlass.range_constexpr(2):
                     for j in cutlass.range_constexpr(2):
                         t = 2 * dk + j
-                        z0 = _k8_shfl_prev(cur_u1[t], prev_lane)
-                        b0, b1, b2, b3 = _dequant_k8_words_to_half2x4(
-                            z0, cur_u0[t], cur_u1[t], self.mul1
-                        )
+                        if cutlass.const_expr(self.bits == 6):
+                            lo, hi = _k6_align_shfl(cur_u0[t], cur_u1[t], prev_lane, shift)
+                            b0, b1, b2, b3 = packed_dequant_trellis_stream_to_half2x4(lo, hi, 6)
+                        else:
+                            z0 = _k8_shfl_prev(cur_u1[t], prev_lane)
+                            b0, b1, b2, b3 = _dequant_k8_words_to_half2x4(
+                                z0, cur_u0[t], cur_u1[t], self.mul1
+                            )
                         if cutlass.const_expr(self.input_bf16):
                             b0, b1 = _f16x2_to_bf16x2(b0), _f16x2_to_bf16x2(b1)
                             b2, b3 = _f16x2_to_bf16x2(b2), _f16x2_to_bf16x2(b3)
@@ -4155,7 +4182,7 @@ class NativeTrellisLinear:
                 _mbar_arrive(bar_full + Int32(s * 8))
 
     @cute.jit
-    def _prefill_consume_tile_k8_128(
+    def _prefill_consume_tile_128(
         self,
         total: cute.Tensor,
         tid: Int32,
@@ -4297,7 +4324,7 @@ class NativeTrellisLinear:
                     _st_global_cs_v2_f32_offset(r1_addr, n * 32, v2, v3)
 
     @cute.kernel
-    def multiply_prefill_k8_128(
+    def multiply_prefill_128(
         self,
         inputs: cute.Tensor,
         payload: cute.Tensor,
@@ -4307,7 +4334,7 @@ class NativeTrellisLinear:
         rotation_id: Int32,
     ):
         smem = cutlass_utils.SmemAllocator()
-        storage = smem.allocate(self._k8_prefill_128_storage())
+        storage = smem.allocate(self._prefill_128_storage())
         ring = shared_ptr_to_u32(storage.buf.data_ptr())
         stage_bytes = _WS_A_STAGE_BYTES + 8192
         bar_full = ring + Int32(2 * stage_bytes)
@@ -4336,9 +4363,13 @@ class NativeTrellisLinear:
             x_addr = inputs[rotation_id]
             payload_ptr = payload.iterator.toint()
             while task < total_tasks:
-                m_block = task % m_tiles
-                nb = task // m_tiles
-                self._prefill_produce_tile_k8_128(
+                if cutlass.const_expr(self.prefill_128_body):
+                    m_block = task // n_tiles
+                    nb = task % n_tiles
+                else:
+                    m_block = task % m_tiles
+                    nb = task // m_tiles
+                self._prefill_produce_tile_128(
                     m_block, nb, x_addr, payload_ptr, rows,
                     pw, lane, r_p, c_p, smem_a_base, prod_b_base, bar_full, bar_empty,
                 )
@@ -4358,9 +4389,13 @@ class NativeTrellisLinear:
             output_ptr = output.iterator.toint()
             total = cute.make_rmem_tensor((4, 4, 4), Float32)
             while task < total_tasks:
-                m_block = task % m_tiles
-                nb = task // m_tiles
-                self._prefill_consume_tile_k8_128(
+                if cutlass.const_expr(self.prefill_128_body):
+                    m_block = task // n_tiles
+                    nb = task % n_tiles
+                else:
+                    m_block = task % m_tiles
+                    nb = task // m_tiles
+                self._prefill_consume_tile_128(
                     total, tid, m_block, nb, scales_ptr, output_ptr, rows,
                     ring, cons_a_base0, cons_a_base1, cons_b_base, bar_full, bar_empty,
                 )
