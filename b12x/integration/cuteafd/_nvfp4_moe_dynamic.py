@@ -39,18 +39,22 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
+import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Float32, Int32, Int64, Uint32, Uint64, const_expr
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.utils import LayoutEnum
 
 from b12x._lib.activation import _f32_asm, situ_vendor
 from b12x._lib.intrinsics import (
+    cp_async_bulk_g2s_mbar,
     create_l2_evict_first_policy,
-    ld_global_nc_u32,
+    ld_global_nc_u32_l2hint,
     ld_global_nc_v4_u32,
-    ld_global_nc_v4_u32_l2hint,
     ld_global_v4_u32,
     ld_shared_u32 as ld_shared_u32_at,
+    ldmatrix_m8n8x4_b16,
     cvt_e2m1x8_f32,
     cvt_f32_to_e4m3,
     div_rn_f32,
@@ -73,7 +77,7 @@ from b12x._lib.intrinsics import (
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 
 from ._fp8_moe_kernels import META_HEAD, _atomic_add_shared_i32, _ceil, _i32_at, _ld_v2_u32, _round_bf16, _set_i32
-from ._fp8_moe_stream import STREAM_TILE_M, _chunk
+from ._fp8_moe_stream import STREAM_TILE_M, _chunk, _u8_weight
 from ._fp8_weights import _ld_f32
 from ._nvfp4_moe_a4 import StreamNvfp4GateUpA4, StreamNvfp4LinearA4, _copy_nvfp4_group
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
@@ -746,20 +750,6 @@ def _ld_nc_u32_pred(address: Int64, cond: Int32, *, loc=None, ip=None) -> Uint32
         asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
 
 
-@dsl_user_op
-def _ld_nc_v2_u32_noalloc_l2hint(base_ptr: Int64, cache_policy: Uint64, *, loc=None, ip=None):
-    """Streaming 8-byte global load with L1 no-allocate and an L2 cache policy."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.i32(), T.i32()]),
-        [Int64(base_ptr).ir_value(loc=loc, ip=ip), Uint64(cache_policy).ir_value(loc=loc, ip=ip)],
-        "ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {$0, $1}, [$2], $3;",
-        "=r,=r,l,l",
-        has_side_effects=True, is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
-    return (Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
-            Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)))
-
-
 @cute.jit
 def _candidate_fast(values: cute.Tensor, scale: Float32, decoder: Float32, outer: Float32) -> tuple:
     """Bit-exact ``_candidate`` using hardware ``cvt.rn.bf16x2.e2m1x2`` nibble decode."""
@@ -807,20 +797,32 @@ def _quantize_row16_dyn_fast(values: cute.Tensor, bmax: Float32, encoder: Float3
     st_global_u8(scale_at, cutlass.Uint8(scale & Uint32(0xFF)))
 
 
-class PrepGammaSmallDyn:
-    """Fused ``MoePrep`` + ``GroupedGamma`` for small-M dynamic NVFP4 (``pairs <= 128``):
-    one CTA of ``experts`` threads (384 = 12 warps), warp-level prefix scan, and fused
-    grouped route weight scatter."""
+class PrepQuantSmallDyn:
+    """Fused route prep + grouped gamma scatter + single-pass per-source-row input quantization
+    for small-M Inkling 2 NVFP4 TP4 (``pairs <= 128``, ``K = 4608``, ``E = 384``).
 
-    def __init__(self, *, experts: int, top_k: int, max_tiles: int):
-        self.experts, self.top_k, self.max_tiles = int(experts), int(top_k), int(max_tiles)
+    Grid ``(rows + 1, 1, 1)``, block ``(384, 1, 1)``: CTA 0 runs the 12-warp prefix-scan route
+    prep and scatters ``gamma``; CTAs ``1..rows`` concurrently quantize unique input rows
+    ``0..rows-1`` (288 active threads = ``K / 16``) into compact ``[rows, ...]`` buffers."""
+
+    def __init__(self, *, k: int, experts: int, top_k: int, max_tiles: int, input_kind: str = "bf16"):
+        self.k, self.experts, self.top_k, self.max_tiles = int(k), int(experts), int(top_k), int(max_tiles)
+        if input_kind not in ("bf16", "nvfp4"):
+            raise ValueError("dynamic NVFP4 input_kind must be bf16 or nvfp4")
+        self.input_kind = input_kind
+        self.row_bytes = self.k // 2 + self.k // 16 + 16 if input_kind == "nvfp4" else self.k * 2
+        self.groups = self.k // 16
         if self.experts <= 0 or self.experts % 32 or self.experts > 1024:
-            raise ValueError("PrepGammaSmallDyn requires positive 32-aligned experts <= 1024")
+            raise ValueError("PrepQuantSmallDyn requires positive 32-aligned experts <= 1024")
+        if self.k <= 0 or self.k % 512 or self.groups > self.experts:
+            raise ValueError("PrepQuantSmallDyn requires positive K % 512 == 0 and K / 16 <= experts")
         self.threads = self.experts
         self.warps = self.threads // 32
+        self.quant_warps = self.groups // 32
 
     def key(self) -> tuple:
-        return ("prep_gamma_small_dyn", 1, self.experts, self.top_k, self.max_tiles)
+        return ("prep_quant_small_dyn", 2, self.k, self.experts, self.top_k, self.max_tiles) + (
+            ("nvfp4_input",) if self.input_kind == "nvfp4" else ())
 
     def _storage(self):
         class Storage:
@@ -831,238 +833,218 @@ class PrepGammaSmallDyn:
             "cursor": cute.struct.Align[cute.struct.MemRange[Int32, self.experts], 16],
             "w_rows": cute.struct.Align[cute.struct.MemRange[Int32, self.warps], 16],
             "w_flags": cute.struct.Align[cute.struct.MemRange[Int32, self.warps], 16],
+            "wmax": cute.struct.Align[cute.struct.MemRange[Float32, self.quant_warps], 16],
         }
         return cute.struct(Storage)
 
     @cute.jit
-    def __call__(self, ids: cute.Pointer, weights: cute.Pointer, meta: cute.Pointer,
+    def __call__(self, src: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, meta: cute.Pointer,
                  pair_row: cute.Pointer, pair_pos: cute.Pointer, gamma: cute.Pointer,
-                 rows: Int32, stream: cuda.CUstream):
-        self.kernel(ids, weights, meta, pair_row, pair_pos, gamma, rows).launch(
-            grid=(1, 1, 1), block=(self.threads, 1, 1), stream=stream)
+                 aq: cute.Pointer, a_s: cute.Pointer, amax: cute.Pointer, rows: Int32,
+                 stream: cuda.CUstream):
+        self.kernel(src, ids, weights, meta, pair_row, pair_pos, gamma, aq, a_s, amax, rows).launch(
+            grid=(rows + Int32(1), 1, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
-    def kernel(self, ids: cute.Pointer, weights: cute.Pointer, meta: cute.Pointer,
-               pair_row: cute.Pointer, pair_pos: cute.Pointer, gamma: cute.Pointer, rows: Int32):
+    def kernel(self, src: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, meta: cute.Pointer,
+               pair_row: cute.Pointer, pair_pos: cute.Pointer, gamma: cute.Pointer,
+               aq: cute.Pointer, a_s: cute.Pointer, amax: cute.Pointer, rows: Int32):
+        cta = Int32(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
         warp_id = tidx // Int32(32)
         lane = tidx % Int32(32)
         smem = cutlass_utils.SmemAllocator()
         storage = smem.allocate(self._storage())
-        counts = storage.counts.get_tensor(cute.make_layout((self.experts,)))
-        cursor = storage.cursor.get_tensor(cute.make_layout((self.experts,)))
-        w_rows = storage.w_rows.get_tensor(cute.make_layout((self.warps,)))
-        w_flags = storage.w_flags.get_tensor(cute.make_layout((self.warps,)))
-        counts_smem = shared_ptr_to_u32(storage.counts.data_ptr())
-        cursor_smem = shared_ptr_to_u32(storage.cursor.data_ptr())
-        e_count = Int32(self.experts)
-        m = Int64(meta.toint())
-        counts_at = m + Int64(4 * META_HEAD)
-        offsets_at = counts_at + Int64(4 * self.experts)
-        active_at = offsets_at + Int64(4 * self.experts)
-        tiles_at = active_at + Int64(4 * self.experts)
-        ids_at = Int64(ids.toint())
-        rows_at = Int64(pair_row.toint())
-        pos_at = Int64(pair_pos.toint())
-        pairs = rows * Int32(self.top_k)
-        counts[tidx] = Int32(0)
-        if tidx < pairs:
-            _set_i32(rows_at, tidx, Int32(-1))
-        cute.arch.sync_threads()
-        if tidx < pairs:
-            e = _i32_at(ids_at, tidx)
-            if (e >= Int32(0)) & (e < e_count):
-                _atomic_add_shared_i32(counts_smem + e * Int32(4), Int32(1))
-        cute.arch.sync_threads()
-        # Each expert has at most pairs <= 128 == STREAM_TILE_M rows, so tiles_e == flag.
-        n = Int32(counts[tidx])
-        flag = Int32(cutlass.select_(n > Int32(0), Int32(1), Int32(0)))
-        scan_r = n
-        scan_f = flag
-        for stage in cutlass.range_constexpr(5):
-            off = 1 << stage
-            up_r = Int32(cute.arch.shuffle_sync_up(scan_r, offset=off, mask_and_clamp=0))
-            up_f = Int32(cute.arch.shuffle_sync_up(scan_f, offset=off, mask_and_clamp=0))
-            if lane >= Int32(off):
-                scan_r = scan_r + up_r
-                scan_f = scan_f + up_f
-        if lane == Int32(31):
-            w_rows[warp_id] = scan_r
-            w_flags[warp_id] = scan_f
-        cute.arch.sync_threads()
-        if warp_id == Int32(0):
-            wr = Int32(0)
-            wf = Int32(0)
-            if lane < Int32(self.warps):
-                wr = Int32(w_rows[lane])
-                wf = Int32(w_flags[lane])
+        if cta == Int32(0):
+            counts = storage.counts.get_tensor(cute.make_layout((self.experts,)))
+            cursor = storage.cursor.get_tensor(cute.make_layout((self.experts,)))
+            w_rows = storage.w_rows.get_tensor(cute.make_layout((self.warps,)))
+            w_flags = storage.w_flags.get_tensor(cute.make_layout((self.warps,)))
+            counts_smem = shared_ptr_to_u32(storage.counts.data_ptr())
+            cursor_smem = shared_ptr_to_u32(storage.cursor.data_ptr())
+            e_count = Int32(self.experts)
+            m = Int64(meta.toint())
+            counts_at = m + Int64(4 * META_HEAD)
+            offsets_at = counts_at + Int64(4 * self.experts)
+            active_at = offsets_at + Int64(4 * self.experts)
+            tiles_at = active_at + Int64(4 * self.experts)
+            ids_at = Int64(ids.toint())
+            rows_at = Int64(pair_row.toint())
+            pos_at = Int64(pair_pos.toint())
+            pairs = rows * Int32(self.top_k)
+            counts[tidx] = Int32(0)
+            if tidx < pairs:
+                _set_i32(rows_at, tidx, Int32(-1))
+            cute.arch.sync_threads()
+            if tidx < pairs:
+                e = _i32_at(ids_at, tidx)
+                if (e >= Int32(0)) & (e < e_count):
+                    _atomic_add_shared_i32(counts_smem + e * Int32(4), Int32(1))
+            cute.arch.sync_threads()
+            # Each expert has at most pairs <= 128 == STREAM_TILE_M rows, so tiles_e == flag.
+            n = Int32(counts[tidx])
+            flag = Int32(cutlass.select_(n > Int32(0), Int32(1), Int32(0)))
+            scan_r = n
+            scan_f = flag
             for stage in cutlass.range_constexpr(5):
                 off = 1 << stage
-                if const_expr(off < self.warps):
-                    up_r = Int32(cute.arch.shuffle_sync_up(wr, offset=off, mask_and_clamp=0))
-                    up_f = Int32(cute.arch.shuffle_sync_up(wf, offset=off, mask_and_clamp=0))
-                    if lane >= Int32(off):
-                        wr = wr + up_r
-                        wf = wf + up_f
-            if lane < Int32(self.warps):
-                w_rows[lane] = wr
-                w_flags[lane] = wf
-        cute.arch.sync_threads()
-        base_r = Int32(0)
-        base_f = Int32(0)
-        if warp_id > Int32(0):
-            base_r = Int32(w_rows[warp_id - Int32(1)])
-            base_f = Int32(w_flags[warp_id - Int32(1)])
-        end_r = base_r + scan_r
-        end_f = base_f + scan_f
-        offset = end_r - n
-        active = end_f - flag
-        _set_i32(counts_at, tidx, n)
-        _set_i32(offsets_at, tidx, offset)
-        cursor[tidx] = offset
-        if n > Int32(0):
-            _set_i32(active_at, active, tidx)
-            if active < Int32(self.max_tiles):
-                _set_i32(tiles_at, active, tidx)
-        if tidx == e_count - Int32(1):
-            _set_i32(m, 0, end_f)
-            _set_i32(m, 1, end_f)
-            _set_i32(m, 2, end_r)
-        cute.arch.sync_threads()
-        if tidx < pairs:
-            e = _i32_at(ids_at, tidx)
-            position = Int32(-1)
-            if (e >= Int32(0)) & (e < e_count):
-                position = _atomic_add_shared_i32(cursor_smem + e * Int32(4), Int32(1))
-                _set_i32(rows_at, position, tidx // Int32(self.top_k))
-                w_val = _ld_f32(Int64(weights.toint()) + Int64(tidx) * Int64(4))
-                st_global_f32(Int64(gamma.toint()) + Int64(position) * Int64(4), w_val)
-            _set_i32(pos_at, tidx, position)
-
-
-class QuantRowsSmallDyn:
-    """Single-pass per-source-row dynamic NVFP4 quantizer (one CTA per unique input row,
-    288 threads = K / 16 groups for K = 4608): loads each 16-BF16 group once into registers,
-    reduces row amax by warp shuffle, and quantizes directly into compact ``[rows, ...]``."""
-
-    def __init__(self, *, k: int, input_kind: str = "bf16"):
-        self.k = int(k)
-        if input_kind not in ("bf16", "nvfp4"):
-            raise ValueError("dynamic NVFP4 input_kind must be bf16 or nvfp4")
-        self.input_kind = input_kind
-        self.row_bytes = self.k // 2 + self.k // 16 + 16 if input_kind == "nvfp4" else self.k * 2
-        self.groups = self.k // 16
-        if self.k <= 0 or self.k % 512 or self.groups > 1024:
-            raise ValueError("QuantRowsSmallDyn requires positive K % 512 == 0 and K / 16 <= 1024")
-        self.threads = self.groups
-        self.warps = self.threads // 32
-
-    def key(self) -> tuple:
-        return ("quant_rows_small_dyn", 1, self.k) + (("nvfp4_input",) if self.input_kind == "nvfp4" else ())
-
-    def _storage(self):
-        class Storage:
-            pass
-
-        Storage.__annotations__ = {
-            "wmax": cute.struct.Align[cute.struct.MemRange[Float32, self.warps], 16],
-        }
-        return cute.struct(Storage)
-
-    @cute.jit
-    def __call__(self, src: cute.Pointer, aq: cute.Pointer, a_s: cute.Pointer, amax: cute.Pointer,
-                 rows: Int32, stream: cuda.CUstream):
-        self.kernel(src, aq, a_s, amax).launch(
-            grid=(rows, 1, 1), block=(self.threads, 1, 1), stream=stream)
-
-    @cute.kernel
-    def kernel(self, src: cute.Pointer, aq: cute.Pointer, a_s: cute.Pointer, amax: cute.Pointer):
-        row = Int32(cute.arch.block_idx()[0])
-        tidx = Int32(cute.arch.thread_idx()[0])
-        row_at = Int64(src.toint()) + Int64(row) * Int64(self.row_bytes)
-        packed_at = Int64(aq.toint()) + Int64(row) * Int64(self.k // 2) + Int64(tidx) * Int64(8)
-        scale_at = Int64(a_s.toint()) + Int64(row) * Int64(self.groups) + Int64(tidx)
-        if const_expr(self.input_kind == "nvfp4"):
-            if tidx == Int32(0):
-                st_global_f32(Int64(amax.toint()) + Int64(row) * Int64(4),
-                              _ld_f32(row_at + Int64(self.k // 2 + self.k // 16)))
-            _copy_nvfp4_group(row_at, self.k, tidx, packed_at, scale_at)
-        else:
-            smem = cutlass_utils.SmemAllocator()
-            storage = smem.allocate(self._storage())
-            wmax = storage.wmax.get_tensor(cute.make_layout((self.warps,)))
-            warp_id = tidx // Int32(32)
-            lane = tidx % Int32(32)
-            at = row_at + Int64(tidx) * Int64(32)
-            w0, w1, w2, w3 = ld_global_nc_v4_u32(at)
-            w4, w5, w6, w7 = ld_global_nc_v4_u32(at + Int64(16))
-            words = (w0, w1, w2, w3, w4, w5, w6, w7)
-            values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
-            for q in cutlass.range_constexpr(8):
-                values[2 * q] = _bf16_lo(words[q])
-                values[2 * q + 1] = _bf16_hi(words[q])
-            bmax = max_abs_16(values)
-            local = bmax
-            for shift in cutlass.range_constexpr(5):
-                local = fmax_f32(local, Float32(cute.arch.shuffle_sync_bfly(local, offset=1 << shift)))
-            if lane == Int32(0):
-                wmax[warp_id] = local
+                up_r = Int32(cute.arch.shuffle_sync_up(scan_r, offset=off, mask_and_clamp=0))
+                up_f = Int32(cute.arch.shuffle_sync_up(scan_f, offset=off, mask_and_clamp=0))
+                if lane >= Int32(off):
+                    scan_r = scan_r + up_r
+                    scan_f = scan_f + up_f
+            if lane == Int32(31):
+                w_rows[warp_id] = scan_r
+                w_flags[warp_id] = scan_f
             cute.arch.sync_threads()
             if warp_id == Int32(0):
-                v = Float32(0.0)
+                wr = Int32(0)
+                wf = Int32(0)
                 if lane < Int32(self.warps):
-                    v = Float32(wmax[lane])
-                for shift in cutlass.range_constexpr(5):
-                    if const_expr((1 << shift) < self.warps):
-                        v = fmax_f32(v, Float32(cute.arch.shuffle_sync_bfly(v, offset=1 << shift)))
-                if lane == Int32(0):
-                    wmax[0] = v
-                    st_global_f32(Int64(amax.toint()) + Int64(row) * Int64(4), v)
+                    wr = Int32(w_rows[lane])
+                    wf = Int32(w_flags[lane])
+                for stage in cutlass.range_constexpr(5):
+                    off = 1 << stage
+                    if const_expr(off < self.warps):
+                        up_r = Int32(cute.arch.shuffle_sync_up(wr, offset=off, mask_and_clamp=0))
+                        up_f = Int32(cute.arch.shuffle_sync_up(wf, offset=off, mask_and_clamp=0))
+                        if lane >= Int32(off):
+                            wr = wr + up_r
+                            wf = wf + up_f
+                if lane < Int32(self.warps):
+                    w_rows[lane] = wr
+                    w_flags[lane] = wf
             cute.arch.sync_threads()
-            row_amax = Float32(wmax[0])
-            encoder, decoder, outer = _row_factors(row_amax)
-            _quantize_row16_dyn_fast(values, bmax, encoder, decoder, outer, packed_at, scale_at)
+            base_r = Int32(0)
+            base_f = Int32(0)
+            if warp_id > Int32(0):
+                base_r = Int32(w_rows[warp_id - Int32(1)])
+                base_f = Int32(w_flags[warp_id - Int32(1)])
+            end_r = base_r + scan_r
+            end_f = base_f + scan_f
+            offset = end_r - n
+            active = end_f - flag
+            _set_i32(counts_at, tidx, n)
+            _set_i32(offsets_at, tidx, offset)
+            cursor[tidx] = offset
+            if n > Int32(0):
+                _set_i32(active_at, active, tidx)
+                if active < Int32(self.max_tiles):
+                    _set_i32(tiles_at, active, tidx)
+            if tidx == e_count - Int32(1):
+                _set_i32(m, 0, end_f)
+                _set_i32(m, 1, end_f)
+                _set_i32(m, 2, end_r)
+            cute.arch.sync_threads()
+            if tidx < pairs:
+                e = _i32_at(ids_at, tidx)
+                position = Int32(-1)
+                if (e >= Int32(0)) & (e < e_count):
+                    position = _atomic_add_shared_i32(cursor_smem + e * Int32(4), Int32(1))
+                    _set_i32(rows_at, position, tidx // Int32(self.top_k))
+                    w_val = _ld_f32(Int64(weights.toint()) + Int64(tidx) * Int64(4))
+                    st_global_f32(Int64(gamma.toint()) + Int64(position) * Int64(4), w_val)
+                _set_i32(pos_at, tidx, position)
+        else:
+            row = cta - Int32(1)
+            row_at = Int64(src.toint()) + Int64(row) * Int64(self.row_bytes)
+            if const_expr(self.input_kind == "nvfp4"):
+                if tidx == Int32(0):
+                    st_global_f32(Int64(amax.toint()) + Int64(row) * Int64(4),
+                                  _ld_f32(row_at + Int64(self.k // 2 + self.k // 16)))
+                if tidx < Int32(self.groups):
+                    packed_at = Int64(aq.toint()) + Int64(row) * Int64(self.k // 2) + Int64(tidx) * Int64(8)
+                    scale_at = Int64(a_s.toint()) + Int64(row) * Int64(self.groups) + Int64(tidx)
+                    _copy_nvfp4_group(row_at, self.k, tidx, packed_at, scale_at)
+            else:
+                wmax = storage.wmax.get_tensor(cute.make_layout((self.quant_warps,)))
+                values = cute.make_rmem_tensor(cute.make_layout((16,), stride=(1,)), Float32)
+                bmax = Float32(0.0)
+                if tidx < Int32(self.groups):
+                    at = row_at + Int64(tidx) * Int64(32)
+                    w0, w1, w2, w3 = ld_global_nc_v4_u32(at)
+                    w4, w5, w6, w7 = ld_global_nc_v4_u32(at + Int64(16))
+                    words = (w0, w1, w2, w3, w4, w5, w6, w7)
+                    for q in cutlass.range_constexpr(8):
+                        values[2 * q] = _bf16_lo(words[q])
+                        values[2 * q + 1] = _bf16_hi(words[q])
+                    bmax = max_abs_16(values)
+                local = bmax
+                for shift in cutlass.range_constexpr(5):
+                    local = fmax_f32(local, Float32(cute.arch.shuffle_sync_bfly(local, offset=1 << shift)))
+                if (warp_id < Int32(self.quant_warps)) & (lane == Int32(0)):
+                    wmax[warp_id] = local
+                cute.arch.sync_threads()
+                if warp_id == Int32(0):
+                    v = Float32(0.0)
+                    if lane < Int32(self.quant_warps):
+                        v = Float32(wmax[lane])
+                    for shift in cutlass.range_constexpr(5):
+                        if const_expr((1 << shift) < self.quant_warps):
+                            v = fmax_f32(v, Float32(cute.arch.shuffle_sync_bfly(v, offset=1 << shift)))
+                    if lane == Int32(0):
+                        wmax[0] = v
+                        st_global_f32(Int64(amax.toint()) + Int64(row) * Int64(4), v)
+                cute.arch.sync_threads()
+                if tidx < Int32(self.groups):
+                    row_amax = Float32(wmax[0])
+                    encoder, decoder, outer = _row_factors(row_amax)
+                    packed_at = Int64(aq.toint()) + Int64(row) * Int64(self.k // 2) + Int64(tidx) * Int64(8)
+                    scale_at = Int64(a_s.toint()) + Int64(row) * Int64(self.groups) + Int64(tidx)
+                    _quantize_row16_dyn_fast(values, bmax, encoder, decoder, outer, packed_at, scale_at)
 
 
 class GateUpSmallDyn:
-    """Zero-barrier register-streaming W4A4 gate/up + SiTU x gamma for small-M Inkling 2
-    NVFP4 TP4 (``hidden=4608, inter=576``).
+    """2D-TMA weight-streaming W4A4 gate/up + SiTU x gamma for small-M Inkling 2 NVFP4 TP4
+    (``hidden=4608, inter=576``).
 
     Grid ``(inter // 16, grid_tiles)``, 4 warps (128 threads): warps 0..1 own 16 gate rows
-    (``w1``), warps 2..3 own the matching 16 up rows (``w3``). Each warp streams 8 weight
-    rows in ping-pong 128-byte (K=256) register buffers with ``L1::no_allocate`` +
-    ``L2::evict_first`` and 32-byte (K=512) scale sectors, reading unique L1-cached input
-    rows through ``pair_row``. Accumulates ``nvfp4_mma_m16n8k64_f32_e2m1`` in exact
-    ascending K order, exchanges BF16 gate/up through 1,152 B of SMEM once per 16-row chunk,
-    and writes compact ``act_bf16 [pairs, inter]`` and ``act_amax_part [pairs, inter / 16]``."""
+    (``w1``), warps 2..3 own the matching 16 up rows (``w3``). Streams 128-byte-swizzled
+    ``(16, 128)`` packed weight boxes (K=256) through a 3-stage TMA ring (13,312 B SMEM ->
+    7 CTAs/SM = 28 warps/SM), loads weight fragments via conflict-free ``ldmatrix_m8n8x4_b16``,
+    loads ``s1``/``s3`` scales via naturally 4-byte aligned ``ld_global_nc_u32_l2hint``
+    (preserving the 4-byte scale ABI), and reads unique L1-cached input rows via ``pair_row``.
+    Reuses the drained weight ring for the 1,152 B BF16 gate/up epilogue exchange."""
 
     threads = 128
     half_n = 16
-    x_stride = 72  # 32 BF16 (16 gate + 16 up) = 64 B + 8 B padding (conflict-free)
+    k_bytes = 128      # K = 256 packed E2M1 bytes per TMA step
+    w_ring = 3
+    x_stride = 72      # 32 BF16 (16 gate + 16 up) = 64 B + 8 B padding (conflict-free)
 
     def __init__(self, *, inter: int, hidden: int, experts: int, gate_cap: float = 4.0,
                  up_cap: float = 25.0, max_live: int = 16):
         self.inter, self.hidden, self.experts = int(inter), int(hidden), int(experts)
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         self.max_live = int(max_live)
-        if self.hidden <= 0 or self.hidden % 512 or self.inter <= 0 or self.inter % self.half_n:
-            raise ValueError("GateUpSmallDyn requires H % 512 == 0 and I % 16 == 0")
-        self.blocks512 = self.hidden // 512
+        if self.hidden <= 0 or self.hidden % 256 or self.inter <= 0 or self.inter % self.half_n:
+            raise ValueError("GateUpSmallDyn requires H % 256 == 0 and I % 16 == 0")
         self.row_bytes = self.hidden // 2
         self.scale_bytes = self.hidden // 16
+        self.k_steps = self.row_bytes // self.k_bytes
+        self.half_bytes = self.half_n * self.k_bytes
+        if self.k_steps < self.w_ring:
+            raise ValueError("GateUpSmallDyn needs at least w_ring K steps")
         self.amax_offset = nvfp4_amax_offset(experts, self.inter, self.hidden)
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
 
     def key(self) -> tuple:
-        return ("gate_up_small_dyn", 1, self.inter, self.hidden, self.experts,
+        return ("gate_up_small_dyn", 2, self.inter, self.hidden, self.experts, self.w_ring,
                 self.gate_cap, self.up_cap, self.max_live)
 
-    def _storage(self):
+    def _w_layout(self):
+        atom = warpgroup.make_smem_layout_atom(
+            sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, cutlass.Uint8, self.k_bytes),
+            cutlass.Uint8)
+        return cute.tile_to_shape(atom, (self.half_n, self.k_bytes, 2 * self.w_ring), order=(0, 1, 2))
+
+    def _storage(self, w_layout):
         class Storage:
             pass
 
         Storage.__annotations__ = {
-            "xch": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, 16 * self.x_stride], 16],
+            "mbar": cute.struct.MemRange[cutlass.Int64, self.w_ring],
+            "w": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, cute.cosize(w_layout)], 1024],
         }
         return cute.struct(Storage)
 
@@ -1071,15 +1053,36 @@ class GateUpSmallDyn:
                  w1: cute.Pointer, s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer,
                  row_amax: cute.Pointer, gamma: cute.Pointer, act_bf16: cute.Pointer,
                  act_amax_part: cute.Pointer, grid_tiles: Int32, stream: cuda.CUstream):
-        self.kernel(aq, a_s, pair_row, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16,
-                    act_amax_part).launch(
+        w_layout = self._w_layout()
+        rows_w = self.experts * self.inter
+        box = cute.slice_(w_layout, (None, None, 0))
+        tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w1, rows_w, self.row_bytes), box,
+            (self.half_n, self.k_bytes), num_multicast=1)
+        tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, self.row_bytes), box,
+            (self.half_n, self.k_bytes), num_multicast=1)
+        self.kernel(aq, a_s, pair_row, meta, tma_tensor_g, s1, tma_tensor_u, s3, row_amax, gamma,
+                    act_bf16, act_amax_part, tma_g, tma_u, w_layout, self._storage(w_layout)).launch(
             grid=(self.inter // self.half_n, grid_tiles, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.jit
-    def _mma_k128(self, acc: cute.Tensor, w_buf: cute.Tensor, w_off: cutlass.Constexpr,
-                  a_lo_ptr: Int64, a_hi_ptr: Int64, k_byte: Int64, live_lo: Int32, live_hi: Int32,
-                  has_hi: Int32, sfa_lo: cute.Tensor, sfa_hi: cute.Tensor, sfb: cute.Tensor,
-                  src_lane: Int32, c: Int32):
+    def _load_w(self, step, tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile):
+        slot = Int32(step) % Int32(self.w_ring)
+        barrier = mbar + slot
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_arrive_and_expect_tx(barrier, 2 * self.half_bytes)
+        cute.copy(tma_g, t_wg[(None, w_tile, Int32(step))], t_ws[(None, slot * Int32(2))], tma_bar_ptr=barrier)
+        cute.copy(tma_u, t_wu[(None, w_tile, Int32(step))], t_ws[(None, slot * Int32(2) + Int32(1))],
+                  tma_bar_ptr=barrier)
+
+    @cute.jit
+    def _mma_tma_k128(self, acc: cute.Tensor, w_base: Int32, nrow: Int32, mat: Int32, mrow: Int32,
+                      chunk_base: cutlass.Constexpr, a_lo_ptr: Int64, a_hi_ptr: Int64, k_byte: Int64,
+                      live_lo: Int32, live_hi: Int32, has_hi: Int32, sfa_lo_w: Uint32, sfa_hi_w: Uint32,
+                      sfb_w: Uint32, lane0: Int32, lane1: Int32, c: Int32):
+        chunk = Int32(chunk_base) + mat
+        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(w_base + nrow * Int32(self.k_bytes) + ((chunk ^ mrow) * Int32(16)))
         al0, al1, al2, al3 = _ld_nc_v4_u32_pred(a_lo_ptr + k_byte + Int64(c) * Int64(16), live_lo)
         al0, al1, al2, al3 = _quad_transpose_x4(al0, al1, al2, al3, c)
         ah0, ah1, ah2, ah3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
@@ -1091,37 +1094,30 @@ class GateUpSmallDyn:
                 ah1 = th1
                 ah2 = th2
                 ah3 = th3
-        b0, b1, b2, b3 = _quad_transpose_x4(
-            w_buf[w_off], w_buf[w_off + 1], w_buf[w_off + 2], w_buf[w_off + 3], c)
-        # Step 0 (even K64)
-        sfb0 = _shfl_idx_u32(sfb[0], src_lane)
-        sfa0 = _shfl_idx_u32(sfa_lo[0], src_lane)
+        sfa0 = _shfl_idx_u32(sfa_lo_w, lane0)
+        sfa1 = _shfl_idx_u32(sfa_lo_w, lane1)
         if const_expr(self.max_live > 8):
             if has_hi != Int32(0):
-                sfa0_h = _shfl_idx_u32(sfa_hi[0], src_lane)
+                sfa0_h = _shfl_idx_u32(sfa_hi_w, lane0)
+                sfa1_h = _shfl_idx_u32(sfa_hi_w, lane1)
                 sfa0 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa0_h, sfa0))
-        d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-            acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa0, sfb0)
-        # Step 1 (odd K64)
-        sfb1 = _shfl_idx_u32(sfb[1], src_lane)
-        sfa1 = _shfl_idx_u32(sfa_lo[1], src_lane)
-        if const_expr(self.max_live > 8):
-            if has_hi != Int32(0):
-                sfa1_h = _shfl_idx_u32(sfa_hi[1], src_lane)
                 sfa1 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa1_h, sfa1))
         d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-            d0, d1, d2, d3, al2, ah2, al3, ah3, b2, b3, sfa1, sfb1)
+            acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa0, _shfl_idx_u32(sfb_w, lane0))
+        d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+            d0, d1, d2, d3, al2, ah2, al3, ah3, b2, b3, sfa1, _shfl_idx_u32(sfb_w, lane1))
         acc[0], acc[1], acc[2], acc[3] = d0, d1, d2, d3
 
     @cute.kernel
     def kernel(self, aq: cute.Pointer, a_s: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer,
-               w1: cute.Pointer, s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer,
+               weight_g: cute.Tensor, s1: cute.Pointer, weight_u: cute.Tensor, s3: cute.Pointer,
                row_amax: cute.Pointer, gamma: cute.Pointer, act_bf16: cute.Pointer,
-               act_amax_part: cute.Pointer):
+               act_amax_part: cute.Pointer, tma_g: cute.CopyAtom, tma_u: cute.CopyAtom,
+               w_layout: cute.ComposedLayout, Storage: cutlass.Constexpr):
         n_blk = Int32(cute.arch.block_idx()[0])
         tile = Int32(cute.arch.block_idx()[1])
         smem = cutlass_utils.SmemAllocator()
-        storage = smem.allocate(self._storage())
+        storage = smem.allocate(Storage)
         if tile < _i32_at(Int64(meta.toint()), 1):
             e, first, live = _chunk(meta, self.experts, tile)
             tidx = Int32(cute.arch.thread_idx()[0])
@@ -1129,21 +1125,42 @@ class GateUpSmallDyn:
             lane = tidx % Int32(32)
             q = lane // Int32(4)
             c = lane % Int32(4)
+            mat = lane // Int32(8)
+            mrow = lane % Int32(8)
             quad_base = q * Int32(4)
             side = warp_id // Int32(2)
             sub_n = warp_id % Int32(2)
+            nrow = sub_n * Int32(8) + mrow
             n0 = n_blk * Int32(self.half_n)
-            wp = cutlass.select_(side == Int32(0), Int64(w1.toint()), Int64(w3.toint()))
+            mbar = storage.mbar.data_ptr()
+            s_w = storage.w.get_tensor(w_layout.outer, swizzle=w_layout.inner)
+            sw = shared_ptr_to_u32(storage.w.data_ptr())
+            w_tile = e * Int32(self.inter // self.half_n) + n_blk
+            t_ws, t_wg = cpasync.tma_partition(
+                tma_g, 0, cute.make_layout(1), cute.group_modes(s_w, 0, 2),
+                cute.group_modes(cute.local_tile(weight_g, (self.half_n, self.k_bytes), (None, None)), 0, 2))
+            _, t_wu = cpasync.tma_partition(
+                tma_u, 0, cute.make_layout(1), cute.group_modes(s_w, 0, 2),
+                cute.group_modes(cute.local_tile(weight_u, (self.half_n, self.k_bytes), (None, None)), 0, 2))
+            if tidx == Int32(0):
+                cpasync.prefetch_descriptor(tma_g)
+                cpasync.prefetch_descriptor(tma_u)
             sp = cutlass.select_(side == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
-            w_row = wp + w_row_idx * Int64(self.row_bytes)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
             expert_factor = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
                 * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)))
             policy = create_l2_evict_first_policy()
-            xch = shared_ptr_to_u32(storage.xch.data_ptr())
             m_chunks = (live + Int32(15)) // Int32(16)
             for m_chunk in cutlass.range(m_chunks, unroll=1):
+                if tidx == Int32(0):
+                    for init_slot in cutlass.range_constexpr(self.w_ring):
+                        cute.arch.mbarrier_init(mbar + init_slot, 1)
+                    cute.arch.mbarrier_init_fence()
+                cute.arch.sync_threads()
+                if warp_id == Int32(0):
+                    for pre in cutlass.range_constexpr(self.w_ring - 1):
+                        self._load_w(pre, tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
                 m0 = m_chunk * Int32(16)
                 chunk_live = live - m0
                 if chunk_live > Int32(16):
@@ -1166,88 +1183,49 @@ class GateUpSmallDyn:
                 acc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
                 for v in cutlass.range_constexpr(4):
                     acc[v] = Float32(0.0)
-                w0 = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
-                w1_buf = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
-                sfb = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
-                sfb_nxt = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
-                sfa_lo = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
-                sfa_lo_nxt = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
-                sfa_hi = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
-                sfa_hi_nxt = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Uint32)
-                sfb_nxt[0], sfb_nxt[1] = Uint32(0), Uint32(0)
-                sfa_lo_nxt[0], sfa_lo_nxt[1] = Uint32(0), Uint32(0)
-                sfa_hi[0], sfa_hi[1] = Uint32(0), Uint32(0)
-                sfa_hi_nxt[0], sfa_hi_nxt[1] = Uint32(0), Uint32(0)
 
-                # Prologue: block 0 scales (32 B sector = K512) and first 128 B weight line (K256).
-                s0, s1_w = _ld_nc_v2_u32_noalloc_l2hint(s_row + Int64(c) * Int64(8), policy)
-                sfb[0], sfb[1] = s0, s1_w
-                sa0, sa1 = _ld_nc_v2_u32_pred(as_lo_ptr + Int64(c) * Int64(8), live_lo)
-                sfa_lo[0], sfa_lo[1] = sa0, sa1
-                if const_expr(self.max_live > 8):
-                    if has_hi != Int32(0):
-                        sh0, sh1 = _ld_nc_v2_u32_pred(as_hi_ptr + Int64(c) * Int64(8), live_hi)
-                        sfa_hi[0], sfa_hi[1] = sh0, sh1
-                r0, r1, r2, r3 = ld_global_nc_v4_u32_l2hint(w_row + Int64(c) * Int64(16), policy, no_allocate=True)
-                r4, r5, r6, r7 = ld_global_nc_v4_u32_l2hint(w_row + Int64(64) + Int64(c) * Int64(16), policy, no_allocate=True)
-                w0[0], w0[1], w0[2], w0[3] = r0, r1, r2, r3
-                w0[4], w0[5], w0[6], w0[7] = r4, r5, r6, r7
+                # Prefetch step 0 scales while TMA prologue is in flight (4-byte aligned, s1/s3 ABI align=4).
+                sfb_cur = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
 
-                for blk512 in cutlass.range(self.blocks512, unroll=1):
-                    k_base = Int64(blk512) * Int64(256)
-                    # Prefetch Half 1 (K +256..+511) weights and next blk512 weight scales.
-                    p0, p1, p2, p3 = ld_global_nc_v4_u32_l2hint(
-                        w_row + k_base + Int64(128) + Int64(c) * Int64(16), policy, no_allocate=True)
-                    p4, p5, p6, p7 = ld_global_nc_v4_u32_l2hint(
-                        w_row + k_base + Int64(192) + Int64(c) * Int64(16), policy, no_allocate=True)
-                    w1_buf[0], w1_buf[1], w1_buf[2], w1_buf[3] = p0, p1, p2, p3
-                    w1_buf[4], w1_buf[5], w1_buf[6], w1_buf[7] = p4, p5, p6, p7
-                    if blk512 + Int32(1) < Int32(self.blocks512):
-                        ns0, ns1 = _ld_nc_v2_u32_noalloc_l2hint(
-                            s_row + Int64(blk512 + Int32(1)) * Int64(32) + Int64(c) * Int64(8), policy)
-                        sfb_nxt[0], sfb_nxt[1] = ns0, ns1
-                    # Compute Half 0 (K +0..+255): steps 0,1 then 2,3.
-                    self._mma_k128(acc, w0, 0, a_lo_ptr, a_hi_ptr, k_base, live_lo, live_hi,
-                                   has_hi, sfa_lo, sfa_hi, sfb, quad_base, c)
-                    self._mma_k128(acc, w0, 4, a_lo_ptr, a_hi_ptr, k_base + Int64(64), live_lo, live_hi,
-                                   has_hi, sfa_lo, sfa_hi, sfb, quad_base + Int32(1), c)
-                    # Prefetch next blk512 Half 0 weights and activation scales.
-                    if blk512 + Int32(1) < Int32(self.blocks512):
-                        nk = Int64(blk512 + Int32(1)) * Int64(256)
-                        q0, q1, q2, q3 = ld_global_nc_v4_u32_l2hint(
-                            w_row + nk + Int64(c) * Int64(16), policy, no_allocate=True)
-                        q4, q5, q6, q7 = ld_global_nc_v4_u32_l2hint(
-                            w_row + nk + Int64(64) + Int64(c) * Int64(16), policy, no_allocate=True)
-                        w0[0], w0[1], w0[2], w0[3] = q0, q1, q2, q3
-                        w0[4], w0[5], w0[6], w0[7] = q4, q5, q6, q7
-                        ns_off = Int64(blk512 + Int32(1)) * Int64(32) + Int64(c) * Int64(8)
-                        na0, na1 = _ld_nc_v2_u32_pred(as_lo_ptr + ns_off, live_lo)
-                        sfa_lo_nxt[0], sfa_lo_nxt[1] = na0, na1
-                        if const_expr(self.max_live > 8):
-                            if has_hi != Int32(0):
-                                nh0, nh1 = _ld_nc_v2_u32_pred(as_hi_ptr + ns_off, live_hi)
-                                sfa_hi_nxt[0], sfa_hi_nxt[1] = nh0, nh1
-                    # Compute Half 1 (K +256..+511): steps 4,5 then 6,7.
-                    self._mma_k128(acc, w1_buf, 0, a_lo_ptr, a_hi_ptr, k_base + Int64(128), live_lo, live_hi,
-                                   has_hi, sfa_lo, sfa_hi, sfb, quad_base + Int32(2), c)
-                    self._mma_k128(acc, w1_buf, 4, a_lo_ptr, a_hi_ptr, k_base + Int64(192), live_lo, live_hi,
-                                   has_hi, sfa_lo, sfa_hi, sfb, quad_base + Int32(3), c)
-                    sfb[0], sfb[1] = sfb_nxt[0], sfb_nxt[1]
-                    sfa_lo[0], sfa_lo[1] = sfa_lo_nxt[0], sfa_lo_nxt[1]
+                for step in cutlass.range(self.k_steps, unroll=1):
+                    slot = step % Int32(self.w_ring)
+                    cute.arch.mbarrier_wait(mbar + slot, (step // Int32(self.w_ring)) & Int32(1))
+                    cute.arch.sync_threads()
+                    if warp_id == Int32(0):
+                        if step + Int32(self.w_ring - 1) < Int32(self.k_steps):
+                            self._load_w(step + Int32(self.w_ring - 1), tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
+                    # Prefetch next step's 4-byte aligned weight scale word across the current step's MMAs.
+                    sfb_next = sfb_cur
+                    if step + Int32(1) < Int32(self.k_steps):
+                        sfb_next = ld_global_nc_u32_l2hint(
+                            s_row + Int64(step + Int32(1)) * Int64(16) + Int64(c) * Int64(4), policy)
+                    s_off = Int64(step) * Int64(16) + Int64(c) * Int64(4)
+                    sfa_lo_w = _ld_nc_u32_pred(as_lo_ptr + s_off, live_lo)
+                    sfa_hi_w = Uint32(0)
                     if const_expr(self.max_live > 8):
                         if has_hi != Int32(0):
-                            sfa_hi[0], sfa_hi[1] = sfa_hi_nxt[0], sfa_hi_nxt[1]
+                            sfa_hi_w = _ld_nc_u32_pred(as_hi_ptr + s_off, live_hi)
+                    w_base = sw + (slot * Int32(2) + side) * Int32(self.half_bytes)
+                    k_byte = Int64(step) * Int64(self.k_bytes)
+                    self._mma_tma_k128(acc, w_base, nrow, mat, mrow, 0, a_lo_ptr, a_hi_ptr, k_byte,
+                                       live_lo, live_hi, has_hi, sfa_lo_w, sfa_hi_w, sfb_cur,
+                                       quad_base, quad_base + Int32(1), c)
+                    self._mma_tma_k128(acc, w_base, nrow, mat, mrow, 4, a_lo_ptr, a_hi_ptr, k_byte + Int64(64),
+                                       live_lo, live_hi, has_hi, sfa_lo_w, sfa_hi_w, sfb_cur,
+                                       quad_base + Int32(2), quad_base + Int32(3), c)
+                    sfb_cur = sfb_next
 
-                # Epilogue: exchange BF16 gate/up via 1,152 B SMEM, compute SiTU x gamma and group amax.
+                # Reuse drained TMA weight ring for the 1,152 B BF16 gate/up exchange.
+                cute.arch.sync_threads()
                 col_xch = side * Int32(16) + sub_n * Int32(8) + Int32(2) * c
                 if q < chunk_live:
                     factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(src_lo) * Int64(4)) * expert_factor
-                    st_shared_u32(xch + q * Int32(self.x_stride) + col_xch * Int32(2),
+                    st_shared_u32(sw + q * Int32(self.x_stride) + col_xch * Int32(2),
                                   pack_f32x2_to_bfloat2(acc[0] * factor_lo, acc[1] * factor_lo))
                 if const_expr(self.max_live > 8):
                     if q + Int32(8) < chunk_live:
                         factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(src_hi) * Int64(4)) * expert_factor
-                        st_shared_u32(xch + (q + Int32(8)) * Int32(self.x_stride) + col_xch * Int32(2),
+                        st_shared_u32(sw + (q + Int32(8)) * Int32(self.x_stride) + col_xch * Int32(2),
                                       pack_f32x2_to_bfloat2(acc[2] * factor_hi, acc[3] * factor_hi))
                 cute.arch.sync_threads()
                 erow = tidx // Int32(8)
@@ -1256,8 +1234,8 @@ class GateUpSmallDyn:
                 if erow < chunk_live:
                     p = first + m0 + erow
                     g_row = _ld_f32(Int64(gamma.toint()) + Int64(p) * Int64(4))
-                    gw = ld_shared_u32_at(xch + erow * Int32(self.x_stride) + epair * Int32(4))
-                    uw = ld_shared_u32_at(xch + erow * Int32(self.x_stride) + Int32(self.half_n * 2) + epair * Int32(4))
+                    gw = ld_shared_u32_at(sw + erow * Int32(self.x_stride) + epair * Int32(4))
+                    uw = ld_shared_u32_at(sw + erow * Int32(self.x_stride) + Int32(self.half_n * 2) + epair * Int32(4))
                     v0 = situ_vendor(_bf16_lo(gw), _bf16_lo(uw), g_row, gate_cap=self.gate_cap, up_cap=self.up_cap)
                     v1 = situ_vendor(_bf16_hi(gw), _bf16_hi(uw), g_row, gate_cap=self.gate_cap, up_cap=self.up_cap)
                     local = fmax_f32(fabs_f32(v0), fabs_f32(v1))
@@ -1348,30 +1326,41 @@ class ChunkActSmallDyn:
 
 
 class DownSmallDyn:
-    """Zero-SMEM, zero-barrier register-streaming W4A4 down projection for small-M Inkling 2
-    NVFP4 TP4 (``n=4608, k=576``).
+    """1D-bulk-TMA W4A4 down projection for small-M Inkling 2 NVFP4 TP4 (``n=4608, k=576``).
 
-    Grid ``(n // 64, grid_tiles)``, 4 warps (128 threads), 2 column groups (16 output cols)
-    per warp. Preloads all 9 E4M3 scale words of ``s2`` and ``a_s``, runs a fully unrolled
-    ping-pong K128 (64 B) + K64 tail (32 B) register pipeline with ``L1::no_allocate`` +
-    ``L2::evict_first`` weight loads, and writes coalesced BF16 ``y [pairs, n]``."""
+    Grid ``(n // 32, grid_tiles)`` = ``(144, grid_tiles)`` (exact multiple of 48 SMs for every
+    expert count), 4 warps (128 threads, 8 output columns per warp). Each CTA issues one
+    contiguous 9,216 B ``cp_async_bulk_g2s_mbar`` transfer of its 32x288 B packed ``w2`` tile
+    into SMEM (9,344 B -> 10 CTAs/SM = 40 warps/SM), overlaps all 9 naturally 4-byte aligned
+    ``s2`` scale loads with TMA flight, reads weight fragments via ``ldmatrix_m8n8x4_b16``
+    (plus two SMEM loads for the K64 tail), and writes coalesced BF16 ``y [pairs, n]``."""
 
     threads = 128
-    tile_n = 64
-    groups = 2
+    tile_n = 32
 
     def __init__(self, *, n: int, k: int, experts: int, max_live: int = 16):
         self.n, self.k, self.experts = int(n), int(k), int(experts)
         self.max_live = int(max_live)
         if self.n <= 0 or self.n % self.tile_n or self.k != 576:
-            raise ValueError("DownSmallDyn requires N % 64 == 0 and K == 576")
+            raise ValueError("DownSmallDyn requires N % 32 == 0 and K == 576")
         self.row_bytes = self.k // 2       # 288 B
         self.scale_bytes = self.k // 16    # 36 B (9 u32 words)
+        self.tile_bytes = self.tile_n * self.row_bytes  # 9,216 B (multiple of 128 B)
         self.amax_offset = nvfp4_amax_offset(experts, self.n, self.k)
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("down_small_dyn", 1, self.n, self.k, self.experts, self.max_live)
+        return ("down_small_dyn", 2, self.n, self.k, self.experts, self.tile_n, self.max_live)
+
+    def _storage(self):
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "w": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, self.tile_bytes], 128],
+            "mbar": cute.struct.MemRange[cutlass.Int64, 1],
+        }
+        return cute.struct(Storage)
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer,
@@ -1381,19 +1370,11 @@ class DownSmallDyn:
             grid=(self.n // self.tile_n, grid_tiles, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.jit
-    def _load_w128(self, buf: cute.Tensor, w_row0: Int64, w_row1: Int64, k_byte: cutlass.Constexpr,
-                   c: Int32, policy: Uint64):
-        off = Int64(k_byte) + Int64(c) * Int64(16)
-        r0, r1, r2, r3 = ld_global_nc_v4_u32_l2hint(w_row0 + off, policy, no_allocate=True)
-        r4, r5, r6, r7 = ld_global_nc_v4_u32_l2hint(w_row1 + off, policy, no_allocate=True)
-        buf[0], buf[1], buf[2], buf[3] = r0, r1, r2, r3
-        buf[4], buf[5], buf[6], buf[7] = r4, r5, r6, r7
-
-    @cute.jit
-    def _mma_k128_g2(self, acc: cute.Tensor, w_buf: cute.Tensor, a_lo_ptr: Int64, a_hi_ptr: Int64,
-                     k_byte: cutlass.Constexpr, live_lo: Int32, live_hi: Int32, has_hi: Int32,
-                     sfa_lo_w: Uint32, sfa_hi_w: Uint32, sfb0_w: Uint32, sfb1_w: Uint32,
-                     lane0: Int32, lane1: Int32, c: Int32):
+    def _mma_smem_k128(self, acc: cute.Tensor, w_ldm_row: Int32, a_lo_ptr: Int64, a_hi_ptr: Int64,
+                       k_byte: cutlass.Constexpr, live_lo: Int32, live_hi: Int32, has_hi: Int32,
+                       sfa_lo_w: Uint32, sfa_hi_w: Uint32, sfb_w: Uint32, lane0: Int32, lane1: Int32,
+                       c: Int32):
+        b0, b1, b2, b3 = ldmatrix_m8n8x4_b16(w_ldm_row + Int32(k_byte))
         al0, al1, al2, al3 = _ld_nc_v4_u32_pred(a_lo_ptr + Int64(k_byte) + Int64(c) * Int64(16), live_lo)
         al0, al1, al2, al3 = _quad_transpose_x4(al0, al1, al2, al3, c)
         ah0, ah1, ah2, ah3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
@@ -1413,26 +1394,19 @@ class DownSmallDyn:
                 sfa_1h = _shfl_idx_u32(sfa_hi_w, lane1)
                 sfa_0 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa_0h, sfa_0))
                 sfa_1 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa_1h, sfa_1))
-        # Group 0
-        b0, b1, b2, b3 = _quad_transpose_x4(w_buf[0], w_buf[1], w_buf[2], w_buf[3], c)
         d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-            acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa_0, _shfl_idx_u32(sfb0_w, lane0))
+            acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa_0, _shfl_idx_u32(sfb_w, lane0))
         d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-            d0, d1, d2, d3, al2, ah2, al3, ah3, b2, b3, sfa_1, _shfl_idx_u32(sfb0_w, lane1))
+            d0, d1, d2, d3, al2, ah2, al3, ah3, b2, b3, sfa_1, _shfl_idx_u32(sfb_w, lane1))
         acc[0], acc[1], acc[2], acc[3] = d0, d1, d2, d3
-        # Group 1
-        b4, b5, b6, b7 = _quad_transpose_x4(w_buf[4], w_buf[5], w_buf[6], w_buf[7], c)
-        e0, e1, e2, e3 = nvfp4_mma_m16n8k64_f32_e2m1(
-            acc[4], acc[5], acc[6], acc[7], al0, ah0, al1, ah1, b4, b5, sfa_0, _shfl_idx_u32(sfb1_w, lane0))
-        e0, e1, e2, e3 = nvfp4_mma_m16n8k64_f32_e2m1(
-            e0, e1, e2, e3, al2, ah2, al3, ah3, b6, b7, sfa_1, _shfl_idx_u32(sfb1_w, lane1))
-        acc[4], acc[5], acc[6], acc[7] = e0, e1, e2, e3
 
     @cute.kernel
     def kernel(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer,
                s: cute.Pointer, y: cute.Pointer, row_amax: cute.Pointer):
         n_blk = Int32(cute.arch.block_idx()[0])
         tile = Int32(cute.arch.block_idx()[1])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
         if tile < _i32_at(Int64(meta.toint()), 1):
             e, first, live = _chunk(meta, self.experts, tile)
             tidx = Int32(cute.arch.thread_idx()[0])
@@ -1440,25 +1414,34 @@ class DownSmallDyn:
             lane = tidx % Int32(32)
             q = lane // Int32(4)
             c = lane % Int32(4)
+            mat = lane // Int32(8)
+            mrow = lane % Int32(8)
             quad_base = q * Int32(4)
-            n0 = n_blk * Int32(self.tile_n) + warp_id * Int32(16)
-            w_idx0 = Int64(e) * Int64(self.n) + Int64(n0 + q)
-            w_idx1 = w_idx0 + Int64(8)
-            w_row0 = Int64(w.toint()) + w_idx0 * Int64(self.row_bytes)
-            w_row1 = Int64(w.toint()) + w_idx1 * Int64(self.row_bytes)
-            s_row0 = Int64(s.toint()) + w_idx0 * Int64(self.scale_bytes)
-            s_row1 = Int64(s.toint()) + w_idx1 * Int64(self.scale_bytes)
+            mbar = storage.mbar.data_ptr()
+            sw = shared_ptr_to_u32(storage.w.data_ptr())
+            if tidx == Int32(0):
+                cute.arch.mbarrier_init(mbar, 1)
+                cute.arch.mbarrier_init_fence()
+            cute.arch.sync_threads()
+            w_tile_addr = Int64(w.toint()) + (Int64(e) * Int64(self.n) + Int64(n_blk) * Int64(self.tile_n)) * Int64(self.row_bytes)
+            if tidx == Int32(0):
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar, self.tile_bytes)
+                cp_async_bulk_g2s_mbar(sw, w_tile_addr, Int32(self.tile_bytes), shared_ptr_to_u32(mbar))
+
+            # Overlap naturally 4-byte aligned s2 scale preloads (ABI align=4) with bulk TMA flight.
+            n0 = n_blk * Int32(self.tile_n) + warp_id * Int32(8)
+            w_idx = Int64(e) * Int64(self.n) + Int64(n0 + q)
+            s_row = Int64(s.toint()) + w_idx * Int64(self.scale_bytes)
+            policy = create_l2_evict_first_policy()
+            sfb0 = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
+            sfb1 = ld_global_nc_u32_l2hint(s_row + Int64(16) + Int64(c) * Int64(4), policy)
+            sfb2 = ld_global_nc_u32_l2hint(s_row + Int64(32), policy)
             expert_factor = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
                 * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)))
-            policy = create_l2_evict_first_policy()
 
-            # Preload all 9 scale words (36 B/row) of both weight groups once per CTA.
-            sfb0_0 = ld_global_nc_u32(s_row0 + Int64(c) * Int64(4))
-            sfb0_1 = ld_global_nc_u32(s_row0 + Int64(16) + Int64(c) * Int64(4))
-            sfb0_2 = ld_global_nc_u32(s_row0 + Int64(32))
-            sfb1_0 = ld_global_nc_u32(s_row1 + Int64(c) * Int64(4))
-            sfb1_1 = ld_global_nc_u32(s_row1 + Int64(16) + Int64(c) * Int64(4))
-            sfb1_2 = ld_global_nc_u32(s_row1 + Int64(32))
+            cute.arch.mbarrier_wait(mbar, 0)
+            w_ldm_row = sw + (warp_id * Int32(8) + mrow) * Int32(self.row_bytes) + mat * Int32(16)
+            w_smem_row = sw + (warp_id * Int32(8) + q) * Int32(self.row_bytes) + c * Int32(4)
 
             m_chunks = (live + Int32(15)) // Int32(16)
             for m_chunk in cutlass.range(m_chunks, unroll=1):
@@ -1486,32 +1469,19 @@ class DownSmallDyn:
                         sfa1_hi = _ld_nc_u32_pred(as_hi_ptr + Int64(16) + Int64(c) * Int64(4), live_hi)
                         sfa2_hi = _ld_nc_u32_pred(as_hi_ptr + Int64(32), live_hi)
 
-                acc = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Float32)
-                for v in cutlass.range_constexpr(8):
+                acc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                for v in cutlass.range_constexpr(4):
                     acc[v] = Float32(0.0)
-                w0 = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
-                w1_buf = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
 
-                # Unrolled ping-pong over K = 576 = 4 * 128 + 64.
-                self._load_w128(w0, w_row0, w_row1, 0, c, policy)
-
-                self._load_w128(w1_buf, w_row0, w_row1, 64, c, policy)
-                self._mma_k128_g2(acc, w0, a_lo_ptr, a_hi_ptr, 0, live_lo, live_hi, has_hi,
-                                  sfa0_lo, sfa0_hi, sfb0_0, sfb1_0, quad_base, quad_base + Int32(1), c)
-
-                self._load_w128(w0, w_row0, w_row1, 128, c, policy)
-                self._mma_k128_g2(acc, w1_buf, a_lo_ptr, a_hi_ptr, 64, live_lo, live_hi, has_hi,
-                                  sfa0_lo, sfa0_hi, sfb0_0, sfb1_0, quad_base + Int32(2), quad_base + Int32(3), c)
-
-                self._load_w128(w1_buf, w_row0, w_row1, 192, c, policy)
-                self._mma_k128_g2(acc, w0, a_lo_ptr, a_hi_ptr, 128, live_lo, live_hi, has_hi,
-                                  sfa1_lo, sfa1_hi, sfb0_1, sfb1_1, quad_base, quad_base + Int32(1), c)
-
-                # Prefetch final K64 tail (32 B sector at offset 256) before computing block 3.
-                t0, t1 = _ld_nc_v2_u32_noalloc_l2hint(w_row0 + Int64(256) + Int64(c) * Int64(8), policy)
-                t2, t3 = _ld_nc_v2_u32_noalloc_l2hint(w_row1 + Int64(256) + Int64(c) * Int64(8), policy)
-                self._mma_k128_g2(acc, w1_buf, a_lo_ptr, a_hi_ptr, 192, live_lo, live_hi, has_hi,
-                                  sfa1_lo, sfa1_hi, sfb0_1, sfb1_1, quad_base + Int32(2), quad_base + Int32(3), c)
+                # Unrolled K = 576 = 4 * 128 + 64 directly from TMA-loaded SMEM tile.
+                self._mma_smem_k128(acc, w_ldm_row, a_lo_ptr, a_hi_ptr, 0, live_lo, live_hi, has_hi,
+                                    sfa0_lo, sfa0_hi, sfb0, quad_base, quad_base + Int32(1), c)
+                self._mma_smem_k128(acc, w_ldm_row, a_lo_ptr, a_hi_ptr, 64, live_lo, live_hi, has_hi,
+                                    sfa0_lo, sfa0_hi, sfb0, quad_base + Int32(2), quad_base + Int32(3), c)
+                self._mma_smem_k128(acc, w_ldm_row, a_lo_ptr, a_hi_ptr, 128, live_lo, live_hi, has_hi,
+                                    sfa1_lo, sfa1_hi, sfb1, quad_base, quad_base + Int32(1), c)
+                self._mma_smem_k128(acc, w_ldm_row, a_lo_ptr, a_hi_ptr, 192, live_lo, live_hi, has_hi,
+                                    sfa1_lo, sfa1_hi, sfb1, quad_base + Int32(2), quad_base + Int32(3), c)
 
                 # Step 8 (K = 512..575).
                 al0, al1 = _ld_nc_v2_u32_pred(a_lo_ptr + Int64(256) + Int64(c) * Int64(8), live_lo)
@@ -1527,25 +1497,21 @@ class DownSmallDyn:
                 if const_expr(self.max_live > 8):
                     if has_hi != Int32(0):
                         sfa_t = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa2_hi, sfa2_lo))
-                b0, b1 = _quad_unpack_v2(t0, t1, lane)
+                b0 = ld_shared_u32_at(w_smem_row + Int32(256))
+                b1 = ld_shared_u32_at(w_smem_row + Int32(272))
                 d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
-                    acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa_t, sfb0_2)
-                b2, b3 = _quad_unpack_v2(t2, t3, lane)
-                e0, e1, e2, e3 = nvfp4_mma_m16n8k64_f32_e2m1(
-                    acc[4], acc[5], acc[6], acc[7], al0, ah0, al1, ah1, b2, b3, sfa_t, sfb1_2)
+                    acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa_t, sfb2)
 
                 # Epilogue: coalesced BF16 stores directly to y [pairs, n].
                 if q < chunk_live:
                     factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(p_lo) * Int64(4)) * expert_factor
                     y_lo = Int64(y.toint()) + (Int64(p_lo) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
                     st_global_u32(y_lo, pack_f32x2_to_bfloat2(d0 * factor_lo, d1 * factor_lo))
-                    st_global_u32(y_lo + Int64(16), pack_f32x2_to_bfloat2(e0 * factor_lo, e1 * factor_lo))
                 if const_expr(self.max_live > 8):
                     if q + Int32(8) < chunk_live:
                         factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(p_hi) * Int64(4)) * expert_factor
                         y_hi = Int64(y.toint()) + (Int64(p_hi) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
                         st_global_u32(y_hi, pack_f32x2_to_bfloat2(d2 * factor_hi, d3 * factor_hi))
-                        st_global_u32(y_hi + Int64(16), pack_f32x2_to_bfloat2(e2 * factor_hi, e3 * factor_hi))
 
 
 class CombineSmallDyn:
@@ -1594,5 +1560,5 @@ class CombineSmallDyn:
             pack_f32x2_to_bfloat2(acc[4], acc[5]), pack_f32x2_to_bfloat2(acc[6], acc[7]))
 
 
-__all__ += ["ChunkActDyn", "PrepGammaSmallDyn", "QuantRowsSmallDyn", "GateUpSmallDyn",
+__all__ += ["ChunkActDyn", "PrepQuantSmallDyn", "GateUpSmallDyn",
             "ChunkActSmallDyn", "DownSmallDyn", "CombineSmallDyn"]
