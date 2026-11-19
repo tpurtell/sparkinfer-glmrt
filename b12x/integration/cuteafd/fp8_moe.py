@@ -92,7 +92,8 @@ from ._mxfp8_moe_stream import GroupedGamma, StreamMxfp8Down, StreamMxfp8GateUp
 from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
-from ._nvfp4_moe_dynamic import (ChunkActDyn, ChunkRowsDyn, StreamNvfp4GateUpDyn,
+from ._nvfp4_moe_dynamic import (ChunkActDyn, ChunkActSmallDyn, ChunkRowsDyn, CombineSmallDyn, DownSmallDyn,
+                                 GateUpSmallDyn, PrepGammaSmallDyn, QuantRowsSmallDyn, StreamNvfp4GateUpDyn,
                                  StreamNvfp4LinearDyn, nvfp4_amax_offset)
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
@@ -956,11 +957,27 @@ class _StreamNvfp4DynRoute:
                                 for n in (32, 64, 128))
         self.core_only = False
         self.combine = MoeCombine(hidden=h, top_k=k, unit_weights=True)
+        self.fast_small_m = (
+            h == 4608 and i == 576 and e == 384 and k == 8 and int(max_rows) <= 16
+        )
+        if self.fast_small_m:
+            max_live = 8 if int(max_rows) == 1 else 16
+            self.prep_small = PrepGammaSmallDyn(experts=e, top_k=k, max_tiles=self.max_tiles)
+            self.rows_small = QuantRowsSmallDyn(k=h, input_kind=input_kind or "bf16")
+            self.gate_small = GateUpSmallDyn(inter=i, hidden=h, experts=e, max_live=max_live, **caps)
+            self.act_small = ChunkActSmallDyn(inter=i)
+            self.down_small = DownSmallDyn(n=h, k=i, experts=e, max_live=max_live)
+            self.combine_small = CombineSmallDyn(hidden=h, top_k=k)
 
     def key(self) -> tuple:
-        return ("stream_nvfp4_dyn", self.max_tiles, self.rows_in.key(), self.gamma.key(), self.gate_up.key(),
+        base = ("stream_nvfp4_dyn", self.max_tiles, self.rows_in.key(), self.gamma.key(), self.gate_up.key(),
                 self.act.key(), self.down.key(), self.combine.key(),
                 tuple(p.key() for p in self.small_gate), tuple(p.key() for p in self.small_down))
+        if self.fast_small_m:
+            return base + ("small_m_fast", 1, self.prep_small.key(), self.rows_small.key(),
+                           self.gate_small.key(), self.act_small.key(), self.down_small.key(),
+                           self.combine_small.key())
+        return base
 
     @cute.jit
     def __call__(self, x: cute.Pointer, ids: cute.Pointer, weights: cute.Pointer, w1: cute.Pointer,
@@ -997,31 +1014,40 @@ class _StreamNvfp4DynRoute:
         aq, a_s, aamax = ptr(cutlass.Uint8, aq_at), ptr(cutlass.Uint8, as_at), ptr(cutlass.Float32, aamax_at)
         y = ptr(cutlass.BFloat16, y_at)
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
-        self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
-        self.gamma(pair_pos, weights, gamma, rows, stream)
-        self.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
-        dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
-        sms = runtime_num_sm()
-        target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
-        if Int32(g.top_k * (g.slice // 16)) >= target:
-            self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
-        elif Int32(g.top_k * (g.slice // 32)) >= target:
-            self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+        if cutlass.const_expr(self.fast_small_m):
+            self.prep_small(ids_i, weights, meta, pair_row, pair_pos, gamma, rows, stream)
+            self.rows_small(x, xq, xs, xamax, rows, stream)
+            self.gate_small(xq, xs, pair_row, meta, w1, s1, w3, s3, xamax, gamma, act16, part, pairs, stream)
+            self.act_small(act16, part, meta, aq, a_s, aamax, pairs, stream)
+            self.down_small(aq, a_s, meta, w2, s2, y, aamax, pairs, stream)
+            if cutlass.const_expr(not self.core_only):
+                self.combine_small(y, pair_pos, out, rows, stream)
         else:
-            self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
-        if pairs > Int32(16):
-            self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
-        self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
-        if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
-            self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-        elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
-            self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-        else:
-            self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-        if pairs > Int32(16):
-            self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-        if cutlass.const_expr(not self.core_only):
-            self.combine(y, pair_pos, weights, out, rows, stream)
+            self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
+            self.gamma(pair_pos, weights, gamma, rows, stream)
+            self.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
+            dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
+            sms = runtime_num_sm()
+            target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
+            if Int32(g.top_k * (g.slice // 16)) >= target:
+                self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+            elif Int32(g.top_k * (g.slice // 32)) >= target:
+                self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+            else:
+                self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+            if pairs > Int32(16):
+                self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+            self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
+            if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
+                self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+            elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
+                self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+            else:
+                self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+            if pairs > Int32(16):
+                self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+            if cutlass.const_expr(not self.core_only):
+                self.combine(y, pair_pos, weights, out, rows, stream)
 
 
 def _segmented_route(g: Fp8MoeGeometry, route: str, max_rows: int, wire: bool, prefill: str = "auto",
