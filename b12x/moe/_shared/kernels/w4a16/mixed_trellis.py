@@ -33,6 +33,7 @@ from b12x._lib.intrinsics import (
     ld_global_acquire_i32,
     ld_global_nc_v2_u32,
     pack_f32x2_to_f16x2,
+    prefetch_bulk_global_l2,
     shared_ptr_to_u32,
     st_global_release_i32,
     st_global_v2_u32,
@@ -418,7 +419,8 @@ class W4A16MixedTrellisKernel:
         ) + (
             () if self.descriptor_bits == 9 else ("descriptor_bits", self.descriptor_bits)
         ) + (("compact_weights_v2",) if self.compact_weights else ()) + (
-            ("group_decode_v1",) if self.group_decode else ()
+            (("group_compact_live_v2",) if self.compact_weights else ("group_decode_v1",))
+            if self.group_decode else ()
         )
 
     @cute.jit
@@ -1329,6 +1331,106 @@ class W4A16MixedTrellisKernel:
                  Int32(1), Int32(0), Int32(0))
             tile += peers
 
+    @cute.jit
+    def _group_live_half(self, block, experts, descriptors, total_experts):
+        expert = experts[block].to(Int32)
+        half = Int32(0)
+        if expert >= Int32(0) and expert < total_experts:
+            width = descriptors[3 * total_experts + expert].to(Int32)
+            if width > Int32(0):
+                half = width // Int32(self.driver.fc1.tile_n)
+        return half
+
+    @cute.jit
+    def _group_prefix(self, value, lane):
+        # Only the first eight lanes can own groups.
+        for i in cutlass.range_constexpr(3):
+            prev = cute.arch.shuffle_sync_up(value, offset=1 << i, mask_and_clamp=0)
+            if lane >= Int32(1 << i):
+                value += prev
+        return value
+
+    @cute.jit
+    def _compact_group(self, blocks, groups, shift, experts, descriptors, total_experts, cta, grid_x):
+        # Every warp independently builds the same plan in registers. One lane
+        # per group counts live tiles over its range; no CTA broadcasts or
+        # global work queues. Even an empty range gets a (no-op) owner.
+        lane = cute.arch.lane_idx()
+        first = Int32(0)
+        stop = Int32(0)
+        load = Int32(0)
+        if lane < groups:
+            first = self._group_boundary((blocks * lane) >> shift, blocks, experts)
+            stop = self._group_boundary((blocks * (lane + Int32(1))) >> shift, blocks, experts)
+            block = first
+            while block < stop:
+                load += Int32(2) * self._group_live_half(block, experts, descriptors, total_experts)
+                block += Int32(1)
+        prefix = self._group_prefix(load, lane)
+        total = cute.arch.shuffle_sync(prefix, groups - Int32(1))
+        # Reserve the minimum integer CTA quota for each group's live FC1
+        # work to finish in 'waves'. Ceilings may oversubscribe the grid.
+        waves = max(Int32(1), (total + grid_x - Int32(1)) // grid_x)
+        required = grid_x + Int32(1)
+        quota = Int32(0)
+        quota_end = Int32(0)
+        while required > grid_x:
+            if lane < groups:
+                quota = max(Int32(1), (load + waves - Int32(1)) // waves)
+            quota_end = self._group_prefix(quota, lane)
+            required = cute.arch.shuffle_sync(quota_end, groups - Int32(1))
+            waves += Int32(1)
+        # Allocate any remainder by cumulative live width (also proportional
+        # to FC2 weight bytes at a fixed rate). Endpoints tile [0, grid_x).
+        end = quota_end + (grid_x - required) * prefix // max(Int32(1), total)
+        if total == Int32(0):
+            end = (grid_x * (lane + Int32(1))) >> shift
+        mask = cute.arch.vote_ballot_sync((lane < groups) & (cta >= end))
+        owner = Int32(cute.arch.popc(mask))
+        start_cta = cute.arch.shuffle_sync(end, max(Int32(0), owner - Int32(1)))
+        if owner == Int32(0):
+            start_cta = Int32(0)
+        peers = cute.arch.shuffle_sync(end, owner) - start_cta
+        return (owner, cta - start_cta, peers, cute.arch.shuffle_sync(first, owner),
+                cute.arch.shuffle_sync(stop, owner))
+
+    @cute.jit
+    def _group_compact_fc1(self, emit: cutlass.Constexpr, experts, descriptors, total_experts,
+                           first, stop, rank, peers, tid, w2_0, w2_1, down_0, down_1):
+        # Carry a live tile ticket across expert boundaries: padded gate/up
+        # tails consume no ticket. Restore physical N only at the emitter.
+        tile = rank
+        block = first
+        while block < stop:
+            half = self._group_live_half(block, experts, descriptors, total_experts)
+            count = Int32(2) * half
+            while tile < count:
+                n = tile
+                if tile >= half:
+                    n += Int32(self.driver.fc1.n_tiles // 2) - half
+                emit(block, n, Int32(0), Int32(self.driver.fc1.k_tiles),
+                     Int32(1), Int32(0), Int32(0))
+                tile += peers
+            # In a one-block group excess CTAs cannot steal a whole FC1
+            # tile. Give one of them the down projection's contiguous native
+            # weight span to warm while the other ranks compute gate and up.
+            if stop - first == Int32(1) and rank == count and tid == Int32(0) and half > Int32(0):
+                e = experts[block].to(Int32)
+                descriptor = descriptors[2 * total_experts + e].to(Int32)
+                if descriptor >= Int32(0):
+                    tier = descriptor >> Int32(self.descriptor_bits)
+                    local = descriptor & Int32((1 << self.descriptor_bits) - 1)
+                    off = descriptors[6 * total_experts + e].to(Int64)
+                    elems = half * Int32(self.driver.fc1.tile_n * self.hidden_size)
+                    if tier == Int32(0) and local < down_0:
+                        prefetch_bulk_global_l2(get_ptr_as_int64(w2_0, off),
+                                                elems * Int32(self.tier0.fc2.trellis_bits) // Int32(8))
+                    if tier == Int32(1) and local < down_1:
+                        prefetch_bulk_global_l2(get_ptr_as_int64(w2_1, off),
+                                                elems * Int32(self.tier1.fc2.trellis_bits) // Int32(8))
+            tile -= count
+            block += Int32(1)
+
     @cute.kernel
     def group_kernel(self, operands: tuple):
         (
@@ -1379,11 +1481,16 @@ class W4A16MixedTrellisKernel:
         elif blocks >= Int32(2) and grid_x >= Int32(2 * 6):
             shift = Int32(1)
         groups = Int32(1) << shift
-        group = cta & (groups - Int32(1))
-        rank = cta >> shift
-        peers = (grid_x + groups - Int32(1) - group) >> shift
-        first = self._group_boundary((blocks * group) >> shift, blocks, experts)
-        stop = self._group_boundary((blocks * (group + Int32(1))) >> shift, blocks, experts)
+        if cutlass.const_expr(self.compact_weights):
+            group, rank, peers, first, stop = self._compact_group(
+                blocks, groups, shift, experts, descriptor_map, total_experts, cta, grid_x,
+            )
+        else:
+            group = cta & (groups - Int32(1))
+            rank = cta >> shift
+            peers = (grid_x + groups - Int32(1) - group) >> shift
+            first = self._group_boundary((blocks * group) >> shift, blocks, experts)
+            stop = self._group_boundary((blocks * (group + Int32(1))) >> shift, blocks, experts)
         if first < stop:
             block_m = Int32(self.driver.moe_block_size)
             slots = (stop - first) * block_m
@@ -1398,7 +1505,11 @@ class W4A16MixedTrellisKernel:
                 tid, rank, peers, active_m,
             )
             self._group_barrier(workspace, group, 0, tid, peers)
-            self._group_gemm(fc1_emit, self.driver.fc1, first, stop, rank, peers)
+            if cutlass.const_expr(self.compact_weights):
+                self._group_compact_fc1(fc1_emit, experts, descriptor_map, total_experts,
+                                        first, stop, rank, peers, tid, t0_w2, t1_w2, t0_down, t1_down)
+            else:
+                self._group_gemm(fc1_emit, self.driver.fc1, first, stop, rank, peers)
             self._group_barrier(workspace, group, 1, tid, peers)
             self.driver._run_activation_compact(
                 fc1, activated, intermediate_rotations, routes, ids, count,
