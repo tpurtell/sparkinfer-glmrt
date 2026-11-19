@@ -379,3 +379,134 @@ def test_sm121_k4_decode_selector_dispatches_mul1_and_mcg_before_cuda(
         assert len(selected) == 1
         assert isinstance(selected[0], W4A16MixedTrellisK4Decode)
         assert selected[0].tier0.trellis_codebook == cb
+
+
+@pytest.mark.parametrize(
+    ("codebook_arg", "bits"),
+    [
+        ("mul1", (2, 3, 4, 5)),
+        ("mul1", (3, 4, 5, 6)),
+        ("mul1", (2, 4, 5, 6)),
+        (MUL1_MULTIPLIER, (2, 3, 5, 6)),
+    ],
+)
+def test_mixed_trellis4_format_accepts_mul1_and_separates_cache_keys_on_cpu(
+    monkeypatch,
+    codebook_arg: str | int,
+    bits: tuple[int, int, int, int],
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis4
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis4 import (
+        W4A16MixedTrellis4Kernel,
+        _normalize_mixed_trellis_format,
+    )
+
+    normalized, normalized_bits = _normalize_mixed_trellis_format(codebook_arg, bits)
+    assert normalized == "mul1"
+    assert normalized_bits == bits
+
+    for bad_bits, match in (
+        ((1, 2, 3, 4), "mul1 is defined only for K2/K3/K4/K5/K6"),
+        ((2, 3, 4, 7), "mul1 is defined only for K2/K3/K4/K5/K6"),
+        ((2, 3, 4), "four distinct bitrates"),
+        ((2, 3, 3, 4), "four distinct bitrates"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            _normalize_mixed_trellis_format("mul1", bad_bits)
+
+    def make_moe(num_experts: int, tier_bits: int, codebook: str) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=16,
+            hidden_size=512,
+            intermediate_size=256,
+            num_experts=num_experts,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=128,
+            fc1_tile_k=64,
+            fc2_tile_n=128,
+            fc2_tile_k=64,
+            moe_block_size=16,
+            max_m_blocks=8,
+            element_dtype="fp16",
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj",
+            trellis_bits=tier_bits,
+            trellis_codebook=codebook,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype="bf16",
+            workspace_sms=48,
+            schedule_whole_tiles=True,
+        )
+
+    mul1_k4t = W4A16MixedTrellis4Kernel(
+        driver=make_moe(8, bits[0], "mul1"),
+        tier0=make_moe(2, bits[0], "mul1"),
+        tier1=make_moe(2, bits[1], "mul1"),
+        tier2=make_moe(2, bits[2], "mul1"),
+        tier3=make_moe(2, bits[3], "mul1"),
+    )
+    mcg_k4t = W4A16MixedTrellis4Kernel(
+        driver=make_moe(8, bits[0], "mcg"),
+        tier0=make_moe(2, bits[0], "mcg"),
+        tier1=make_moe(2, bits[1], "mcg"),
+        tier2=make_moe(2, bits[2], "mcg"),
+        tier3=make_moe(2, bits[3], "mcg"),
+    )
+    assert mul1_k4t.__cache_key__ != mcg_k4t.__cache_key__
+
+    with pytest.raises(ValueError, match="disagree on trellis_codebook"):
+        W4A16MixedTrellis4Kernel(
+            driver=make_moe(8, bits[0], "mul1"),
+            tier0=make_moe(2, bits[0], "mul1"),
+            tier1=make_moe(2, bits[1], "mul1"),
+            tier2=make_moe(2, bits[2], "mul1"),
+            tier3=make_moe(2, bits[3], "mcg"),
+        )
+
+    class _StopBeforeCuda(Exception):
+        pass
+
+    captured: list[W4A16MixedTrellis4Kernel] = []
+
+    def capture(build, **_kwargs):
+        captured.append(build(False))
+        raise _StopBeforeCuda
+
+    monkeypatch.setattr(mixed_trellis4, "_select_mixed_fc2_kernel", capture)
+    with pytest.raises(_StopBeforeCuda):
+        mixed_trellis4.compile_mixed_trellis4(
+            size_m=16,
+            hidden_size=512,
+            intermediate_size=256,
+            tier0_num_experts=2,
+            tier1_num_experts=2,
+            tier2_num_experts=2,
+            tier3_num_experts=2,
+            route_num_experts=600,
+            top_k=2,
+            max_m_blocks=16,
+            sms=48,
+            max_shared_mem=101376,
+            force_tile_config=(64, 128, 64, 128),
+            tier0_bits=bits[0],
+            tier1_bits=bits[1],
+            tier2_bits=bits[2],
+            tier3_bits=bits[3],
+            trellis_codebook=codebook_arg,
+            decode_schedule="gb10",
+        )
+    assert len(captured) == 1
+    assert captured[0].descriptor_bits == 10
+    for name in ("driver", "tier0", "tier1", "tier2", "tier3"):
+        fused = getattr(captured[0], name)
+        assert fused.trellis_codebook == "mul1"
+        assert fused.fc1.l2_evict_first_b and fused.fc2.l2_evict_first_b
+
