@@ -170,7 +170,8 @@ def _run_shape(args, shape, rows, cls, source):
         from spark_native_replay import native_plan
         plan = native_plan(shape, args.aot_root)
         return _run_replay(args, shape, rows, source, plan.select(rows),
-                           plan.select((1, 8, 80)), plan.make, plan.metadata)
+                           plan.select(tuple(shape.get('prefix_rows', (1, 8, 80)))),
+                           plan.make, plan.metadata)
     paths, metas, selected = _replay_buckets(shape, args.aot_root, rows)
     resolved = [shape[k] for k in ('hidden', 'intermediate', 'experts', 'top_k', 'bits')]
     h, _, e, _, _ = resolved
@@ -193,7 +194,7 @@ def _run_shape(args, shape, rows, cls, source):
 
 
 def _run_replay(args, shape, rows, source, selected, prefixes, make, metadata):
-    ids = routes(shape, max(max(rows), 80), args.seed)
+    ids = routes(shape, max(max(rows), max(prefixes), 80), args.seed)
     h, top_k = shape['hidden'], shape['top_k']
     rng = torch.Generator(device='cuda').manual_seed(args.seed + 1)
     x = (torch.randn((len(ids), h), device='cuda', generator=rng) * 2.).to(torch.float8_e4m3fn).view(torch.uint8)
@@ -300,7 +301,9 @@ def replay_spark_shapes(args, cls, source):
             plan = _replay_buckets(shape, args.aot_root, rows)[2]
         else:
             from spark_native_replay import native_plan
-            plan = native_plan(shape, args.aot_root).select(rows)
+            native = native_plan(shape, args.aot_root)
+            native.select(tuple(shape.get('prefix_rows', (1, 8, 80))))
+            plan = native.select(rows)
         print(json.dumps(plan))
         return
     if torch.cuda.get_device_capability() != (12, 1):
