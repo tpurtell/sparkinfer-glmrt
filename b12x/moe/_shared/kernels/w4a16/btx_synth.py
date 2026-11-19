@@ -36,7 +36,12 @@ from b12x.moe._shared.btx_schema import (
     rate_code,
     rate_code_bits,
 )
-from b12x.moe._shared.trellis_codebooks import MCG, MCG_MULTIPLIER
+from b12x.moe._shared.trellis_codebooks import (
+    MCG,
+    MCG_MULTIPLIER,
+    MUL1,
+    MUL1_MULTIPLIER,
+)
 
 
 @dataclass(frozen=True)
@@ -262,6 +267,8 @@ def _manifest_dict(config: BtxSynthConfig) -> dict:
     }
     if config.codebook == MCG:
         manifest["codebook_seed"] = MCG_MULTIPLIER
+    elif config.codebook == MUL1:
+        manifest["codebook_seed"] = MUL1_MULTIPLIER
     return manifest
 
 

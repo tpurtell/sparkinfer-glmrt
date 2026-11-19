@@ -112,7 +112,7 @@ class TrellisWeights:
 
 @dataclass(frozen=True, kw_only=True)
 class Exl3TrellisWeights:
-    """Projection-major uniform EXL3 MCG tiles and rotation vectors."""
+    """Projection-major uniform EXL3 MCG/MUL1 tiles and rotation vectors."""
 
     w13: torch.Tensor
     w2: torch.Tensor
@@ -120,7 +120,8 @@ class Exl3TrellisWeights:
     up_suh: torch.Tensor
     intermediate_rotations: torch.Tensor
     down_svh: torch.Tensor
-    mcg: torch.Tensor | int
+    mcg: torch.Tensor | int | None = None
+    mul1: torch.Tensor | int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -128,8 +129,23 @@ class Exl3TrellisWeights:
         ):
             if not isinstance(getattr(self, name), torch.Tensor):
                 raise TypeError(f"Exl3TrellisWeights.{name} must be a tensor")
-        if not isinstance(self.mcg, (torch.Tensor, int)):
-            raise TypeError("Exl3TrellisWeights.mcg must be a tensor or integer")
+        if (self.mcg is None) == (self.mul1 is None):
+            if self.mcg is None:
+                raise ValueError(
+                    "Exl3TrellisWeights requires either mcg or mul1 checkpoint marker"
+                )
+            raise ValueError(
+                "Exl3TrellisWeights cannot declare both mcg and mul1 checkpoint markers"
+            )
+        for marker_name in ("mcg", "mul1"):
+            marker = getattr(self, marker_name)
+            if marker is not None and (
+                isinstance(marker, bool)
+                or not isinstance(marker, (torch.Tensor, int))
+            ):
+                raise TypeError(
+                    f"Exl3TrellisWeights.{marker_name} must be a tensor or integer"
+                )
 
 
 @dataclass(frozen=True)

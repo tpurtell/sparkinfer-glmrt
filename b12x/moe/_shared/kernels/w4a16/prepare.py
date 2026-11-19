@@ -9,7 +9,11 @@ import torch
 
 from b12x.moe._shared.trellis_codebooks import (
     MCG,
+    MCG_MULTIPLIER,
+    MUL1,
+    MUL1_MULTIPLIER,
     SQG_E4M3,
+    SQG_FP16,
     normalize_codebook,
     validate_codebook_bits,
 )
@@ -1491,8 +1495,86 @@ def make_w4a16_packed_buffers(
 
 
 _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
+
+
 def _normalize_trellis256_codebook(codebook: str | int) -> str:
     return normalize_codebook(codebook)
+
+
+def _extract_exl3_marker_u32(marker: torch.Tensor | int, *, name: str) -> int:
+    if isinstance(marker, bool):
+        raise TypeError(
+            f"EXL3 {name} marker must be an int32/uint32 scalar tensor or int"
+        )
+    if isinstance(marker, torch.Tensor):
+        if (
+            marker.dtype not in (torch.int32, torch.uint32)
+            or marker.ndim not in (0, 1)
+            or marker.numel() != 1
+        ):
+            raise ValueError(
+                f"EXL3 {name} marker must be a scalar or 1-element int32/uint32 tensor"
+            )
+        return int(marker.detach().cpu().item()) & 0xFFFFFFFF
+    if isinstance(marker, int):
+        return int(marker) & 0xFFFFFFFF
+    raise TypeError(
+        f"EXL3 {name} marker must be an int32/uint32 scalar tensor or int"
+    )
+
+
+def resolve_exl3_checkpoint_codebook(
+    *,
+    mcg: torch.Tensor | int | None = None,
+    mul1: torch.Tensor | int | None = None,
+    codebook: str | int | None = None,
+    require_marker: bool = False,
+    default: str | None = MCG,
+) -> str:
+    """Resolve and cross-validate checkpoint-defined EXL3 `.mcg`/`.mul1` markers."""
+    if mcg is not None and mul1 is not None:
+        raise ValueError(
+            "multiple EXL3 codebook markers supplied (both mcg and mul1)"
+        )
+    marker_codebook: str | None = None
+    if mcg is not None:
+        marker_value = _extract_exl3_marker_u32(mcg, name="MCG")
+        if marker_value != MCG_MULTIPLIER:
+            raise ValueError(
+                f"unexpected EXL3 MCG marker {marker_value:#010x}; "
+                f"expected {MCG_MULTIPLIER:#010x}"
+            )
+        marker_codebook = MCG
+    elif mul1 is not None:
+        marker_value = _extract_exl3_marker_u32(mul1, name="MUL1")
+        if marker_value != MUL1_MULTIPLIER:
+            raise ValueError(
+                f"unexpected EXL3 MUL1 marker {marker_value:#010x}; "
+                f"expected {MUL1_MULTIPLIER:#010x}"
+            )
+        marker_codebook = MUL1
+    if require_marker and marker_codebook is None:
+        raise ValueError(
+            "EXL3 Trellis preparation requires the checkpoint MCG or MUL1 marker"
+        )
+    explicit = (
+        None if codebook is None else _normalize_trellis256_codebook(codebook)
+    )
+    if (
+        marker_codebook is not None
+        and explicit is not None
+        and marker_codebook != explicit
+    ):
+        raise ValueError(
+            "EXL3 codebook metadata disagrees: "
+            f"marker={marker_codebook!r}, codebook={explicit!r}"
+        )
+    resolved = marker_codebook or explicit or default
+    if resolved is None:
+        raise ValueError(
+            "Trellis MoE preparation requires mcg=, mul1=, or explicit codebook="
+        )
+    return _normalize_trellis256_codebook(resolved)
 
 
 def _trellis256_random_native_tensor(
@@ -1593,7 +1675,9 @@ def prepare_trellis256_moe_weights(
     w13_layout: str = "packed",
     trellis_bits: int | None = None,
     dummy_scale: torch.Tensor | None = None,
-    codebook: str | int = "mcg",
+    codebook: str | int | None = None,
+    mcg: torch.Tensor | int | None = None,
+    mul1: torch.Tensor | int | None = None,
     gate_suh: torch.Tensor | None = None,
     up_suh: torch.Tensor | None = None,
     intermediate_rotations: torch.Tensor | None = None,
@@ -1690,7 +1774,12 @@ def prepare_trellis256_moe_weights(
             "trellis_t256 has no FC2 logical-tail path: "
             f"FC2_N={hidden_size} must be divisible by fc2_tile_n={fc2_tile_n}"
         )
-    normalized_codebook = _normalize_trellis256_codebook(codebook)
+    normalized_codebook = resolve_exl3_checkpoint_codebook(
+        mcg=mcg,
+        mul1=mul1,
+        codebook=codebook,
+        default=MCG,
+    )
 
     have_w13 = w13 is not None
     have_w2 = w2 is not None
@@ -1988,6 +2077,32 @@ def prepare_trellis256_moe_weights(
     )
 
 
+_TRELLIS256_DENSE_CODEBOOKS: tuple[str, ...] = (MCG, SQG_E4M3, SQG_FP16)
+
+
+def _normalize_trellis256_dense_codebook(codebook: str | int) -> str:
+    if isinstance(codebook, bool):
+        raise ValueError(
+            f"unsupported trellis codebook {codebook!r}; expected "
+            "'mcg', 'sqg_e4m3', or 'sqg_fp16'"
+        )
+    if isinstance(codebook, int):
+        sentinel = int(codebook) & 0xFFFFFFFF
+        if sentinel == MCG_MULTIPLIER:
+            return MCG
+        raise ValueError(
+            "unsupported trellis codebook sentinel "
+            f"{sentinel:#010x}; expected MCG 0xcbac1fed"
+        )
+    text = str(codebook).strip().lower()
+    if text in _TRELLIS256_DENSE_CODEBOOKS:
+        return text
+    raise ValueError(
+        f"unsupported trellis codebook {codebook!r}; expected "
+        "'mcg', 'sqg_e4m3', or 'sqg_fp16'"
+    )
+
+
 def _trellis256_marker_codebook(
     *,
     mcg: torch.Tensor | None,
@@ -2001,6 +2116,10 @@ def _trellis256_marker_codebook(
         )
     marker_codebook: str | None = None
     if mcg is not None:
+        if isinstance(mcg, bool):
+            raise ValueError(
+                "trellis256 mcg marker must be a scalar int32/uint32 tensor"
+            )
         if not isinstance(mcg, torch.Tensor):
             marker_value = int(mcg) & 0xFFFFFFFF
         else:
@@ -2009,8 +2128,12 @@ def _trellis256_marker_codebook(
                     "trellis256 mcg marker must be a scalar int32/uint32 tensor"
                 )
             marker_value = int(mcg.item()) & 0xFFFFFFFF
-        marker_codebook = _normalize_trellis256_codebook(marker_value)
-    explicit = None if codebook is None else _normalize_trellis256_codebook(codebook)
+        marker_codebook = _normalize_trellis256_dense_codebook(marker_value)
+    explicit = (
+        None
+        if codebook is None
+        else _normalize_trellis256_dense_codebook(codebook)
+    )
     if (
         marker_codebook is not None
         and explicit is not None
@@ -2405,6 +2528,8 @@ def _finalize_prepared_trellis_weights(
     ):
         raise ValueError("workspace must be contiguous int32 on the weight device")
 
+    normalized_codebook = _normalize_trellis256_codebook(codebook)
+    validate_codebook_bits(normalized_codebook, trellis_bits)
     global_scale = torch.ones((num_experts,), dtype=torch.float32, device=device)
     return PreparedW4A16MoeWeights(
         w13=w13.view(torch.int32) if w13.dtype == torch.int16 else w13,
@@ -2426,7 +2551,7 @@ def _finalize_prepared_trellis_weights(
         weight_layout="trellis_t256",
         scale_format="e4m3_k32",
         trellis=TrellisWeightState(
-            codebook=codebook,
+            codebook=normalized_codebook,
             bits=trellis_bits,
             fc1_pair_kind=fc1_pair_kind,
             fc2_pair_kind=fc2_pair_kind,
@@ -2482,6 +2607,7 @@ __all__ = [
     "prepare_trellis256_moe_weights",
     "prepare_trellis256_dense_weight",
     "prepare_trellis256_pair_dense_weight",
+    "resolve_exl3_checkpoint_codebook",
     "prepare_w4a16_compressed_tensors_weights",
     "prepare_w4a16_e8m0_native_weights",
     "prepare_w4a16_fc2_e8m0_weights",
