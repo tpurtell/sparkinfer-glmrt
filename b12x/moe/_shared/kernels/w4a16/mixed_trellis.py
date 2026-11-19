@@ -21,21 +21,33 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.compiler import OptLevel
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Int32, Int64, T, Uint32, dsl_user_op
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.intrinsics import (
     bfloat2_to_float2_scaled,
+    cvt_bf16x2_to_f16x2_via_f32,
+    f16x2_to_f32x2,
     get_ptr_as_int64,
     half2_to_float2_scaled,
+    ld_global_acquire_i32,
     ld_global_nc_v2_u32,
+    ld_shared_i32_relaxed,
     pack_f32x2_to_f16x2,
+    red_add_global_release_i32,
     shared_ptr_to_u32,
+    st_global_i32,
     st_global_v2_u32,
+    st_shared_i32,
 )
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
+from b12x.moe._shared.kernels.activations import (
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
+)
 from b12x.moe._shared.trellis_codebooks import (
     normalize_codebook,
     validate_codebook_bits,
@@ -1544,6 +1556,1648 @@ class W4A16MixedTrellisKernel:
         )
 
 
+_K4_GROUPWISE_FAMILIES = frozenset(
+    {
+        (4608, 384, 8),  # Inkling
+        (4096, 352, 8),  # Step-5
+        (6144, 256, 8),  # GLM 5.3
+        (6144, 128, 4),  # ML4
+        (4096, 256, 8),  # Muse
+        (4096, 288, 8),  # GLM Flash K4
+    }
+)
+
+
+@dsl_user_op
+def _gw_atom_add_acq_rel_gpu_i32(
+    addr: Int64, val: Int32, *, loc=None, ip=None
+) -> Int32:
+    """GPU-scope acquire-release global int32 atomic add returning old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _gw_ld_global_cg_v2_u32(
+    base_ptr: Int64, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32]:
+    """Coherent L2-cached 64-bit global load for intra-launch phase buffers."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v2.u32 {$0, $1}, [$2];",
+        "=r,=r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _gw_vote_ballot_sync(pred: Int32, *, loc=None, ip=None) -> Uint32:
+    """Convergent warp ballot over ``pred != 0``."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(pred).ir_value(loc=loc, ip=ip)],
+            "{ .reg .pred p; setp.ne.b32 p, $1, 0; vote.sync.ballot.b32 $0, p, 0xffffffff; }",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _gw_popc_u32(val: Uint32, *, loc=None, ip=None) -> Int32:
+    """Population count of a 32-bit mask."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(val).ir_value(loc=loc, ip=ip)],
+            "popc.b32 $0, $1;",
+            "=r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _gw_warp_scan_inc_i32(val: Int32, lane: Int32) -> Int32:
+    """Inclusive intra-warp sum scan across 32 lanes."""
+    for offset in cutlass.range_constexpr(5):
+        step = 1 << offset
+        other = cute.arch.shuffle_sync_up(
+            val, offset=step, mask_and_clamp=0
+        )
+        if lane >= Int32(step):
+            val = val + other
+    return val
+
+
+class W4A16MixedTrellisGroupwiseKernel(W4A16MixedTrellisKernel):
+    """SM121 K4 small-M group-wise cooperative mixed-Trellis kernel.
+
+    At ``active_m <= 8`` (up to 64 routed token-expert pairs), partitions the
+    cooperative launch's workers into ``G`` independent groups inside a single
+    launch. Each group owns a deterministic work-balanced snake subset of the
+    packed expert blocks and runs its own ``input rotation -> FC1 -> activation
+    -> FC2`` pipeline synchronized by cache-line-isolated group-local barriers
+    in ``workspace`` rather than grid-wide barriers.
+
+    On 256-thread N256 CTAs whose per-sub-worker shared-memory footprint fits
+    within the 64 KiB L1-preserving budget (K4/K5 tiers), each CTA splits into
+    two 128-thread N128 sub-workers synchronized on independent hardware named
+    barriers (``bar 1`` and ``bar 2``), doubling active SM parallelism at small
+    M and co-locating two distinct expert groups per physical SM so compute and
+    memory phases overlap across groups. Requests with ``active_m > 8`` fall
+    through to the unmodified ``driver._moe_body`` path.
+    """
+
+    GROUP_SMEM_BYTES = 1536
+
+    OFF_HDR = 0
+    OFF_GRP_RB_PREFIX = 64
+    OFF_GRP_RT_PREFIX = 128
+    OFF_SORTED_RB = 192
+    OFF_SORTED_EXPERT = 448
+    OFF_FC1_PREFIX = 704
+    OFF_SORTED_HALF_TILES = 976
+    OFF_LIVE_ROUTES = 1232
+
+    TMP_VALID = 0
+    TMP_BUCKET = 256
+    TMP_EXPERT = 512
+    TMP_FC1_TILES = 768
+    TMP_HALF_TILES = 1024
+    TMP_ACT_NBLK = 1280
+    TMP_LIVE_CNT = 1536
+    TMP_SORTED_FC1 = 1792
+    TMP_SORTED_CNT = 2048
+    TMP_RT_PREFIX = 2304
+    TMP_ROUTES = 2576
+
+    def __init__(
+        self,
+        *,
+        driver: W4A16FusedMoeKernel,
+        tier0: W4A16FusedMoeKernel,
+        tier1: W4A16FusedMoeKernel,
+        sub_tier0: W4A16FusedMoeKernel | None = None,
+        sub_tier1: W4A16FusedMoeKernel | None = None,
+        descriptor_bits: int = 9,
+        compact_weights: bool = False,
+    ):
+        if (sub_tier0 is None) != (sub_tier1 is None):
+            raise ValueError("sub_tier0 and sub_tier1 must be supplied together")
+        super().__init__(
+            driver=driver,
+            tier0=tier0,
+            tier1=tier1,
+            descriptor_bits=descriptor_bits,
+            paired_boundary=None,
+            compact_weights=compact_weights,
+            token_major_rotation=False,
+        )
+        if (
+            self.cta_threads not in (128, 256)
+            or self.driver.moe_block_size != 8
+            or self.driver.fc2.moe_block_size != 8
+            or self.driver.fc2.schedule_route_block_factor != 1
+            or self.driver.direct_topk_routes
+            or self.driver.fused_input_rotation
+            or self.driver.broadcast_suh
+            or self.driver.coupled_hadamard
+            or self.driver.rotation_input_dtype != "bf16"
+            or self.driver.sqg_xor_cheb_t12_smem
+            or self.driver.fc1.l2_prefetch_k_tiles != 0
+            or self.driver.fc2.l2_prefetch_k_tiles != 0
+            or self.driver.phase_l2_prefetch
+            or self.hidden_size % 128 != 0
+            or self.intermediate_size % 128 != 0
+        ):
+            raise ValueError(
+                "W4A16MixedTrellisGroupwiseKernel requires packed M8 MCG BF16-input geometry"
+            )
+
+        base_bytes = ((int(self.shared_words) * 4 + 15) // 16) * 16
+        self.sub_tier0 = sub_tier0
+        self.sub_tier1 = sub_tier1
+        if sub_tier0 is not None and sub_tier1 is not None:
+            if (
+                self.cta_threads != 256
+                or sub_tier0.cta_threads != 128
+                or sub_tier1.cta_threads != 128
+                or sub_tier0.fc1.tile_n != 128
+                or sub_tier0.fc2.tile_n != 128
+                or sub_tier1.fc1.tile_n != 128
+                or sub_tier1.fc2.tile_n != 128
+                or sub_tier0.fc1.tile_k != 64
+                or sub_tier0.fc2.tile_k != 64
+            ):
+                raise ValueError(
+                    "dual sub-workers require 256-thread parent CTA and 128-thread K64xN128 sub-tiers"
+                )
+            sub_words = max(int(sub_tier0.shared_words), int(sub_tier1.shared_words))
+            sub_bytes = ((sub_words * 4 + 15) // 16) * 16
+            if 2 * sub_bytes + self.GROUP_SMEM_BYTES > 65536:
+                raise ValueError(
+                    "dual sub-worker shared memory exceeds 64 KiB L1-preserving budget"
+                )
+            self.dual_sub_workers = True
+            self.sub_worker_smem_bytes = sub_bytes
+            self.group_smem_off = max(base_bytes, 2 * sub_bytes)
+            if 2 * sub_bytes + self.GROUP_SMEM_BYTES <= 65536 and base_bytes <= 2 * sub_bytes:
+                self.group_smem_off = 2 * sub_bytes
+            total_bytes = max(base_bytes, self.group_smem_off + self.GROUP_SMEM_BYTES)
+        else:
+            self.dual_sub_workers = False
+            self.sub_worker_smem_bytes = 0
+            self.group_smem_off = base_bytes
+            total_bytes = self.group_smem_off + self.GROUP_SMEM_BYTES
+
+        self.shared_words = total_bytes // 4
+        self.gemm_fc1_tile_n = (
+            128 if self.dual_sub_workers else int(self.driver.fc1.tile_n)
+        )
+        self.gemm_fc2_tile_n = (
+            128 if self.dual_sub_workers else int(self.driver.fc2.tile_n)
+        )
+        self.gemm_fc1_n_tiles = int(self.driver.fc1_cols) // self.gemm_fc1_tile_n
+        self.gemm_fc1_half_tiles = self.gemm_fc1_n_tiles // 2
+        self.gemm_fc2_n_tiles = int(self.hidden_size) // self.gemm_fc2_tile_n
+        self.worker_threads = 128 if self.dual_sub_workers else int(self.cta_threads)
+        self.worker_warps = self.worker_threads // 32
+
+        avail_locks = int(self.driver.barrier_count_off)
+        if avail_locks < 2:
+            raise ValueError("insufficient workspace capacity for group barriers")
+        self.max_groups = 8 if avail_locks >= 16 else max(1, avail_locks // 2)
+        if avail_locks >= 256:
+            self.group_barrier_stride = 32
+        elif avail_locks >= 128:
+            self.group_barrier_stride = 16
+        else:
+            self.group_barrier_stride = max(2, avail_locks // max(self.max_groups, 1))
+
+    @property
+    def __cache_key__(self) -> tuple[object, ...]:
+        sub_key = (
+            (self.sub_tier0.__cache_key__, self.sub_tier1.__cache_key__)
+            if self.dual_sub_workers
+            else ()
+        )
+        return super().__cache_key__ + (
+            (
+                "k4_groupwise_v1",
+                self.dual_sub_workers,
+                self.sub_worker_smem_bytes,
+                self.group_smem_off,
+                self.max_groups,
+                self.group_barrier_stride,
+                sub_key,
+            ),
+        )
+
+    @cute.jit
+    def _worker_sync(self, sub_bar_id: Int32):
+        if cutlass.const_expr(self.dual_sub_workers):
+            cute.arch.barrier(
+                barrier_id=sub_bar_id,
+                number_of_threads=128,
+            )
+        else:
+            cute.arch.sync_threads()
+
+    @cute.jit
+    def _group_barrier(
+        self,
+        workspace: cute.Tensor,
+        sub_tid: Int32,
+        sub_bar_id: Int32,
+        group_id: Int32,
+        workers_per_group: Int32,
+    ):
+        self._worker_sync(sub_bar_id)
+        if workers_per_group > Int32(1):
+            if sub_tid == Int32(0):
+                base_off = group_id * Int32(self.group_barrier_stride)
+                count_addr = get_ptr_as_int64(workspace, base_off)
+                sense_addr = get_ptr_as_int64(workspace, base_off + Int32(1))
+                old_sense = ld_global_acquire_i32(sense_addr)
+                old_count = _gw_atom_add_acq_rel_gpu_i32(count_addr, Int32(1))
+                if old_count == workers_per_group - Int32(1):
+                    st_global_i32(count_addr, Int32(0))
+                    red_add_global_release_i32(sense_addr, Int32(1))
+                else:
+                    sense = old_sense
+                    while sense == old_sense:
+                        sense = ld_global_acquire_i32(sense_addr)
+            self._worker_sync(sub_bar_id)
+
+    @cute.jit
+    def _select_group_count(
+        self,
+        d_valid: Int32,
+        total_workers: Int32,
+    ) -> Int32:
+        """Select ``G`` dividing ``total_workers`` to minimize ``G * ceil(D / G)``."""
+        g_sel = Int32(1)
+        if d_valid >= Int32(24):
+            best_g = Int32(1)
+            best_padded = Int32(1 << 20)
+            for cand in cutlass.range_constexpr(4):
+                g_val = (
+                    3
+                    if cand == 0
+                    else (4 if cand == 1 else (6 if cand == 2 else 8))
+                )
+                if cutlass.const_expr(g_val <= self.max_groups):
+                    if (total_workers % Int32(g_val)) == Int32(0):
+                        padded = (
+                            (d_valid + Int32(g_val - 1)) // Int32(g_val)
+                        ) * Int32(g_val)
+                        # Prefer G in {4, 6, 8} unless G=3 eliminates >=2 blocks
+                        # of overhang and no higher G matches.
+                        if cutlass.const_expr(g_val == 3):
+                            best_g = Int32(3)
+                            best_padded = padded
+                        else:
+                            if best_g == Int32(3):
+                                if padded <= best_padded + Int32(1):
+                                    best_g = Int32(g_val)
+                                    best_padded = padded
+                            elif padded <= best_padded:
+                                best_g = Int32(g_val)
+                                best_padded = padded
+            if best_g > Int32(1):
+                g_sel = best_g
+            elif (
+                cutlass.const_expr(2 <= self.max_groups)
+                and (total_workers % Int32(2)) == Int32(0)
+            ):
+                g_sel = Int32(2)
+        elif d_valid >= Int32(8):
+            best_g = Int32(1)
+            best_padded = Int32(1 << 20)
+            for cand in cutlass.range_constexpr(3):
+                g_val = 3 if cand == 0 else (4 if cand == 1 else 6)
+                if cutlass.const_expr(g_val <= self.max_groups):
+                    if d_valid >= Int32(2 * g_val) and (
+                        total_workers % Int32(g_val)
+                    ) == Int32(0):
+                        padded = (
+                            (d_valid + Int32(g_val - 1)) // Int32(g_val)
+                        ) * Int32(g_val)
+                        if padded <= best_padded:
+                            best_g = Int32(g_val)
+                            best_padded = padded
+            if best_g > Int32(1):
+                g_sel = best_g
+            elif (
+                cutlass.const_expr(2 <= self.max_groups)
+                and (total_workers % Int32(2)) == Int32(0)
+            ):
+                g_sel = Int32(2)
+        elif d_valid >= Int32(2):
+            if (
+                cutlass.const_expr(2 <= self.max_groups)
+                and (total_workers % Int32(2)) == Int32(0)
+            ):
+                g_sel = Int32(2)
+        return g_sel
+
+    @cute.jit
+    def _build_group_schedule_smem(
+        self,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        total_experts: Int32,
+        live_routes: Int32,
+        raw_blocks: Int32,
+        total_workers: Int32,
+        smem_base: Int32,
+        tid: Int32,
+    ) -> Int32:
+        """Build deterministic 8-bucket snake group schedule in shared memory."""
+        sched_smem = smem_base + Int32(self.group_smem_off)
+        tmp_smem = smem_base + Int32(128)
+        full_compact = self.intermediate_size == self.gemm_fc1_tile_n
+
+        if tid < Int32(64):
+            rb = tid
+            is_live = Int32(0)
+            bucket = Int32(0)
+            expert = Int32(-1)
+            fc1_tiles = Int32(0)
+            half_tiles = Int32(0)
+            act_nblk = Int32(self.intermediate_size // 128)
+            live_cnt = Int32(0)
+
+            if rb < raw_blocks:
+                ce = block_expert_ids[rb].to(Int32)
+                for k in cutlass.range_constexpr(8):
+                    r_k = packed_route_indices[rb * Int32(8) + Int32(k)].to(Int32)
+                    st_shared_i32(
+                        tmp_smem + Int32(self.TMP_ROUTES) + (rb * Int32(8) + Int32(k)) * Int32(4),
+                        r_k,
+                    )
+                    if r_k >= Int32(0) and r_k < live_routes:
+                        live_cnt += Int32(1)
+                if live_cnt > Int32(0) and ce >= Int32(0) and ce < total_experts:
+                    d0 = descriptor_map[ce].to(Int32)
+                    d1 = descriptor_map[total_experts + ce].to(Int32)
+                    d2 = descriptor_map[Int32(2) * total_experts + ce].to(Int32)
+                    if d0 >= Int32(0) and d1 >= Int32(0) and d2 >= Int32(0):
+                        t_sum = (
+                            ((d0 >> Int32(self.descriptor_bits)) & Int32(1))
+                            + ((d1 >> Int32(self.descriptor_bits)) & Int32(1))
+                            + ((d2 >> Int32(self.descriptor_bits)) & Int32(1))
+                        )
+                        live_w = Int32(self.intermediate_size)
+                        if cutlass.const_expr(self.compact_weights and not full_compact):
+                            live_w = descriptor_map[
+                                Int64(3) * total_experts.to(Int64) + ce.to(Int64)
+                            ].to(Int32)
+                        half_tiles = live_w // Int32(self.gemm_fc1_tile_n)
+                        fc1_tiles = half_tiles * Int32(2)
+                        act_nblk = live_w // Int32(128)
+                        if half_tiles > Int32(0) and act_nblk > Int32(0):
+                            is_live = Int32(1)
+                            expert = ce
+                            full_flag = (
+                                live_w >= Int32(self.intermediate_size)
+                            ).to(Int32)
+                            bucket = (full_flag << Int32(2)) | t_sum
+
+            st_shared_i32(tmp_smem + Int32(self.TMP_VALID) + rb * Int32(4), is_live)
+            st_shared_i32(tmp_smem + Int32(self.TMP_BUCKET) + rb * Int32(4), bucket)
+            st_shared_i32(tmp_smem + Int32(self.TMP_EXPERT) + rb * Int32(4), expert)
+            st_shared_i32(tmp_smem + Int32(self.TMP_FC1_TILES) + rb * Int32(4), fc1_tiles)
+            st_shared_i32(tmp_smem + Int32(self.TMP_HALF_TILES) + rb * Int32(4), half_tiles)
+            st_shared_i32(tmp_smem + Int32(self.TMP_ACT_NBLK) + rb * Int32(4), act_nblk)
+            st_shared_i32(tmp_smem + Int32(self.TMP_LIVE_CNT) + rb * Int32(4), live_cnt)
+            st_shared_i32(tmp_smem + Int32(self.TMP_SORTED_FC1) + rb * Int32(4), Int32(0))
+            st_shared_i32(tmp_smem + Int32(self.TMP_SORTED_CNT) + rb * Int32(4), Int32(0))
+
+        cute.arch.sync_threads()
+
+        if tid < Int32(32):
+            lane = tid
+            lane_lt_mask = (Uint32(1) << Uint32(lane)) - Uint32(1)
+            rb0 = lane
+            rb1 = lane + Int32(32)
+            v0 = ld_shared_i32_relaxed(
+                tmp_smem + Int32(self.TMP_VALID) + rb0 * Int32(4)
+            )
+            b0 = ld_shared_i32_relaxed(
+                tmp_smem + Int32(self.TMP_BUCKET) + rb0 * Int32(4)
+            )
+            v1 = ld_shared_i32_relaxed(
+                tmp_smem + Int32(self.TMP_VALID) + rb1 * Int32(4)
+            )
+            b1 = ld_shared_i32_relaxed(
+                tmp_smem + Int32(self.TMP_BUCKET) + rb1 * Int32(4)
+            )
+            d_valid = cute.arch.warp_redux_sync(v0 + v1, "add")
+            if d_valid > Int32(0):
+                num_groups = self._select_group_count(d_valid, total_workers)
+                workers_per_group = total_workers // num_groups
+                q_grp = d_valid // num_groups
+                r_grp = d_valid - q_grp * num_groups
+
+                if lane <= num_groups:
+                    extra = lane
+                    if (q_grp & Int32(1)) == Int32(0):
+                        if extra > r_grp:
+                            extra = r_grp
+                    else:
+                        extra = lane - (num_groups - r_grp)
+                        if extra < Int32(0):
+                            extra = Int32(0)
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + lane * Int32(4),
+                        lane * q_grp + extra,
+                    )
+
+                rank0 = Int32(-1)
+                rank1 = Int32(-1)
+                cursor = Int32(0)
+                for bk in cutlass.range_constexpr(8):
+                    target_bk = Int32(7 - bk)
+                    m0 = ((v0 != Int32(0)) and (b0 == target_bk)).to(Int32)
+                    m1 = ((v1 != Int32(0)) and (b1 == target_bk)).to(Int32)
+                    mask0 = _gw_vote_ballot_sync(m0)
+                    p0 = _gw_popc_u32(mask0 & lane_lt_mask)
+                    c0 = _gw_popc_u32(mask0)
+                    mask1 = _gw_vote_ballot_sync(m1)
+                    p1 = _gw_popc_u32(mask1 & lane_lt_mask)
+                    c1 = _gw_popc_u32(mask1)
+                    if m0 != Int32(0):
+                        rank0 = cursor + p0
+                    if m1 != Int32(0):
+                        rank1 = cursor + c0 + p1
+                    cursor += c0 + c1
+
+                cute.arch.sync_warp()
+
+                for half in cutlass.range_constexpr(2):
+                    rk = rank0 if half == 0 else rank1
+                    rb_src = rb0 if half == 0 else rb1
+                    if rk >= Int32(0):
+                        row_in_grp = rk // num_groups
+                        rem = rk - row_in_grp * num_groups
+                        grp = rem
+                        if (row_in_grp & Int32(1)) != Int32(0):
+                            grp = num_groups - Int32(1) - rem
+                        grp_base = ld_shared_i32_relaxed(
+                            sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + grp * Int32(4)
+                        )
+                        pos = grp_base + row_in_grp
+                        st_shared_i32(
+                            sched_smem + Int32(self.OFF_SORTED_RB) + pos * Int32(4),
+                            rb_src,
+                        )
+                        st_shared_i32(
+                            sched_smem + Int32(self.OFF_SORTED_EXPERT) + pos * Int32(4),
+                            ld_shared_i32_relaxed(
+                                tmp_smem + Int32(self.TMP_EXPERT) + rb_src * Int32(4)
+                            ),
+                        )
+                        st_shared_i32(
+                            sched_smem + Int32(self.OFF_SORTED_HALF_TILES) + pos * Int32(4),
+                            ld_shared_i32_relaxed(
+                                tmp_smem + Int32(self.TMP_HALF_TILES) + rb_src * Int32(4)
+                            ),
+                        )
+                        st_shared_i32(
+                            tmp_smem + Int32(self.TMP_SORTED_FC1) + pos * Int32(4),
+                            ld_shared_i32_relaxed(
+                                tmp_smem + Int32(self.TMP_FC1_TILES) + rb_src * Int32(4)
+                            ),
+                        )
+                        st_shared_i32(
+                            tmp_smem + Int32(self.TMP_SORTED_CNT) + pos * Int32(4),
+                            ld_shared_i32_relaxed(
+                                tmp_smem + Int32(self.TMP_LIVE_CNT) + rb_src * Int32(4)
+                            ),
+                        )
+
+                cute.arch.sync_warp()
+
+                f0 = Int32(0)
+                f1 = Int32(0)
+                c0_rt = Int32(0)
+                c1_rt = Int32(0)
+                if rb0 < d_valid:
+                    f0 = ld_shared_i32_relaxed(
+                        tmp_smem + Int32(self.TMP_SORTED_FC1) + rb0 * Int32(4)
+                    )
+                    c0_rt = ld_shared_i32_relaxed(
+                        tmp_smem + Int32(self.TMP_SORTED_CNT) + rb0 * Int32(4)
+                    )
+                if rb1 < d_valid:
+                    f1 = ld_shared_i32_relaxed(
+                        tmp_smem + Int32(self.TMP_SORTED_FC1) + rb1 * Int32(4)
+                    )
+                    c1_rt = ld_shared_i32_relaxed(
+                        tmp_smem + Int32(self.TMP_SORTED_CNT) + rb1 * Int32(4)
+                    )
+
+                inc_f0 = _gw_warp_scan_inc_i32(f0, lane)
+                exc_f0 = inc_f0 - f0
+                tot_f0 = cute.arch.shuffle_sync(inc_f0, Int32(31))
+                inc_f1 = _gw_warp_scan_inc_i32(f1, lane)
+                exc_f1 = tot_f0 + inc_f1 - f1
+                tot_f = tot_f0 + cute.arch.shuffle_sync(inc_f1, Int32(31))
+
+                st_shared_i32(
+                    sched_smem + Int32(self.OFF_FC1_PREFIX) + rb0 * Int32(4),
+                    exc_f0,
+                )
+                st_shared_i32(
+                    sched_smem + Int32(self.OFF_FC1_PREFIX) + rb1 * Int32(4),
+                    exc_f1,
+                )
+
+                inc_c0 = _gw_warp_scan_inc_i32(c0_rt, lane)
+                exc_c0 = inc_c0 - c0_rt
+                tot_c0 = cute.arch.shuffle_sync(inc_c0, Int32(31))
+                inc_c1 = _gw_warp_scan_inc_i32(c1_rt, lane)
+                exc_c1 = tot_c0 + inc_c1 - c1_rt
+                tot_c = tot_c0 + cute.arch.shuffle_sync(inc_c1, Int32(31))
+
+                st_shared_i32(
+                    tmp_smem + Int32(self.TMP_RT_PREFIX) + rb0 * Int32(4),
+                    exc_c0,
+                )
+                st_shared_i32(
+                    tmp_smem + Int32(self.TMP_RT_PREFIX) + rb1 * Int32(4),
+                    exc_c1,
+                )
+                if lane == Int32(0):
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_FC1_PREFIX) + Int32(64 * 4),
+                        tot_f,
+                    )
+                    st_shared_i32(
+                        tmp_smem + Int32(self.TMP_RT_PREFIX) + Int32(64 * 4),
+                        tot_c,
+                    )
+                    st_shared_i32(sched_smem + Int32(self.OFF_HDR + 0), d_valid)
+                    st_shared_i32(sched_smem + Int32(self.OFF_HDR + 4), num_groups)
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_HDR + 8), workers_per_group
+                    )
+                cute.arch.sync_warp()
+                if lane <= num_groups:
+                    rb_p = ld_shared_i32_relaxed(
+                        sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + lane * Int32(4)
+                    )
+                    rt_p = ld_shared_i32_relaxed(
+                        tmp_smem + Int32(self.TMP_RT_PREFIX) + rb_p * Int32(4)
+                    )
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_GRP_RT_PREFIX) + lane * Int32(4),
+                        rt_p,
+                    )
+            else:
+                if lane == Int32(0):
+                    st_shared_i32(sched_smem + Int32(self.OFF_HDR + 0), Int32(0))
+
+        cute.arch.sync_threads()
+
+        d_valid_cta = ld_shared_i32_relaxed(sched_smem + Int32(self.OFF_HDR + 0))
+        if tid < d_valid_cta:
+            pos = tid
+            orig_rb = ld_shared_i32_relaxed(
+                sched_smem + Int32(self.OFF_SORTED_RB) + pos * Int32(4)
+            )
+            ce = ld_shared_i32_relaxed(
+                sched_smem + Int32(self.OFF_SORTED_EXPERT) + pos * Int32(4)
+            )
+            act_nblk = ld_shared_i32_relaxed(
+                tmp_smem + Int32(self.TMP_ACT_NBLK) + orig_rb * Int32(4)
+            )
+            rt_out = ld_shared_i32_relaxed(
+                tmp_smem + Int32(self.TMP_RT_PREFIX) + pos * Int32(4)
+            )
+            packed_meta = (act_nblk << Int32(22)) | (ce << Int32(8))
+            for k in cutlass.range_constexpr(8):
+                r_k = ld_shared_i32_relaxed(
+                    tmp_smem + Int32(self.TMP_ROUTES) + (orig_rb * Int32(8) + Int32(k)) * Int32(4)
+                )
+                if r_k >= Int32(0) and r_k < live_routes:
+                    st_shared_i32(
+                        sched_smem + Int32(self.OFF_LIVE_ROUTES) + rt_out * Int32(4),
+                        packed_meta | r_k,
+                    )
+                    rt_out += Int32(1)
+
+        cute.arch.sync_threads()
+        return d_valid_cta
+
+    @cute.jit
+    def _run_group_input_rotation(
+        self,
+        x_input: cute.Tensor,
+        a_gate: cute.Tensor,
+        a_up: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        sched_smem: Int32,
+        sub_tid: Int32,
+        group_id: Int32,
+        sched_worker: Int32,
+        workers_per_group: Int32,
+    ):
+        r_begin = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RT_PREFIX) + group_id * Int32(4)
+        )
+        r_end = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RT_PREFIX) + (group_id + Int32(1)) * Int32(4)
+        )
+        group_routes = r_end - r_begin
+        nblk = Int32(self.hidden_size // 128)
+        lane = sub_tid & Int32(31)
+        warp_in_worker = sub_tid >> Int32(5)
+        elem = lane * Int32(4)
+        unit = sched_worker * Int32(self.worker_warps) + warp_in_worker
+        unit_stride = workers_per_group * Int32(self.worker_warps)
+        total_units = group_routes * nblk
+
+        while unit < total_units:
+            local_r = unit // nblk
+            blk = unit - local_r * nblk
+            packed_entry = ld_shared_i32_relaxed(
+                sched_smem + Int32(self.OFF_LIVE_ROUTES) + (r_begin + local_r) * Int32(4)
+            )
+            route = packed_entry & Int32(0xFF)
+            expert = (packed_entry >> Int32(8)) & Int32(0x3FFF)
+            token = route // Int32(self.top_k)
+            col0 = blk * Int32(128) + elem
+
+            x_off = Int64(token) * Int64(self.hidden_size) + Int64(col0)
+            s_off = Int64(expert) * Int64(self.hidden_size) + Int64(col0)
+            out_off = Int64(route) * Int64(self.hidden_size) + Int64(col0)
+
+            xw0, xw1 = ld_global_nc_v2_u32(get_ptr_as_int64(x_input, x_off))
+            gw0, gw1 = ld_global_nc_v2_u32(get_ptr_as_int64(gate_suh, s_off))
+            uw0, uw1 = ld_global_nc_v2_u32(get_ptr_as_int64(up_suh, s_off))
+
+            xh0 = cvt_bf16x2_to_f16x2_via_f32(xw0)
+            xh1 = cvt_bf16x2_to_f16x2_via_f32(xw1)
+            x0, x1 = f16x2_to_f32x2(xh0)
+            x2, x3 = f16x2_to_f32x2(xh1)
+
+            sg0, sg1 = f16x2_to_f32x2(gw0)
+            sg2, sg3 = f16x2_to_f32x2(gw1)
+            g0, g1 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x0 * sg0, x1 * sg1))
+            g2, g3 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x2 * sg2, x3 * sg3))
+            gh0, gh1, gh2, gh3 = self.driver._had128_quad(g0, g1, g2, g3, lane)
+            st_global_v2_u32(
+                get_ptr_as_int64(a_gate, out_off),
+                pack_f32x2_to_f16x2(gh0, gh1),
+                pack_f32x2_to_f16x2(gh2, gh3),
+            )
+
+            su0, su1 = f16x2_to_f32x2(uw0)
+            su2, su3 = f16x2_to_f32x2(uw1)
+            u0, u1 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x0 * su0, x1 * su1))
+            u2, u3 = f16x2_to_f32x2(pack_f32x2_to_f16x2(x2 * su2, x3 * su3))
+            uh0, uh1, uh2, uh3 = self.driver._had128_quad(u0, u1, u2, u3, lane)
+            st_global_v2_u32(
+                get_ptr_as_int64(a_up, out_off),
+                pack_f32x2_to_f16x2(uh0, uh1),
+                pack_f32x2_to_f16x2(uh2, uh3),
+            )
+            unit += unit_stride
+
+    @cute.jit
+    def _run_group_activation(
+        self,
+        fc1: cute.Tensor,
+        activated: cute.Tensor,
+        intermediate_rotations: cute.Tensor,
+        sched_smem: Int32,
+        sub_tid: Int32,
+        group_id: Int32,
+        sched_worker: Int32,
+        workers_per_group: Int32,
+    ):
+        r_begin = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RT_PREFIX) + group_id * Int32(4)
+        )
+        r_end = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RT_PREFIX) + (group_id + Int32(1)) * Int32(4)
+        )
+        group_routes = r_end - r_begin
+        nblk = Int32(self.intermediate_size // 128)
+        lane = sub_tid & Int32(31)
+        warp_in_worker = sub_tid >> Int32(5)
+        elem = lane * Int32(4)
+        unit = sched_worker * Int32(self.worker_warps) + warp_in_worker
+        unit_stride = workers_per_group * Int32(self.worker_warps)
+        total_units = group_routes * nblk
+
+        while unit < total_units:
+            local_r = unit // nblk
+            blk = unit - local_r * nblk
+            packed_entry = ld_shared_i32_relaxed(
+                sched_smem + Int32(self.OFF_LIVE_ROUTES) + (r_begin + local_r) * Int32(4)
+            )
+            live_nblk = (packed_entry >> Int32(22)) & Int32(0xFF)
+            if blk < live_nblk:
+                route = packed_entry & Int32(0xFF)
+                expert = (packed_entry >> Int32(8)) & Int32(0x3FFF)
+                col0 = blk * Int32(128) + elem
+                g_off = Int64(route) * Int64(self.driver.fc1_cols) + Int64(col0)
+                u_off = g_off + Int64(self.intermediate_size)
+                s_off = (
+                    Int64(expert) * Int64(3 * self.intermediate_size) + Int64(col0)
+                )
+
+                gp01, gp23 = _gw_ld_global_cg_v2_u32(get_ptr_as_int64(fc1, g_off))
+                up01, up23 = _gw_ld_global_cg_v2_u32(get_ptr_as_int64(fc1, u_off))
+                svg01, svg23 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(intermediate_rotations, s_off)
+                )
+                svu01, svu23 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(
+                        intermediate_rotations,
+                        s_off + Int64(self.intermediate_size),
+                    )
+                )
+                sd01, sd23 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(
+                        intermediate_rotations,
+                        s_off + Int64(2 * self.intermediate_size),
+                    )
+                )
+
+                g0, g1 = f16x2_to_f32x2(gp01)
+                g2, g3 = f16x2_to_f32x2(gp23)
+                u0, u1 = f16x2_to_f32x2(up01)
+                u2, u3 = f16x2_to_f32x2(up23)
+                gh0, gh1, gh2, gh3 = self.driver._had128_quad(g0, g1, g2, g3, lane)
+                uh0, uh1, uh2, uh3 = self.driver._had128_quad(u0, u1, u2, u3, lane)
+
+                svg0, svg1 = f16x2_to_f32x2(svg01)
+                svg2, svg3 = f16x2_to_f32x2(svg23)
+                svu0, svu1 = f16x2_to_f32x2(svu01)
+                svu2, svu3 = f16x2_to_f32x2(svu23)
+                sd0, sd1 = f16x2_to_f32x2(sd01)
+                sd2, sd3 = f16x2_to_f32x2(sd23)
+
+                ig0 = gh0 * svg0
+                ig1 = gh1 * svg1
+                ig2 = gh2 * svg2
+                ig3 = gh3 * svg3
+                iu0 = uh0 * svu0
+                iu1 = uh1 * svu1
+                iu2 = uh2 * svu2
+                iu3 = uh3 * svu3
+
+                ig0, iu0 = self.driver._clamp_swiglu_inputs(ig0, iu0)
+                ig1, iu1 = self.driver._clamp_swiglu_inputs(ig1, iu1)
+                ig2, iu2 = self.driver._clamp_swiglu_inputs(ig2, iu2)
+                ig3, iu3 = self.driver._clamp_swiglu_inputs(ig3, iu3)
+
+                if cutlass.const_expr(self.driver.activation_is_situ):
+                    beta = cutlass.Float32(SITU_DEFAULT_BETA)
+                    linear_beta = cutlass.Float32(SITU_DEFAULT_LINEAR_BETA)
+                    a0 = (
+                        beta
+                        * cute.math.tanh(ig0 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig0)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu0 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd0
+                    )
+                    a1 = (
+                        beta
+                        * cute.math.tanh(ig1 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig1)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu1 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd1
+                    )
+                    a2 = (
+                        beta
+                        * cute.math.tanh(ig2 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig2)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu2 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd2
+                    )
+                    a3 = (
+                        beta
+                        * cute.math.tanh(ig3 / beta, fastmath=self.driver.fast_math)
+                        * self.driver._sigmoid_f32(ig3)
+                        * linear_beta
+                        * cute.math.tanh(
+                            iu3 / linear_beta, fastmath=self.driver.fast_math
+                        )
+                        * sd3
+                    )
+                else:
+                    a0 = self.driver._gated_silu(ig0) * iu0 * sd0
+                    a1 = self.driver._gated_silu(ig1) * iu1 * sd1
+                    a2 = self.driver._gated_silu(ig2) * iu2 * sd2
+                    a3 = self.driver._gated_silu(ig3) * iu3 * sd3
+
+                o0, o1, o2, o3 = self.driver._had128_quad(a0, a1, a2, a3, lane)
+                out_off = Int64(route) * Int64(self.intermediate_size) + Int64(col0)
+                st_global_v2_u32(
+                    get_ptr_as_int64(activated, out_off),
+                    pack_f32x2_to_f16x2(o0, o1),
+                    pack_f32x2_to_f16x2(o2, o3),
+                )
+            unit += unit_stride
+
+    def _dispatch_group_gemm_bound(
+        self,
+        gemm,
+        compact_weight,
+        sub_bar_id: Int32,
+        *args,
+    ):
+        """Trace-time Python: bind compact weight and optional sub-worker barrier."""
+        gemm._compact_weight = compact_weight
+        if self.dual_sub_workers:
+            gemm._named_barrier = (sub_bar_id, 128)
+        try:
+            self._dispatch_tier_gemm(gemm, *args)
+        finally:
+            gemm._compact_weight = None
+            gemm._named_barrier = None
+
+    @cute.jit
+    def _emit_group_tile(
+        self,
+        is_fc1: cutlass.Constexpr,
+        a_flat: cute.Tensor,
+        a_alt_flat: cute.Tensor,
+        t0_b_flat: cute.Tensor,
+        t0_scales_flat: cute.Tensor,
+        t0_global_scale: cute.Tensor,
+        t1_b_flat: cute.Tensor,
+        t1_scales_flat: cute.Tensor,
+        t1_global_scale: cute.Tensor,
+        c_flat: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        topk_weights: cute.Tensor,
+        c_tmp: cute.Tensor,
+        locks: cute.Tensor,
+        trellis_lut_addr: Int64,
+        worker_smem_base: Int32,
+        sched_smem: Int32,
+        sub_tid: Int32,
+        sub_bar_id: Int32,
+        active_size_m: Int32,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
+        tier0_fc2_experts: Int32,
+        tier1_fc2_experts: Int32,
+        tier0_gate_experts: Int32,
+        tier1_gate_experts: Int32,
+        tier0_up_experts: Int32,
+        tier1_up_experts: Int32,
+        pos: Int32,
+        output_n_tile: Int32,
+    ):
+        route_block_idx = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_SORTED_RB) + pos * Int32(4)
+        )
+        combined_expert = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_SORTED_EXPERT) + pos * Int32(4)
+        )
+        total_experts = tier0_num_experts + tier1_num_experts
+        fc1_half_tiles = Int32(self.gemm_fc1_half_tiles)
+        descriptor_row = Int32(2)
+        if cutlass.const_expr(is_fc1):
+            descriptor_row = Int32(0)
+            if output_n_tile >= fc1_half_tiles:
+                descriptor_row = Int32(1)
+        descriptor = descriptor_map[
+            descriptor_row * total_experts + combined_expert
+        ].to(Int32)
+
+        reduce_tile_count = Int32(
+            self.hidden_size // 64 if is_fc1 else self.intermediate_size // 64
+        )
+        compact_weight = None
+        if cutlass.const_expr(self.compact_weights):
+            full_width = self.intermediate_size == self.gemm_fc1_tile_n
+            if cutlass.const_expr(full_width):
+                live_width = Int32(self.intermediate_size)
+            else:
+                live_width = descriptor_map[
+                    Int64(3) * total_experts.to(Int64) + combined_expert.to(Int64)
+                ].to(Int32)
+                if cutlass.const_expr(not is_fc1):
+                    reduce_tile_count = live_width // Int32(64)
+            weight_offset = descriptor_map[
+                (descriptor_row.to(Int64) + Int64(4)) * total_experts.to(Int64)
+                + combined_expert.to(Int64)
+            ].to(Int64)
+            compact_weight = (weight_offset, live_width, is_fc1, full_width)
+
+        if descriptor >= Int32(0):
+            tier = descriptor >> Int32(self.descriptor_bits)
+            local_expert = descriptor & Int32((1 << self.descriptor_bits) - 1)
+            if cutlass.const_expr(is_fc1):
+                tier0_in_bounds = local_expert < tier0_gate_experts
+                tier1_in_bounds = local_expert < tier1_gate_experts
+                if output_n_tile >= fc1_half_tiles:
+                    tier0_in_bounds = local_expert < tier0_up_experts
+                    tier1_in_bounds = local_expert < tier1_up_experts
+            else:
+                tier0_in_bounds = local_expert < tier0_fc2_experts
+                tier1_in_bounds = local_expert < tier1_fc2_experts
+
+            if tier == Int32(0) and tier0_in_bounds:
+                if cutlass.const_expr(self.dual_sub_workers):
+                    gemm0 = (
+                        self.sub_tier0.fc1 if is_fc1 else self.sub_tier0.fc2
+                    )
+                else:
+                    gemm0 = self.tier0.fc1 if is_fc1 else self.tier0.fc2
+                self._dispatch_group_gemm_bound(
+                    gemm0,
+                    compact_weight,
+                    sub_bar_id,
+                    a_flat,
+                    a_alt_flat,
+                    t0_b_flat,
+                    c_flat,
+                    t0_scales_flat,
+                    t0_global_scale,
+                    packed_route_indices,
+                    topk_weights,
+                    c_tmp,
+                    locks,
+                    trellis_lut_addr,
+                    worker_smem_base,
+                    sub_tid,
+                    route_block_idx,
+                    local_expert,
+                    output_n_tile,
+                    Int32(0),
+                    reduce_tile_count,
+                    Int32(1),
+                    Int32(0),
+                    Int32(0),
+                    active_size_m,
+                )
+            if tier == Int32(1) and tier1_in_bounds:
+                if cutlass.const_expr(self.dual_sub_workers):
+                    gemm1 = (
+                        self.sub_tier1.fc1 if is_fc1 else self.sub_tier1.fc2
+                    )
+                else:
+                    gemm1 = self.tier1.fc1 if is_fc1 else self.tier1.fc2
+                self._dispatch_group_gemm_bound(
+                    gemm1,
+                    compact_weight,
+                    sub_bar_id,
+                    a_flat,
+                    a_alt_flat,
+                    t1_b_flat,
+                    c_flat,
+                    t1_scales_flat,
+                    t1_global_scale,
+                    packed_route_indices,
+                    topk_weights,
+                    c_tmp,
+                    locks,
+                    trellis_lut_addr,
+                    worker_smem_base,
+                    sub_tid,
+                    route_block_idx,
+                    local_expert,
+                    output_n_tile,
+                    Int32(0),
+                    reduce_tile_count,
+                    Int32(1),
+                    Int32(0),
+                    Int32(0),
+                    active_size_m,
+                )
+
+    @cute.jit
+    def _run_group_fc1(
+        self,
+        rotation_gate: cute.Tensor,
+        rotation_up: cute.Tensor,
+        t0_w13: cute.Tensor,
+        t0_w13_scales: cute.Tensor,
+        t0_w13_global: cute.Tensor,
+        t1_w13: cute.Tensor,
+        t1_w13_scales: cute.Tensor,
+        t1_w13_global: cute.Tensor,
+        fc1: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        topk_weights: cute.Tensor,
+        fc1_scratch: cute.Tensor,
+        workspace: cute.Tensor,
+        trellis_lut_addr: Int64,
+        worker_smem_base: Int32,
+        sched_smem: Int32,
+        sub_tid: Int32,
+        sub_bar_id: Int32,
+        group_id: Int32,
+        sched_worker: Int32,
+        workers_per_group: Int32,
+        active_m: Int32,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
+        tier0_fc2_experts: Int32,
+        tier1_fc2_experts: Int32,
+        tier0_gate_experts: Int32,
+        tier1_gate_experts: Int32,
+        tier0_up_experts: Int32,
+        tier1_up_experts: Int32,
+    ):
+        b_begin = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + group_id * Int32(4)
+        )
+        b_end = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + (group_id + Int32(1)) * Int32(4)
+        )
+        full_compact = self.intermediate_size == self.gemm_fc1_tile_n
+        if cutlass.const_expr(self.compact_weights and not full_compact):
+            base_t = ld_shared_i32_relaxed(
+                sched_smem + Int32(self.OFF_FC1_PREFIX) + b_begin * Int32(4)
+            )
+            end_t = ld_shared_i32_relaxed(
+                sched_smem + Int32(self.OFF_FC1_PREFIX) + b_end * Int32(4)
+            )
+            group_fc1_tiles = end_t - base_t
+            task = sched_worker
+            while task < group_fc1_tiles:
+                target = base_t + task
+                lo = b_begin
+                hi = b_end
+                for _ in cutlass.range_constexpr(6):
+                    mid = (lo + hi) >> Int32(1)
+                    if mid > lo:
+                        mid_val = ld_shared_i32_relaxed(
+                            sched_smem + Int32(self.OFF_FC1_PREFIX) + mid * Int32(4)
+                        )
+                        if mid_val <= target:
+                            lo = mid
+                        else:
+                            hi = mid
+                pos = lo
+                pos_base = ld_shared_i32_relaxed(
+                    sched_smem + Int32(self.OFF_FC1_PREFIX) + pos * Int32(4)
+                )
+                local_t = target - pos_base
+                live_half = ld_shared_i32_relaxed(
+                    sched_smem + Int32(self.OFF_SORTED_HALF_TILES) + pos * Int32(4)
+                )
+                output_n_tile = local_t
+                if local_t >= live_half:
+                    output_n_tile = Int32(self.gemm_fc1_half_tiles) + (
+                        local_t - live_half
+                    )
+                self._emit_group_tile(
+                    True,
+                    rotation_gate,
+                    rotation_up,
+                    t0_w13,
+                    t0_w13_scales,
+                    t0_w13_global,
+                    t1_w13,
+                    t1_w13_scales,
+                    t1_w13_global,
+                    fc1,
+                    packed_route_indices,
+                    descriptor_map,
+                    topk_weights,
+                    fc1_scratch,
+                    workspace,
+                    trellis_lut_addr,
+                    worker_smem_base,
+                    sched_smem,
+                    sub_tid,
+                    sub_bar_id,
+                    active_m,
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_fc2_experts,
+                    tier1_fc2_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
+                    pos,
+                    output_n_tile,
+                )
+                task += workers_per_group
+        else:
+            group_blocks = b_end - b_begin
+            fc1_n_tiles = Int32(self.gemm_fc1_n_tiles)
+            group_fc1_tiles = group_blocks * fc1_n_tiles
+            task = sched_worker
+            while task < group_fc1_tiles:
+                local_b = task // fc1_n_tiles
+                output_n_tile = task - local_b * fc1_n_tiles
+                pos = b_begin + local_b
+                self._emit_group_tile(
+                    True,
+                    rotation_gate,
+                    rotation_up,
+                    t0_w13,
+                    t0_w13_scales,
+                    t0_w13_global,
+                    t1_w13,
+                    t1_w13_scales,
+                    t1_w13_global,
+                    fc1,
+                    packed_route_indices,
+                    descriptor_map,
+                    topk_weights,
+                    fc1_scratch,
+                    workspace,
+                    trellis_lut_addr,
+                    worker_smem_base,
+                    sched_smem,
+                    sub_tid,
+                    sub_bar_id,
+                    active_m,
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_fc2_experts,
+                    tier1_fc2_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
+                    pos,
+                    output_n_tile,
+                )
+                task += workers_per_group
+
+    @cute.jit
+    def _run_group_fc2(
+        self,
+        activated: cute.Tensor,
+        t0_w2: cute.Tensor,
+        t0_w2_scales: cute.Tensor,
+        t0_w2_global: cute.Tensor,
+        t1_w2: cute.Tensor,
+        t1_w2_scales: cute.Tensor,
+        t1_w2_global: cute.Tensor,
+        fc2: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        topk_weights: cute.Tensor,
+        fc2_scratch: cute.Tensor,
+        workspace: cute.Tensor,
+        trellis_lut_addr: Int64,
+        worker_smem_base: Int32,
+        sched_smem: Int32,
+        sub_tid: Int32,
+        sub_bar_id: Int32,
+        group_id: Int32,
+        sched_worker: Int32,
+        workers_per_group: Int32,
+        live_routes: Int32,
+        tier0_num_experts: Int32,
+        tier1_num_experts: Int32,
+        tier0_fc2_experts: Int32,
+        tier1_fc2_experts: Int32,
+        tier0_gate_experts: Int32,
+        tier1_gate_experts: Int32,
+        tier0_up_experts: Int32,
+        tier1_up_experts: Int32,
+    ):
+        b_begin = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + group_id * Int32(4)
+        )
+        b_end = ld_shared_i32_relaxed(
+            sched_smem + Int32(self.OFF_GRP_RB_PREFIX) + (group_id + Int32(1)) * Int32(4)
+        )
+        group_blocks = b_end - b_begin
+        fc2_n_tiles = Int32(self.gemm_fc2_n_tiles)
+        group_fc2_tiles = group_blocks * fc2_n_tiles
+        task = sched_worker
+        while task < group_fc2_tiles:
+            local_b = task // fc2_n_tiles
+            output_n_tile = task - local_b * fc2_n_tiles
+            pos = b_begin + local_b
+            self._emit_group_tile(
+                False,
+                activated,
+                activated,
+                t0_w2,
+                t0_w2_scales,
+                t0_w2_global,
+                t1_w2,
+                t1_w2_scales,
+                t1_w2_global,
+                fc2,
+                packed_route_indices,
+                descriptor_map,
+                topk_weights,
+                fc2_scratch,
+                workspace,
+                trellis_lut_addr,
+                worker_smem_base,
+                sched_smem,
+                sub_tid,
+                sub_bar_id,
+                live_routes,
+                tier0_num_experts,
+                tier1_num_experts,
+                tier0_fc2_experts,
+                tier1_fc2_experts,
+                tier0_gate_experts,
+                tier1_gate_experts,
+                tier0_up_experts,
+                tier1_up_experts,
+                pos,
+                output_n_tile,
+            )
+            task += workers_per_group
+
+    @cute.kernel
+    def kernel(
+        self,
+        rotation_input: cute.Tensor,
+        rotation_gate: cute.Tensor,
+        rotation_up: cute.Tensor,
+        t0_w13: cute.Tensor,
+        t0_w2: cute.Tensor,
+        t0_w13_scales: cute.Tensor,
+        t0_w2_scales: cute.Tensor,
+        t0_w13_global: cute.Tensor,
+        t0_w2_global: cute.Tensor,
+        t1_w13: cute.Tensor,
+        t1_w2: cute.Tensor,
+        t1_w13_scales: cute.Tensor,
+        t1_w2_scales: cute.Tensor,
+        t1_w13_global: cute.Tensor,
+        t1_w2_global: cute.Tensor,
+        fc1: cute.Tensor,
+        activated: cute.Tensor,
+        fc2: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        raw_topk_ids: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        global_to_combined: cute.Tensor,
+        topk_weights: cute.Tensor,
+        fc1_scratch: cute.Tensor,
+        fc2_scratch: cute.Tensor,
+        workspace: cute.Tensor,
+        intermediate_rotations: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        trellis_lut: cute.Tensor,
+        tier0_num_experts: cutlass.Int32,
+        tier1_num_experts: cutlass.Int32,
+        tier0_fc2_experts: cutlass.Int32,
+        tier1_fc2_experts: cutlass.Int32,
+        tier0_gate_experts: cutlass.Int32,
+        tier1_gate_experts: cutlass.Int32,
+        tier0_up_experts: cutlass.Int32,
+        tier1_up_experts: cutlass.Int32,
+        route_num_experts: cutlass.Int32,
+        active_m: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        grid_x_raw, _, _ = cute.arch.grid_dim()
+        tid = Int32(tidx)
+        cta = Int32(bidx)
+        grid_x = Int32(grid_x_raw)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, self.shared_words], 1024
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+        trellis_lut_addr = get_ptr_as_int64(trellis_lut, Int32(0))
+        total_experts = tier0_num_experts + tier1_num_experts
+        raw_blocks = packed_route_count[Int32(0)].to(Int32) >> Int32(3)
+
+        if cutlass.const_expr(self.size_m <= 8):
+            use_groupwise = (
+                raw_blocks >= Int32(0) and raw_blocks <= Int32(64)
+            )
+        else:
+            use_groupwise = (
+                active_m <= Int32(8)
+                and raw_blocks >= Int32(0)
+                and raw_blocks <= Int32(64)
+            )
+
+        if use_groupwise:
+            live_routes = active_m * Int32(self.top_k)
+            total_workers = grid_x * Int32(2 if self.dual_sub_workers else 1)
+            d_valid = self._build_group_schedule_smem(
+                packed_route_indices,
+                block_expert_ids,
+                descriptor_map,
+                total_experts,
+                live_routes,
+                raw_blocks,
+                total_workers,
+                smem_base,
+                tid,
+            )
+            if d_valid > Int32(0):
+                sched_smem = smem_base + Int32(self.group_smem_off)
+                num_groups = ld_shared_i32_relaxed(
+                    sched_smem + Int32(self.OFF_HDR + 4)
+                )
+                workers_per_group = ld_shared_i32_relaxed(
+                    sched_smem + Int32(self.OFF_HDR + 8)
+                )
+                if cutlass.const_expr(self.dual_sub_workers):
+                    sub_id = tid >> Int32(7)
+                    sub_tid = tid & Int32(127)
+                    sub_bar_id = sub_id + Int32(1)
+                    worker_smem_base = smem_base + sub_id * Int32(
+                        self.sub_worker_smem_bytes
+                    )
+                    linear_worker = sub_id * grid_x + cta
+                else:
+                    sub_tid = tid
+                    sub_bar_id = Int32(0)
+                    worker_smem_base = smem_base
+                    linear_worker = cta
+
+                group_id = linear_worker // workers_per_group
+                worker_in_group = linear_worker - group_id * workers_per_group
+                sched_worker = worker_in_group
+                if (num_groups & Int32(1)) == Int32(0) and group_id >= (
+                    num_groups >> Int32(1)
+                ):
+                    sched_worker = (
+                        workers_per_group - Int32(1) - worker_in_group
+                    )
+
+                self._run_group_input_rotation(
+                    rotation_input,
+                    rotation_gate,
+                    rotation_up,
+                    gate_suh,
+                    up_suh,
+                    sched_smem,
+                    sub_tid,
+                    group_id,
+                    sched_worker,
+                    workers_per_group,
+                )
+                self._group_barrier(
+                    workspace,
+                    sub_tid,
+                    sub_bar_id,
+                    group_id,
+                    workers_per_group,
+                )
+                self._run_group_fc1(
+                    rotation_gate,
+                    rotation_up,
+                    t0_w13,
+                    t0_w13_scales,
+                    t0_w13_global,
+                    t1_w13,
+                    t1_w13_scales,
+                    t1_w13_global,
+                    fc1,
+                    packed_route_indices,
+                    descriptor_map,
+                    topk_weights,
+                    fc1_scratch,
+                    workspace,
+                    trellis_lut_addr,
+                    worker_smem_base,
+                    sched_smem,
+                    sub_tid,
+                    sub_bar_id,
+                    group_id,
+                    sched_worker,
+                    workers_per_group,
+                    active_m,
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_fc2_experts,
+                    tier1_fc2_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
+                )
+                self._group_barrier(
+                    workspace,
+                    sub_tid,
+                    sub_bar_id,
+                    group_id,
+                    workers_per_group,
+                )
+                self._run_group_activation(
+                    fc1,
+                    activated,
+                    intermediate_rotations,
+                    sched_smem,
+                    sub_tid,
+                    group_id,
+                    sched_worker,
+                    workers_per_group,
+                )
+                self._group_barrier(
+                    workspace,
+                    sub_tid,
+                    sub_bar_id,
+                    group_id,
+                    workers_per_group,
+                )
+                self._run_group_fc2(
+                    activated,
+                    t0_w2,
+                    t0_w2_scales,
+                    t0_w2_global,
+                    t1_w2,
+                    t1_w2_scales,
+                    t1_w2_global,
+                    fc2,
+                    packed_route_indices,
+                    descriptor_map,
+                    topk_weights,
+                    fc2_scratch,
+                    workspace,
+                    trellis_lut_addr,
+                    worker_smem_base,
+                    sched_smem,
+                    sub_tid,
+                    sub_bar_id,
+                    group_id,
+                    sched_worker,
+                    workers_per_group,
+                    live_routes,
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_fc2_experts,
+                    tier1_fc2_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
+                )
+        else:
+            if cutlass.const_expr(self.size_m > 8):
+                fc1_emit = partial(
+                    self._emit_tier_tile,
+                    True,
+                    rotation_gate,
+                    rotation_up,
+                    t0_w13,
+                    t0_w13_scales,
+                    t0_w13_global,
+                    t1_w13,
+                    t1_w13_scales,
+                    t1_w13_global,
+                    fc1,
+                    packed_route_indices,
+                    block_expert_ids,
+                    descriptor_map,
+                    topk_weights,
+                    fc1_scratch,
+                    workspace,
+                    trellis_lut_addr,
+                    smem_base,
+                    tid,
+                    active_m,
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_fc2_experts,
+                    tier1_fc2_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
+                )
+                fc2_emit = partial(
+                    self._emit_tier_tile,
+                    False,
+                    activated,
+                    activated,
+                    t0_w2,
+                    t0_w2_scales,
+                    t0_w2_global,
+                    t1_w2,
+                    t1_w2_scales,
+                    t1_w2_global,
+                    fc2,
+                    packed_route_indices,
+                    block_expert_ids,
+                    descriptor_map,
+                    topk_weights,
+                    fc2_scratch,
+                    workspace,
+                    trellis_lut_addr,
+                    smem_base,
+                    tid,
+                    active_m * Int32(self.top_k),
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_fc2_experts,
+                    tier1_fc2_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
+                )
+                self.driver._moe_body(
+                    rotation_gate,
+                    rotation_up,
+                    rotation_input,
+                    t0_w13,
+                    t0_w2,
+                    fc1,
+                    activated,
+                    fc2,
+                    t0_w13_scales,
+                    t0_w2_scales,
+                    t0_w13_global,
+                    t0_w2_global,
+                    packed_route_indices,
+                    block_expert_ids,
+                    packed_route_count,
+                    t0_w13_global,
+                    Int32(0),
+                    topk_weights,
+                    fc1_scratch,
+                    fc2_scratch,
+                    workspace,
+                    intermediate_rotations,
+                    gate_suh,
+                    up_suh,
+                    descriptor_map,
+                    trellis_lut_addr,
+                    trellis_lut_addr,
+                    total_experts,
+                    total_experts,
+                    smem_base,
+                    tid,
+                    cta,
+                    grid_x,
+                    active_m,
+                    fc1_emit,
+                    fc2_emit,
+                    input_rotated=False,
+                    fc1_prefetch_tile=None,
+                    fc2_prefetch_tile=None,
+                )
+
+
 class W4A16MixedTrellis3Kernel(W4A16MixedTrellisKernel):
     """One cooperative grid over three native Trellis bitrates.
 
@@ -2529,6 +4183,7 @@ def compile_mixed_trellis(
     ws_prerotate: bool | None = None,
     row_addresses: bool = False,
     _kimi_tp6_override: bool | None = None,
+    _k4_groupwise_override: bool | None = None,
 ) -> MixedTrellisCompileResult:
     if row_addresses and not 0 < int(size_m) <= 8192:
         raise ValueError("row-address WS capacity must be in 1..8192")
@@ -2599,7 +4254,11 @@ def compile_mixed_trellis(
         bits: int,
         *,
         grouped_m8_fc2: bool,
+        tile_n_override: int | None = None,
+        fast_m8_route_prologue: bool = False,
     ) -> W4A16FusedMoeKernel:
+        use_fc1_tile_n = fc1_tile_n if tile_n_override is None else int(tile_n_override)
+        use_fc2_tile_n = fc2_tile_n if tile_n_override is None else int(tile_n_override)
         return W4A16FusedMoeKernel(
             size_m=size_m,
             hidden_size=hidden_size,
@@ -2610,9 +4269,9 @@ def compile_mixed_trellis(
             swiglu_limit=swiglu_limit,
             apply_router_weight_on_input=False,
             zero_fc2_output=False,
-            fc1_tile_n=fc1_tile_n,
+            fc1_tile_n=use_fc1_tile_n,
             fc1_tile_k=fc1_tile_k,
-            fc2_tile_n=fc2_tile_n,
+            fc2_tile_n=use_fc2_tile_n,
             fc2_tile_k=fc2_tile_k,
             moe_block_size=moe_block_size,
             max_m_blocks=max_m_blocks,
@@ -2633,6 +4292,7 @@ def compile_mixed_trellis(
             schedule_whole_tiles=True,
             fused_input_rotation=fused_input_rotation and not warp_specialized,
             activation_output_a8=activations == "a8",
+            fast_m8_route_prologue=fast_m8_route_prologue,
             **({} if schedule is None else schedule.kernel_options()),
         )
 
@@ -2703,6 +4363,65 @@ def compile_mixed_trellis(
                 tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 descriptor_bits=descriptor_bits,
+            )
+        use_k4_groupwise = (
+            _k4_groupwise_override
+            if _k4_groupwise_override is not None
+            else (
+                (int(tier0_bits), int(tier1_bits)) in {(4, 5), (4, 6)}
+                and (int(hidden_size), int(route_num_experts), int(top_k))
+                in _K4_GROUPWISE_FAMILIES
+                and 1 <= int(size_m) <= 80
+                and int(moe_block_size) == 8
+                and not grouped_m8_fc2
+                and trellis_codebook == "mcg"
+                and rotation_input_dtype == "bf16"
+                and not direct_topk_routes
+                and not broadcast_suh
+                and paired_boundary is None
+                and not token_major_rotation
+                and not fused_input_rotation
+                and activations == "a16"
+                and input_format == "bf16"
+                and not row_addresses
+                and (fc1_tile_k, fc2_tile_k) == (64, 64)
+                and fc1_tile_n == fc2_tile_n
+                and fc1_tile_n in (128, 256)
+                and int(hidden_size) % 256 == 0
+                and int(intermediate_size) % 128 == 0
+                and (not compact_weights or int(intermediate_size) % int(fc1_tile_n) == 0)
+                and schedule in (None, MixedTrellisDecodeSchedule(l2_evict_first_b=True))
+                and not _w4a16_small_m_splitk_enabled()
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability(torch.cuda.current_device())
+                == (12, 1)
+            )
+        )
+        if use_k4_groupwise:
+            gw_common = {**common, "fast_m8_route_prologue": True}
+            sub_tier0 = None
+            sub_tier1 = None
+            if fc1_tile_n == 256 and int(tier1_bits) <= 5:
+                sub_tier0 = make_kernel(
+                    int(tier0_num_experts),
+                    int(tier0_bits),
+                    tile_n_override=128,
+                    **gw_common,
+                )
+                sub_tier1 = make_kernel(
+                    int(tier1_num_experts),
+                    int(tier1_bits),
+                    tile_n_override=128,
+                    **gw_common,
+                )
+            return W4A16MixedTrellisGroupwiseKernel(
+                driver=make_kernel(total_experts, tier0_bits, **gw_common),
+                tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **gw_common),
+                tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **gw_common),
+                sub_tier0=sub_tier0,
+                sub_tier1=sub_tier1,
+                descriptor_bits=descriptor_bits,
+                compact_weights=compact_weights,
             )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),

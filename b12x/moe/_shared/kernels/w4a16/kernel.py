@@ -1054,6 +1054,7 @@ class W4A16GemmKernel:
         l2_evict_first_b: bool = False,
         l2_prefetch_k_tiles: int = 0,
         compile_sms: int | None = None,
+        fast_m8_route_prologue: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -1296,6 +1297,8 @@ class W4A16GemmKernel:
         # Trace-time binding (suh_gate, suh_up, expert) for the FC1 tile being traced.
         self._rotation = None
         self._compact_weight = None
+        self._named_barrier = None
+        self.fast_m8_route_prologue = bool(fast_m8_route_prologue)
         self.fused_topk_sum = bool(fused_topk_sum)
         self.fused_sum_topk = int(fused_sum_topk)
         # Whole-tile persistent scheduling: every mn-tile is computed by one
@@ -1544,7 +1547,9 @@ class W4A16GemmKernel:
             self.small_m_splitk,
             self.skip_empty_m_blocks,
             self.fused_input_rotation,
-        ) + self._memory_schedule_key()
+        ) + self._memory_schedule_key() + (
+            ("fast_m8_route_prologue",) if self.fast_m8_route_prologue else ()
+        )
 
     def _memory_schedule_key(self) -> tuple[object, ...]:
         """Present only when a memory-schedule option is on, so the keys of
@@ -1578,6 +1583,17 @@ class W4A16GemmKernel:
     @cute.jit
     def _int4_addr(self, smem_base: Int32, int4_off: Int32) -> Int32:
         return smem_base + int4_off * Int32(16)
+
+    @cute.jit
+    def _cta_sync(self):
+        if cutlass.const_expr(self._named_barrier is not None):
+            bar_id, num_threads = self._named_barrier
+            cute.arch.barrier(
+                barrier_id=bar_id,
+                number_of_threads=num_threads,
+            )
+        else:
+            cute.arch.sync_threads()
 
     @cute.jit
     def _dequant_e2m1x4_to_elem2x2(self, packed: Uint32):
@@ -2172,7 +2188,7 @@ class W4A16GemmKernel:
                     smem_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
                     row,
                 )
-            cute.arch.sync_threads()
+            self._cta_sync()
             return valid_rows
 
         if cutlass.const_expr(self.direct_topk_routes):
@@ -2189,7 +2205,7 @@ class W4A16GemmKernel:
                         smem_base + Int32(self.sh_topk_off * 16),
                         self._broadcast_f32_to_elem2(topk),
                     )
-            cute.arch.sync_threads()
+            self._cta_sync()
             return Int32(1)
 
         if cutlass.const_expr(self.single_token_route_fast_path):
@@ -2214,8 +2230,44 @@ class W4A16GemmKernel:
                         smem_base + Int32(self.sh_topk_off * 16),
                         self._broadcast_f32_to_elem2(topk),
                     )
-            cute.arch.sync_threads()
+            self._cta_sync()
             return Int32(1)
+
+        if cutlass.const_expr(
+            self.fast_m8_route_prologue
+            and self.uses_m_block_8
+            and not self.mul_topk_weights
+        ):
+            if tid < Int32(32):
+                lane = tid
+                in_block = Int32(0)
+                if lane < Int32(8):
+                    idx = packed_route_indices[
+                        route_block_idx * Int32(8) + lane
+                    ].to(Int32)
+                    st_shared_i32(
+                        smem_base + Int32(self.sh_route_off * 16) + lane * Int32(4),
+                        idx,
+                    )
+                    rd_row = idx // Int32(self.top_k)
+                    if cutlass.const_expr(self.route_major_a):
+                        rd_row = idx
+                    st_shared_i32(
+                        smem_base + Int32(self.sh_rd_route_off * 16) + lane * Int32(4),
+                        rd_row,
+                    )
+                    if idx < active_size_m * Int32(self.top_k):
+                        in_block = Int32(1)
+                valid = cute.arch.warp_redux_sync(in_block, "add")
+                if lane == Int32(0):
+                    st_shared_i32(
+                        smem_base + Int32(self.sh_topk_off * 16),
+                        valid,
+                    )
+            self._cta_sync()
+            return ld_shared_i32_relaxed(
+                smem_base + Int32(self.sh_topk_off * 16)
+            )
 
         route_indices_int4_addr = self._int4_addr(
             smem_base, Int32(self.sh_route_off) + tid
@@ -2231,7 +2283,7 @@ class W4A16GemmKernel:
         )
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
+        self._cta_sync()
 
         if tid >= Int32(self.cta_threads - 32):
             size_per_thread = _covering_count(self.moe_block_size, 32)
@@ -2274,11 +2326,11 @@ class W4A16GemmKernel:
                 )
                 st_shared_u32(topk_word_addr, packed_topk)
 
-        cute.arch.sync_threads()
+        self._cta_sync()
         valid_count = ld_shared_i32_relaxed(
             smem_base + Int32(self.sh_valid_count_off * 16)
         )
-        cute.arch.sync_threads()
+        self._cta_sync()
         return valid_count
 
     @cute.jit
@@ -3365,7 +3417,7 @@ class W4A16GemmKernel:
                                 uses_m_block_8,
                             )
                     tile_idx += Int32(1)
-            cute.arch.sync_threads()
+            self._cta_sync()
             if tile_idx < k_tiles:
                 self._load_b_scale_register_bundle(
                     b_scale_cur,
@@ -3505,7 +3557,7 @@ class W4A16GemmKernel:
                         self._copy_a_register_bundle_m8(a1_regs_cur, a1_regs_next)
                         self._copy_b_scale_register_bundle(b_scale_cur, b_scale_next)
                     tile_idx += Int32(1)
-            cute.arch.sync_threads()
+            self._cta_sync()
             if tile_idx < k_tiles:
                 self._load_b_scale_register_bundle(
                     b_scale_cur,
@@ -3772,7 +3824,7 @@ class W4A16GemmKernel:
             state = Int32(-1)
             while state != count:
                 state = ld_global_acquire_i32(lock_addr)
-        cute.arch.sync_threads()
+        self._cta_sync()
 
     @cute.jit
     def _publish_reduction_turn(
@@ -3783,7 +3835,7 @@ class W4A16GemmKernel:
         tid: Int32,
     ):
         lock_addr = get_ptr_as_int64(locks_i32_flat, lock_slot)
-        cute.arch.sync_threads()
+        self._cta_sync()
         if tid == Int32(0):
             if reset:
                 st_global_i32(lock_addr, Int32(0))
@@ -5733,14 +5785,14 @@ class W4A16GemmKernel:
         if cutlass.const_expr(self.fused_input_rotation):
             # The first H128 pair: tiles 0 and 1 must both have landed.
             cute.arch.cp_async_wait_group(_STAGES - 3)
-            cute.arch.sync_threads()
+            self._cta_sync()
             self._rotate_a_pair(
                 smem_base, tid, Int32(0), Int32(1), reduce_k_tile,
                 block_valid_rows, output_n_tile,
             )
         else:
             cute.arch.cp_async_wait_group(_STAGES - 2)
-        cute.arch.sync_threads()
+        self._cta_sync()
 
     @cute.jit
     def _prefetch_lookahead_tile(
@@ -5802,7 +5854,7 @@ class W4A16GemmKernel:
             next_tile = reduce_k_tile + tile_idx + Int32(1)
             if tile_idx + Int32(1) < k_tiles and (next_tile & Int32(1)) == Int32(0):
                 cute.arch.cp_async_wait_group(_STAGES - 3)
-                cute.arch.sync_threads()
+                self._cta_sync()
                 self._rotate_a_pair(
                     smem_base,
                     tid,
@@ -5816,7 +5868,7 @@ class W4A16GemmKernel:
                 cute.arch.cp_async_wait_group(_STAGES - 2)
         else:
             cute.arch.cp_async_wait_group(_STAGES - 2)
-        cute.arch.sync_threads()
+        self._cta_sync()
 
     @cute.jit
     def _reduction_offsets(self, tid: Int32):
@@ -5858,7 +5910,7 @@ class W4A16GemmKernel:
                                 (jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
                             ],
                         )
-                cute.arch.sync_threads()
+                self._cta_sync()
 
             if Int32(1) <= red_idx and red_idx < Int32(2):
                 for jj in cutlass.range_constexpr(4):
@@ -5928,7 +5980,7 @@ class W4A16GemmKernel:
                             (jj * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
                         ],
                     )
-            cute.arch.sync_threads()
+            self._cta_sync()
 
             if red_idx == Int32(0):
                 for jj in cutlass.range_constexpr(4):
@@ -5971,7 +6023,7 @@ class W4A16GemmKernel:
                         ]
                         + r3
                     )
-            cute.arch.sync_threads()
+            self._cta_sync()
 
     @cute.jit
     def _output_store_cursor(self, tid: Int32, output_n_tile: Int32):
@@ -6081,7 +6133,7 @@ class W4A16GemmKernel:
                     )
             c_gl_wr += c_gl_wr_delta
             c_sh_rd += c_sh_rd_delta
-        cute.arch.sync_threads()
+        self._cta_sync()
 
     @cute.jit
     def _drain_output_smem_tail(
@@ -6141,7 +6193,7 @@ class W4A16GemmKernel:
                     )
             c_gl_wr += c_gl_wr_delta
             c_sh_rd += c_sh_rd_delta
-        cute.arch.sync_threads()
+        self._cta_sync()
 
     @cute.jit
     def _store_tile_m8(
@@ -6239,7 +6291,7 @@ class W4A16GemmKernel:
                     ]
                     * write_scale,
                 )
-        cute.arch.sync_threads()
+        self._cta_sync()
 
         store_iters = _covering_count(16, self.cta_threads // (2 * self.cta_n_blocks))
         if cutlass.const_expr(self.has_n_tile_tail):
@@ -6358,7 +6410,7 @@ class W4A16GemmKernel:
                             (flat_j * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
                         ],
                     )
-            cute.arch.sync_threads()
+            self._cta_sync()
 
         if Int32(1) <= red_idx and red_idx < Int32(2):
             for flat_j in cutlass.range_constexpr(8):
@@ -6427,7 +6479,7 @@ class W4A16GemmKernel:
                         (flat_j * 4 + 3) % _SCALAR_ACC_FRAGMENT_WIDTH
                     ],
                 )
-        cute.arch.sync_threads()
+        self._cta_sync()
 
         if red_idx == Int32(0):
             for flat_j in cutlass.range_constexpr(8):
@@ -6468,7 +6520,7 @@ class W4A16GemmKernel:
                     ]
                     + r3
                 )
-        cute.arch.sync_threads()
+        self._cta_sync()
 
     @cute.jit
     def _write_bf16x2_shared(
@@ -6567,7 +6619,7 @@ class W4A16GemmKernel:
                         write_scale,
                     )
                 c_sh_wr += Int32(16 * (4 * (2 * self.cta_n_blocks + 1)))
-        cute.arch.sync_threads()
+        self._cta_sync()
 
         store_iters = _covering_count(
             16 * self.cta_m_blocks,
@@ -6722,6 +6774,7 @@ class W4A16FusedMoeKernel:
         fc2_l2_prefetch_k_tiles: int = 0,
         phase_l2_prefetch: bool = False,
         workspace_sms: int | None = None,
+        fast_m8_route_prologue: bool = False,
     ):
         activation = normalize_moe_activation(activation)
         is_gated = validate_activation(activation)
@@ -6982,6 +7035,7 @@ class W4A16FusedMoeKernel:
             l2_evict_first_b=l2_evict_first_b,
             l2_prefetch_k_tiles=fc1_l2_prefetch_k_tiles,
             compile_sms=workspace_sms,
+            fast_m8_route_prologue=fast_m8_route_prologue,
         )
         self.fc2 = W4A16GemmKernel(
             size_m=routed_rows,
@@ -7018,6 +7072,7 @@ class W4A16FusedMoeKernel:
             l2_evict_first_b=l2_evict_first_b,
             l2_prefetch_k_tiles=fc2_l2_prefetch_k_tiles,
             compile_sms=workspace_sms,
+            fast_m8_route_prologue=fast_m8_route_prologue,
         )
         # Prefetch each GEMM's first tile into L2 before the grid barrier that
         # precedes it (the rotation phase's for FC1, FC1's own for FC2): the
