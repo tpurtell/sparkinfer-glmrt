@@ -119,3 +119,113 @@ def test_mul1_rejects_k1_in_registry_and_w4a16_kernel() -> None:
             trellis_bits=1,
             trellis_codebook="mul1",
         )
+
+
+@pytest.mark.parametrize(
+    ("codebook_arg", "bits"),
+    [
+        ("mul1", (2, 3)),
+        ("mul1", (3, 4)),
+        ("mul1", (4, 5)),
+        ("mul1", (5, 6)),
+        ("mul1", (2, 4, 6)),
+        (MUL1_MULTIPLIER, (3, 4, 5)),
+    ],
+)
+def test_mixed_trellis_format_accepts_mul1_and_separates_cache_keys_on_cpu(
+    codebook_arg: str | int,
+    bits: tuple[int, ...],
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
+        W4A16MixedTrellis3Kernel,
+        W4A16MixedTrellisKernel,
+        _normalize_mixed_trellis_format,
+    )
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis_ws import W4A16MixedTrellisWSKernel
+
+    normalized, normalized_bits = _normalize_mixed_trellis_format(codebook_arg, bits)
+    assert normalized == "mul1"
+    assert normalized_bits == bits
+
+    for bad_bits, match in (
+        ((1, 2), "mul1 is defined only for K2/K3/K4/K5/K6"),
+        ((3, 3), "tiers must be distinct"),
+        ((2, 3, 7), "mul1 is defined only for K2/K3/K4/K5/K6"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            _normalize_mixed_trellis_format("mul1", bad_bits)
+
+    def make_moe(num_experts: int, tier_bits: int, codebook: str, block_m: int = 16) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=16,
+            hidden_size=512,
+            intermediate_size=256,
+            num_experts=num_experts,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=128,
+            fc1_tile_k=64,
+            fc2_tile_n=128,
+            fc2_tile_k=64,
+            moe_block_size=block_m,
+            max_m_blocks=8,
+            element_dtype="fp16",
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj",
+            trellis_bits=tier_bits,
+            trellis_codebook=codebook,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype="bf16",
+            workspace_sms=48,
+            schedule_whole_tiles=True,
+        )
+
+    if len(bits) == 2:
+        mul1_k = W4A16MixedTrellisKernel(
+            driver=make_moe(4, bits[0], "mul1"),
+            tier0=make_moe(2, bits[0], "mul1"),
+            tier1=make_moe(2, bits[1], "mul1"),
+        )
+        mcg_k = W4A16MixedTrellisKernel(
+            driver=make_moe(4, bits[0], "mcg"),
+            tier0=make_moe(2, bits[0], "mcg"),
+            tier1=make_moe(2, bits[1], "mcg"),
+        )
+        assert mul1_k.__cache_key__ != mcg_k.__cache_key__
+
+        mul1_ws = W4A16MixedTrellisWSKernel(
+            driver=make_moe(4, bits[0], "mul1"),
+            tier0=make_moe(2, bits[0], "mul1"),
+            tier1=make_moe(2, bits[1], "mul1"),
+            max_shared_mem=101376,
+            prerotate=False,
+        )
+        mcg_ws = W4A16MixedTrellisWSKernel(
+            driver=make_moe(4, bits[0], "mcg"),
+            tier0=make_moe(2, bits[0], "mcg"),
+            tier1=make_moe(2, bits[1], "mcg"),
+            max_shared_mem=101376,
+            prerotate=False,
+        )
+        assert mul1_ws.__cache_key__ != mcg_ws.__cache_key__
+    else:
+        mul1_k3 = W4A16MixedTrellis3Kernel(
+            driver=make_moe(6, bits[0], "mul1"),
+            tier0=make_moe(2, bits[0], "mul1"),
+            tier1=make_moe(2, bits[1], "mul1"),
+            tier2=make_moe(2, bits[2], "mul1"),
+        )
+        mcg_k3 = W4A16MixedTrellis3Kernel(
+            driver=make_moe(6, bits[0], "mcg"),
+            tier0=make_moe(2, bits[0], "mcg"),
+            tier1=make_moe(2, bits[1], "mcg"),
+            tier2=make_moe(2, bits[2], "mcg"),
+        )
+        assert mul1_k3.__cache_key__ != mcg_k3.__cache_key__
