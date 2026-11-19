@@ -2572,8 +2572,8 @@ def compile_mixed_trellis(
         (tier0_bits, tier1_bits),
     )
     tier0_bits, tier1_bits = bits
-    if activations == "a8" and trellis_codebook != "mcg":
-        raise ValueError("EXL3 A8 INT8 weight conversion requires the MCG codebook")
+    if activations == "a8" and trellis_codebook not in (MCG, MUL1):
+        raise ValueError("EXL3 A8 INT8 weight conversion requires the MCG codebook or MUL1")
     # 192-wide and unequal FC1/FC2 N tiles exist only in the warp-specialized
     # kernel; its cooperative sub-kernels (decode helpers, activation) keep 128.
     ws_tile_n = None

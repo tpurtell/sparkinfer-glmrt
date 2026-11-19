@@ -425,21 +425,26 @@ def _run_exact_inter_rot_act_f16(
     activation: str,
     swiglu_limit: float | None,
     fast_math: bool = True,
+    output_f32: bool = False,
 ) -> torch.Tensor:
-    """Single-kernel post-FC1 ``H128 -> * svg/svu -> gated_act -> * sd -> H128 -> fp16``."""
+    """Single-kernel post-FC1 ``H128 -> * svg/svu -> gated_act -> * sd -> H128 -> fp16/fp32``."""
     rows, intermediate = fc1_g_f16.shape
     assert fc1_u_f16.shape == (rows, intermediate)
     assert rot_row_f16.shape == (3 * intermediate,)
     assert intermediate % 128 == 0
     nblk = intermediate // 128
     total_units = rows * nblk
-    out_f16 = torch.empty((rows, intermediate), dtype=torch.float16, device=fc1_g_f16.device)
+    out_tensor = torch.empty(
+        (rows, intermediate),
+        dtype=torch.float32 if output_f32 else torch.float16,
+        device=fc1_g_f16.device,
+    )
     g_flat = fc1_g_f16.contiguous().reshape(-1)
     u_flat = fc1_u_f16.contiguous().reshape(-1)
     r_flat = rot_row_f16.contiguous().reshape(-1)
-    o_flat = out_f16.reshape(-1)
+    o_flat = out_tensor.reshape(-1)
 
-    key = (activation, swiglu_limit, bool(fast_math), rows, intermediate)
+    key = (activation, swiglu_limit, bool(fast_math), bool(output_f32), rows, intermediate)
     if key not in _REF_INTER_ACT_CACHE:
         is_situ = activation == "situ"
         is_post_clamp = activation == "silu_post_clamp"
@@ -521,10 +526,16 @@ def _run_exact_inter_rot_act_f16(
             a2 = _eval_one(ig2, iu2, sd2)
             a3 = _eval_one(ig3, iu3, sd3)
             o0, o1, o2, o3 = _had128_quad_ref(a0, a1, a2, a3, lane)
-            o_t[base + Int32(0)] = o0.to(cutlass.Float16)
-            o_t[base + Int32(1)] = o1.to(cutlass.Float16)
-            o_t[base + Int32(2)] = o2.to(cutlass.Float16)
-            o_t[base + Int32(3)] = o3.to(cutlass.Float16)
+            if cutlass.const_expr(output_f32):
+                o_t[base + Int32(0)] = o0
+                o_t[base + Int32(1)] = o1
+                o_t[base + Int32(2)] = o2
+                o_t[base + Int32(3)] = o3
+            else:
+                o_t[base + Int32(0)] = o0.to(cutlass.Float16)
+                o_t[base + Int32(1)] = o1.to(cutlass.Float16)
+                o_t[base + Int32(2)] = o2.to(cutlass.Float16)
+                o_t[base + Int32(3)] = o3.to(cutlass.Float16)
 
         @cute.jit
         def _launch_inter_act(
@@ -554,7 +565,7 @@ def _run_exact_inter_rot_act_f16(
         from_dlpack(o_flat),
         stream,
     )
-    return out_f16
+    return out_tensor
 
 
 def _run_exact_fc2_rot_f32(
@@ -3557,5 +3568,488 @@ def test_mixed_trellis_kimi_tp6_sm121_auto_selector_bitwise(codebook: str) -> No
         )
         assert_bitwise_equal(auto_out, coop_out, f"sm121_auto_kimi_m{cap_m}_vs_coop_{codebook}")
         assert_bitwise_equal(auto_out, expected, f"sm121_auto_kimi_m{cap_m}_vs_cpu_{codebook}")
+
+
+_REF_A8_QUANT_CACHE: dict[int, object] = {}
+
+
+def _quantize_a8_blocks_exact(x_f32: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Kernel-independent per-H128-block INT8 activation quantizer (no ws_a8 imports)."""
+    rows, cols = x_f32.shape
+    assert cols % 128 == 0
+    nblk = cols // 128
+    total_blocks = rows * nblk
+    q_i32 = torch.empty((total_blocks, 128), dtype=torch.int32, device=x_f32.device)
+    scales_f32 = torch.empty((total_blocks,), dtype=torch.float32, device=x_f32.device)
+
+    in_flat = x_f32.contiguous().reshape(-1)
+    q_flat = q_i32.reshape(-1)
+    s_flat = scales_f32.reshape(-1)
+
+    if total_blocks not in _REF_A8_QUANT_CACHE:
+        from cutlass._mlir.dialects import llvm
+        from cutlass.cutlass_dsl import T, dsl_user_op
+
+        @dsl_user_op
+        def _fma_magic_low_s8_i32(val: Float32, inv: Float32, *, loc=None, ip=None) -> Int32:
+            return Int32(
+                llvm.inline_asm(
+                    T.i32(),
+                    [Float32(val).ir_value(loc=loc, ip=ip), Float32(inv).ir_value(loc=loc, ip=ip)],
+                    "{ .reg .f32 f; .reg .b32 b;\n"
+                    "fma.rn.f32 f, $1, $2, 0f4B400000;\n"
+                    "mov.b32 b, f;\n"
+                    "cvt.s32.s8 $0, b; }",
+                    "=r,f,f",
+                    has_side_effects=False,
+                    is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc,
+                    ip=ip,
+                )
+            )
+
+        @cute.kernel
+        def _a8_quant_kernel(src: cute.Tensor, q_dst: cute.Tensor, s_dst: cute.Tensor):
+            lane, _, _ = cute.arch.thread_idx()
+            blk, _, _ = cute.arch.block_idx()
+            base = blk * Int32(128) + lane * Int32(4)
+            v0 = src[base + Int32(0)].to(Float32)
+            v1 = src[base + Int32(1)].to(Float32)
+            v2 = src[base + Int32(2)].to(Float32)
+            v3 = src[base + Int32(3)].to(Float32)
+            a0 = -v0 if v0 < Float32(0.0) else v0
+            a1 = -v1 if v1 < Float32(0.0) else v1
+            a2 = -v2 if v2 < Float32(0.0) else v2
+            a3 = -v3 if v3 < Float32(0.0) else v3
+            amax = a0 if a0 >= a1 else a1
+            if a2 > amax:
+                amax = a2
+            if a3 > amax:
+                amax = a3
+            for i in cutlass.range_constexpr(5):
+                other = cute.arch.shuffle_sync_bfly(amax, offset=1 << i)
+                if other > amax:
+                    amax = other
+            inv = Float32(0.0)
+            if amax > Float32(0.0):
+                inv = Float32(127.0) / amax
+            q_dst[base + Int32(0)] = _fma_magic_low_s8_i32(v0, inv)
+            q_dst[base + Int32(1)] = _fma_magic_low_s8_i32(v1, inv)
+            q_dst[base + Int32(2)] = _fma_magic_low_s8_i32(v2, inv)
+            q_dst[base + Int32(3)] = _fma_magic_low_s8_i32(v3, inv)
+            if lane == Int32(0):
+                s_dst[blk] = amax * Float32(1.0 / 127.0)
+
+        @cute.jit
+        def _launch_a8_quant(src: cute.Tensor, q_dst: cute.Tensor, s_dst: cute.Tensor, stream):
+            _a8_quant_kernel(src, q_dst, s_dst).launch(
+                grid=(total_blocks, 1, 1),
+                block=(32, 1, 1),
+                stream=stream,
+            )
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        _REF_A8_QUANT_CACHE[total_blocks] = cute.compile(
+            _launch_a8_quant,
+            from_dlpack(in_flat),
+            from_dlpack(q_flat),
+            from_dlpack(s_flat),
+            stream,
+        )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _REF_A8_QUANT_CACHE[total_blocks](
+        from_dlpack(in_flat), from_dlpack(q_flat), from_dlpack(s_flat), stream
+    )
+    return q_i32.reshape(rows, cols), scales_f32.reshape(rows, nblk)
+
+
+def _run_exact_a8_gemm_f16(
+    q_a_i32: torch.Tensor,
+    s_a_f32: torch.Tensor,
+    w_f16: torch.Tensor,
+) -> torch.Tensor:
+    """Exact per-H128-block INT8 dot product + magic-bit float rescale + /32 FP16 store."""
+    rows, k = q_a_i32.shape
+    wk, n = w_f16.shape
+    assert wk == k and k % 128 == 0
+    # round(32 * w) via exact IEEE FP16 FMA(w, 32.0, 1536.0) low mantissa byte.
+    w_fma_i16 = (w_f16.to(torch.float64) * 32.0 + 1536.0).to(torch.float16).view(torch.int16)
+    w_s8_i32 = (w_fma_i16.to(torch.int32) & 0xFF).to(torch.uint8).view(torch.int8).to(torch.int32)
+
+    facc = torch.zeros((rows, n), dtype=torch.float32, device=q_a_i32.device)
+    for b in range(k // 128):
+        qa_b = q_a_i32[:, 128 * b : 128 * (b + 1)].to(torch.float64)
+        wb_b = w_s8_i32[128 * b : 128 * (b + 1), :].to(torch.float64)
+        # |dot| <= 128 * 127 * 127 = 2,064,512 << 2^53, so float64 matmul is integer-exact.
+        dot_i32 = torch.matmul(qa_b, wb_b).to(torch.int64).to(torch.int32)
+        bits_i32 = (dot_i32 + 0x4B400000).to(torch.int32)
+        t_f32 = bits_i32.view(torch.float32) - 12582912.0
+        facc = torch.addcmul(facc, t_f32, s_a_f32[:, b : b + 1])
+    return ((facc + 0.0) * 0.03125).to(torch.float16)
+
+
+def _decode_wire_e4m3_k32_to_f16(wire: torch.Tensor, hidden: int) -> torch.Tensor:
+    """Decode [M, H + H/32] E4M3 + UE8M0 wire rows to the exact FP16 values widened by WS."""
+    rows = int(wire.shape[0])
+    e4m3 = wire[:, :hidden].contiguous().view(torch.float8_e4m3fn).to(torch.float32)
+    s_u8 = wire[:, hidden:].to(torch.int32)
+    s_bits = s_u8 << 23
+    s_bits = torch.where(s_u8 == 0, torch.full_like(s_bits, 0x00400000), s_bits)
+    s_bits = torch.where(s_u8 == 255, torch.full_like(s_bits, 0x7FFFFFFF), s_bits)
+    scales = s_bits.view(torch.float32)
+    return (e4m3.reshape(rows, hidden // 32, 32) * scales.unsqueeze(-1)).to(torch.float16).reshape(rows, hidden)
+
+
+def reference_exl3_ws_a8_routed_moe_bitwise(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gate_weights_f16: list[torch.Tensor],
+    up_weights_f16: list[torch.Tensor],
+    down_weights_f16: list[torch.Tensor],
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    down_svh: torch.Tensor,
+    *,
+    input_format: str = "bf16",
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Bitwise reference for warp-specialized EXL3 A8 over CPU-decoded Reference(codebook) FP16 weights."""
+    device = x.device
+    m = int(x.shape[0])
+    hidden = int(gate_weights_f16[0].shape[0])
+    _, top_k = topk_ids.shape
+
+    if input_format == "e4m3_k32":
+        x_base_f16 = _decode_wire_e4m3_k32_to_f16(x, hidden)
+    else:
+        x_base_f16 = x.to(torch.float16)
+
+    route_outputs = torch.zeros((m, top_k, hidden), dtype=torch.float32, device=device)
+    ids_cpu = topk_ids.detach().cpu().numpy()
+
+    for expert in sorted({int(e) for e in ids_cpu.reshape(-1) if int(e) >= 0}):
+        positions = np.argwhere(ids_cpu == expert)
+        token_idx = torch.from_numpy(positions[:, 0]).to(device=device, dtype=torch.long)
+        slot_idx = torch.from_numpy(positions[:, 1]).to(device=device, dtype=torch.long)
+
+        x_e = x_base_f16.index_select(0, token_idx)
+        g_suh = gate_suh[0 if gate_suh.shape[0] == 1 else expert]
+        u_suh = up_suh[0 if up_suh.shape[0] == 1 else expert]
+
+        rot_g_f32 = _run_exact_had128_f32((x_e * g_suh).to(torch.float16).to(torch.float32))
+        rot_u_f32 = _run_exact_had128_f32((x_e * u_suh).to(torch.float16).to(torch.float32))
+        qg, sg = _quantize_a8_blocks_exact(rot_g_f32)
+        qu, su = _quantize_a8_blocks_exact(rot_u_f32)
+
+        w_g = gate_weights_f16[expert].to(device=device)
+        w_u = up_weights_f16[expert].to(device=device)
+        w_d = down_weights_f16[expert].to(device=device)
+
+        fc1_g = _run_exact_a8_gemm_f16(qg, sg, w_g)
+        fc1_u = _run_exact_a8_gemm_f16(qu, su, w_u)
+
+        act_f32 = _run_exact_inter_rot_act_f16(
+            fc1_g,
+            fc1_u,
+            intermediate_rotations[expert],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            output_f32=True,
+        )
+        qa, sa = _quantize_a8_blocks_exact(act_f32)
+        fc2_f16 = _run_exact_a8_gemm_f16(qa, sa, w_d)
+
+        d_svh_f16 = down_svh[0 if down_svh.shape[0] == 1 else expert]
+        fc2_rot = _run_exact_fc2_rot_f32(fc2_f16, d_svh_f16)
+        route_outputs[token_idx, slot_idx] = fc2_rot
+
+    acc = torch.zeros((m, hidden), dtype=torch.float32, device=device)
+    w_f32 = topk_weights.to(torch.float32)
+    for slot in range(top_k):
+        acc = torch.addcmul(acc, route_outputs[:, slot], w_f32[:, slot : slot + 1])
+    return acc.to(output_dtype)
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120 or SM121 GPU")
+@pytest.mark.parametrize("codebook", ["mul1", "mcg"])
+@pytest.mark.parametrize(
+    "a8_case",
+    [
+        "bf16_k2_k3_silu_m16",
+        "bf16_k3_k4_graph_and_frozen_live_rows",
+        "wire_e4m3_k4_k5_tiles192x256_clamp",
+        "bf16_k5_k6_proj_tiered_situ_fp32_m32",
+    ],
+)
+def test_mixed_trellis_ws_a8_bitwise_matches_reference(
+    codebook: str,
+    a8_case: str,
+) -> None:
+    """Bitwise oracle for warp-specialized A8 W4A16MixedTrellisWSKernel across K2..K6, BF16 & E4M3 wire inputs, 192x256 tiles, dynamic claims, graph replay, and frozen live rows."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(device)
+    sms = int(props.multi_processor_count)
+    max_shared_mem = int(props.shared_memory_per_block_optin)
+
+    if a8_case == "bf16_k2_k3_silu_m16":
+        bits = (2, 3)
+        input_format = "bf16"
+        hidden, intermediate = 512, 256
+        tiles = (64, 128, 64, 128)
+        block_m = 16
+        capacity_m = 32
+        activation = "silu"
+        swiglu_limit = None
+        out_dtype_str = "bf16"
+        out_dtype = torch.bfloat16
+        dynamic_tiles = False
+        proj_tiered = False
+    elif a8_case == "bf16_k3_k4_graph_and_frozen_live_rows":
+        bits = (3, 4)
+        input_format = "bf16"
+        hidden, intermediate = 512, 256
+        tiles = (64, 128, 64, 128)
+        block_m = 16
+        capacity_m = 64
+        activation = "silu"
+        swiglu_limit = None
+        out_dtype_str = "bf16"
+        out_dtype = torch.bfloat16
+        dynamic_tiles = True
+        proj_tiered = False
+    elif a8_case == "wire_e4m3_k4_k5_tiles192x256_clamp":
+        bits = (4, 5)
+        input_format = "e4m3_k32"
+        hidden, intermediate = 512, 384
+        tiles = (64, 192, 64, 256)
+        block_m = 16
+        capacity_m = 48
+        activation = "silu_post_clamp"
+        swiglu_limit = 7.0
+        out_dtype_str = "bf16"
+        out_dtype = torch.bfloat16
+        dynamic_tiles = False
+        proj_tiered = False
+    else:
+        assert a8_case == "bf16_k5_k6_proj_tiered_situ_fp32_m32"
+        bits = (5, 6)
+        input_format = "bf16"
+        hidden, intermediate = 512, 256
+        tiles = (64, 128, 64, 128)
+        block_m = 32
+        capacity_m = 32
+        activation = "situ"
+        swiglu_limit = None
+        out_dtype_str = "fp32"
+        out_dtype = torch.float32
+        dynamic_tiles = False
+        proj_tiered = True
+
+    experts, top_k = 4, 2
+    prep_tiles = (64, 128, 64, 128)
+    seed_base = 150_000 + bits[0] * 100 + bits[1] * 10 + (1 if codebook == "mul1" else 0)
+
+    if proj_tiered:
+        (
+            tiers,
+            mapping,
+            descriptor,
+            rotations,
+            gate_w,
+            up_w,
+            down_w,
+            gate_suh,
+            up_suh,
+            inter_rot,
+            down_svh,
+        ) = _build_projection_tiered_fixture(
+            hidden=hidden,
+            intermediate=intermediate,
+            tier_bits=bits,
+            gate_tiers=(0, 1, 0, 1),
+            up_tiers=(1, 0, 0, 1),
+            down_tiers=(0, 0, 1, 1),
+            codebook=codebook,
+            seed_base=seed_base,
+            tile_config=prep_tiles,
+            activation=activation,
+            device=device,
+        )
+    else:
+        (
+            tiers,
+            mapping,
+            descriptor,
+            rotations,
+            gate_w,
+            up_w,
+            down_w,
+            gate_suh,
+            up_suh,
+            inter_rot,
+            down_svh,
+        ) = _build_disjoint_2tier_fixture(
+            hidden=hidden,
+            intermediate=intermediate,
+            bits=bits,
+            codebook=codebook,
+            seed_base=seed_base,
+            tile_config=prep_tiles,
+            activation=activation,
+            device=device,
+        )
+
+    route_slots = max_packed_route_slots(capacity_m * top_k, block_m, experts)
+    max_m_blocks = (route_slots + block_m - 1) // block_m
+    common_compile = dict(
+        size_m=capacity_m,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        tier0_num_experts=2,
+        tier1_num_experts=2,
+        route_num_experts=experts,
+        top_k=top_k,
+        max_m_blocks=max_m_blocks,
+        sms=sms,
+        max_shared_mem=max_shared_mem,
+        force_tile_config=tiles,
+        tier0_bits=bits[0],
+        tier1_bits=bits[1],
+        trellis_codebook=codebook,
+        swiglu_limit=swiglu_limit,
+        activation=activation,
+        moe_block_size=block_m,
+        rotation_input_dtype="bf16",
+        full_rotation_output_dtype=out_dtype_str,
+        warp_specialized=True,
+        input_format=input_format,
+        ws_dynamic_tiles=dynamic_tiles,
+    )
+    a8_launch = compile_mixed_trellis(**common_compile, activations="a8")
+    a16_launch = compile_mixed_trellis(**common_compile, activations="a16")
+    assert a8_launch.trellis_codebook == codebook
+    assert a8_launch.activations == "a8"
+    assert a8_launch.compiled is not a16_launch.compiled
+
+    a8_bind = bind_mixed_trellis(tiers[0], tiers[1], mapping, descriptor, rotations, a8_launch)
+    a16_bind = bind_mixed_trellis(tiers[0], tiers[1], mapping, descriptor, rotations, a16_launch)
+    a8_buf = make_mixed_trellis_buffers(a8_launch, device=device, sms=sms)
+    a16_buf = make_mixed_trellis_buffers(a16_launch, device=device, sms=sms)
+    warmup_mixed_trellis_route_pack(a8_launch, a8_buf, expert_map=mapping)
+    warmup_mixed_trellis_route_pack(a16_launch, a16_buf, expert_map=mapping)
+
+    rng = torch.Generator(device="cpu").manual_seed(155_000 + bits[0] * 19 + len(a8_case))
+    x_bf16 = (torch.randn((capacity_m, hidden), generator=rng) * 0.04).to(
+        device=device, dtype=torch.bfloat16
+    )
+    ids_full = torch.stack(
+        [torch.randperm(experts, generator=rng)[:top_k] for _ in range(capacity_m)]
+    ).to(device=device, dtype=torch.int32)
+    weights_full = torch.softmax(
+        torch.randn((capacity_m, top_k), generator=rng, dtype=torch.float32), dim=-1
+    ).to(device=device)
+
+    def make_operand(src_bf16: torch.Tensor) -> torch.Tensor:
+        if input_format == "bf16":
+            return src_bf16.contiguous()
+        rows = int(src_bf16.shape[0])
+        groups = src_bf16.float().reshape(rows, hidden // 32, 32)
+        exponent = torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(2.0**-100) / 448.0)).clamp(-127, 127)
+        vals = (groups / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn)
+        return torch.cat(
+            (vals.view(torch.uint8).reshape(rows, hidden), (exponent + 127).to(torch.uint8)),
+            dim=1,
+        ).contiguous()
+
+    live_counts = (
+        (1, 17, capacity_m)
+        if a8_case in ("bf16_k3_k4_graph_and_frozen_live_rows", "wire_e4m3_k4_k5_tiles192x256_clamp")
+        else (capacity_m,)
+    )
+    operands = {m_live: make_operand(x_bf16[:m_live]) for m_live in live_counts}
+
+    with kernel_resolution_guard(f"frozen ws_a8 {a8_case}"):
+        w_saved = weights_full.clone()
+        try:
+            for live_m in live_counts:
+                weights_full.copy_(w_saved)
+                if live_m < capacity_m:
+                    weights_full[live_m:].fill_(float("nan"))
+                a8_buf.output.fill_(float("nan"))
+                a16_buf.output.fill_(float("nan"))
+                actual_a8 = run_bound_mixed_trellis(
+                    operands[live_m], weights_full[:live_m], ids_full[:live_m], a8_bind, a8_buf
+                ).clone()
+                actual_a16 = run_bound_mixed_trellis(
+                    operands[live_m], weights_full[:live_m], ids_full[:live_m], a16_bind, a16_buf
+                ).clone()
+                torch.cuda.synchronize(device)
+
+                expected_a8 = reference_exl3_ws_a8_routed_moe_bitwise(
+                    operands[live_m],
+                    ids_full[:live_m],
+                    w_saved[:live_m],
+                    gate_w,
+                    up_w,
+                    down_w,
+                    gate_suh,
+                    up_suh,
+                    inter_rot,
+                    down_svh,
+                    input_format=input_format,
+                    activation=activation,
+                    swiglu_limit=swiglu_limit,
+                    output_dtype=out_dtype,
+                )
+                assert_bitwise_equal(actual_a8, expected_a8, f"ws_a8_{a8_case}_m{live_m}_{codebook}")
+
+                rel = (actual_a8.float() - actual_a16.float()).norm() / actual_a16.float().norm().clamp_min(1e-12)
+                cos = torch.nn.functional.cosine_similarity(
+                    actual_a8.float().flatten(), actual_a16.float().flatten(), dim=0
+                )
+                assert float(rel.item()) < 0.045, f"ws_a8 vs a16 rel={rel.item()}"
+                assert float(cos.item()) > 0.999, f"ws_a8 vs a16 cos={cos.item()}"
+        finally:
+            weights_full.copy_(w_saved)
+
+        if 17 in operands:
+            expected_17 = reference_exl3_ws_a8_routed_moe_bitwise(
+                operands[17],
+                ids_full[:17],
+                weights_full[:17],
+                gate_w,
+                up_w,
+                down_w,
+                gate_suh,
+                up_suh,
+                inter_rot,
+                down_svh,
+                input_format=input_format,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                output_dtype=out_dtype,
+            )
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph):
+                    run_bound_mixed_trellis(
+                        operands[17], weights_full[:17], ids_full[:17], a8_bind, a8_buf
+                    )
+                for _ in range(2):
+                    a8_buf.output.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize(device)
+                    assert_bitwise_equal(
+                        a8_buf.output[:17], expected_17, f"ws_a8_graph_{a8_case}_{codebook}"
+                    )
+            finally:
+                graph.reset()
+
 
 

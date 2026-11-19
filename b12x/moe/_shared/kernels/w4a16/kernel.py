@@ -6907,9 +6907,9 @@ class W4A16FusedMoeKernel:
         self.activation_output_a8 = bool(activation_output_a8)
         if self.activation_output_a8 and (
             not self.full_rotation or coupled_hadamard or self.collect_activation_amax
-            or element_dtype != "fp16" or self.trellis_codebook != MCG
+            or element_dtype != "fp16" or self.trellis_codebook not in (MCG, MUL1)
         ):
-            raise ValueError("A8 activation output requires MCG FP16 H128 full rotation")
+            raise ValueError("A8 activation output requires MCG or MUL1 FP16 H128 full rotation")
         # FC1 rotates the staged token input itself (no rotation phase, no
         # materialized per-route copies). Requires BF16 input, per-expert SUH
         # and packed routes; the caller binds the SUH tables per FC1 tile.

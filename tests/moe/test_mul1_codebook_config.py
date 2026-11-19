@@ -650,3 +650,142 @@ def test_sm121_kimi_tp6_selector_dispatches_mul1_and_mcg_before_cuda(
     assert selected[0].tier0.trellis_codebook == expected_cb
 
 
+@pytest.mark.parametrize("bits", [(2, 3), (3, 4), (4, 5), (4, 6), (5, 6)])
+@pytest.mark.parametrize("input_format", ["bf16", "e4m3_k32"])
+def test_ws_a8_accepts_mul1_and_separates_cache_keys_on_cpu(
+    monkeypatch,
+    bits: tuple[int, int],
+    input_format: str,
+) -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("cutlass")
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mt_mod
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16FusedMoeKernel
+    from b12x.moe._shared.kernels.w4a16.mixed_trellis_ws import W4A16MixedTrellisWSKernel
+
+    def make_moe(num_experts: int, tier_bits: int, codebook: str, a8: bool) -> W4A16FusedMoeKernel:
+        return W4A16FusedMoeKernel(
+            size_m=64,
+            hidden_size=512,
+            intermediate_size=256,
+            num_experts=num_experts,
+            top_k=2,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            fc1_tile_n=128,
+            fc1_tile_k=64,
+            fc2_tile_n=128,
+            fc2_tile_k=64,
+            moe_block_size=16,
+            max_m_blocks=16,
+            element_dtype="fp16",
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj",
+            trellis_bits=tier_bits,
+            trellis_codebook=codebook,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype="bf16",
+            workspace_sms=48,
+            schedule_whole_tiles=True,
+            activation_output_a8=a8,
+        )
+
+    mul1_a8 = W4A16MixedTrellisWSKernel(
+        driver=make_moe(4, bits[0], "mul1", True),
+        tier0=make_moe(2, bits[0], "mul1", True),
+        tier1=make_moe(2, bits[1], "mul1", True),
+        max_shared_mem=101376,
+        input_format=input_format,
+        activations="a8",
+        prerotate=False,
+    )
+    mcg_a8 = W4A16MixedTrellisWSKernel(
+        driver=make_moe(4, bits[0], "mcg", True),
+        tier0=make_moe(2, bits[0], "mcg", True),
+        tier1=make_moe(2, bits[1], "mcg", True),
+        max_shared_mem=101376,
+        input_format=input_format,
+        activations="a8",
+        prerotate=False,
+    )
+    mul1_a16 = W4A16MixedTrellisWSKernel(
+        driver=make_moe(4, bits[0], "mul1", False),
+        tier0=make_moe(2, bits[0], "mul1", False),
+        tier1=make_moe(2, bits[1], "mul1", False),
+        max_shared_mem=101376,
+        input_format=input_format,
+        activations="a16",
+        prerotate=False,
+    )
+    assert mul1_a8.ws_a8
+    assert mul1_a8.__cache_key__ != mcg_a8.__cache_key__
+    assert mul1_a8.__cache_key__ != mul1_a16.__cache_key__
+
+    if bits == (3, 4) and input_format == "bf16":
+        with pytest.raises(ValueError, match="A8 activation output requires MCG or MUL1"):
+            make_moe(2, 3, "sqg_e4m3", True)
+        with pytest.raises(ValueError, match="requires the MCG codebook"):
+            mt_mod.compile_mixed_trellis(
+                size_m=64,
+                hidden_size=512,
+                intermediate_size=256,
+                tier0_num_experts=2,
+                tier1_num_experts=2,
+                top_k=2,
+                max_m_blocks=16,
+                sms=48,
+                max_shared_mem=101376,
+                force_tile_config=(64, 128, 64, 128),
+                moe_block_size=16,
+                trellis_codebook="sqg_e4m3",
+                warp_specialized=True,
+                activations="a8",
+            )
+
+    class _StopBeforeCuda(Exception):
+        pass
+
+    captured: list[W4A16MixedTrellisWSKernel] = []
+    orig_ws = W4A16MixedTrellisWSKernel
+
+    def capture_ws(**kwargs):
+        captured.append(orig_ws(**kwargs))
+        raise _StopBeforeCuda
+
+    import b12x.moe._shared.kernels.w4a16.mixed_trellis_ws as mt_ws_mod
+    monkeypatch.setattr(mt_ws_mod, "W4A16MixedTrellisWSKernel", capture_ws)
+    for cb_arg in ("mul1", MUL1_MULTIPLIER, "mcg"):
+        captured.clear()
+        with pytest.raises(_StopBeforeCuda):
+            mt_mod.compile_mixed_trellis(
+                size_m=64,
+                hidden_size=512,
+                intermediate_size=384 if input_format == "e4m3_k32" else 256,
+                tier0_num_experts=2,
+                tier1_num_experts=2,
+                top_k=2,
+                max_m_blocks=16,
+                sms=48,
+                max_shared_mem=101376,
+                force_tile_config=(64, 192, 64, 256) if input_format == "e4m3_k32" else (64, 128, 64, 128),
+                tier0_bits=bits[0],
+                tier1_bits=bits[1],
+                trellis_codebook=cb_arg,
+                moe_block_size=16,
+                warp_specialized=True,
+                input_format=input_format,
+                activations="a8",
+                workspace_sms=48,
+            )
+        assert len(captured) == 1
+        assert isinstance(captured[0], W4A16MixedTrellisWSKernel)
+        assert captured[0].ws_a8
+        expected_cb = "mcg" if cb_arg == "mcg" else "mul1"
+        assert captured[0].driver.trellis_codebook == expected_cb
+        assert captured[0].driver.activation_output_a8
+
+
+
