@@ -8,8 +8,10 @@
   dense-down and +0.3475% K8 Step-5 TP2 O at 2048 rows. The stacked rerun
   is byte-exact for all 140 cases. Its diagnostic K6 GLM O adjacent flag
   comes from a larger speedup at 2048, not slower absolute 2240 latency
-  in that run. Expected changed placement group: `programs` (SM120 dense
-  trellis only). See tpurtell/cuteafd#2528.
+  in that run. The isolated repeat confirms no 2240-row regression
+  (-0.57% chain, -0.79% body paired medians); 2048 chain is +0.10% with
+  substantial pair-to-pair variation. Expected changed placement group:
+  `programs` (SM120 dense trellis only). See tpurtell/cuteafd#2528.
 
 - SM120 native trellis body: use 128x128 prefill for selected BF16-ingress
   K6/K8 MCG projections. Preserve packed operands, H128 stages, ordered
