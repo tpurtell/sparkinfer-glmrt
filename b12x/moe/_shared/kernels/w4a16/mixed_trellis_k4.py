@@ -8,44 +8,46 @@ contiguous weight layouts across all gated activations (``silu``,
 Structural design (bit-identical to ``W4A16MixedTrellisKernel`` and invariant
 across ``m1``, ``m8``, and ``m80``):
 
-1. Non-cooperative phase launches with Blackwell PDL (``use_pdl=True``):
-   replaces the single cooperative mega-kernel and its three global-memory
-   spinning grid barriers with lightweight non-cooperative launches on the exact
-   ``v41_exl3_core`` ABI. Primary kernels signal ``griddepcontrol_launch_dependents``
-   so dependent GEMMs immediately occupy idle SMs during tail waves, resolve
-   read-only metadata, and prefetch their first two weight slabs from LPDDR5X
-   into SMEM before blocking on ``griddepcontrol_wait``.
-2. Fused last-CTA-activates inside FC1 (eliminating ``act_kernel`` whenever
-   ``max_live_blocks <= 4 * sms`` from runtime ``grid_x``, covering ``m1..m16``):
-   each active FC1 CTA for route block ``rb`` writes its output tile and
-   atomically increments ``workspace[rb]`` with ``atom.acq_rel.gpu``; the final
-   CTA for ``rb`` resets ``workspace[rb] = 0`` and immediately executes the
-   vectorized H128 + SwiGLU/SiLU/SiTU + H128 activation for ``rb`` straight out
-   of L2 using L2-coherent ``ld.global.cg.v2.u32``, cutting the small-M core to
-   just two overlapped launches (``fc1+rot+act`` -> PDL -> ``fc2``).
-3. Wave-matched FC1 tiling and unified 2-stage FC2 tiling:
-   - Narrow waves (``active_m <= 3``): ``fc1_tile_n = 32`` when
-     ``intermediate_size <= 384`` (``64`` when ``>= 512``) with 3-stage K128
-     slabs and fused H128 BF16->FP16 input rotation (6 CTAs/SM, 128-154 live
-     CTAs at ``m = 1``).
-   - Small-M waves (``4 <= active_m <= 16``): ``fc1_tile_n = 64`` with 3-stage
-     K128 slabs and fused input rotation, halving CTA count, fused rotation
-     work, ``ldmatrix`` count, and atomic increments while doubling contiguous
-     DRAM burst width (512 B/row).
-   - Medium-M waves (``active_m > 16``, e.g. ``m64``/``m80``): vectorized
-     live-route input rotation -> PDL -> ``fc1_tile_n = 128`` (1024 B/row,
-     3-stage) with adaptive L2 cache policy for multi-block expert reuse.
-   - Unified FC2 (``m1..m80``): ``fc2_tile_n = 128`` with 2-stage double-buffered
-     K128 slabs (3 CTAs/SM = 12 warps/SM even at ``max_bits = 6``, 1024 B/row,
-     exact multiples of 48 at ``m = 1`` for H=4608 and H=6144), prefetching both
-     initial weight slabs (100% of K=256 weights) under PDL before waiting on
-     ``activated``.
-4. Exact K-reduction and hoisted 64-bit addressing:
+1. Single-kernel persistent work-stealing decode for small-M (``m1..m11`` on
+   GB10, whenever ``5 + 2 * max_live_blocks <= 4 * runtime_sms``):
+   - Replaces the two-kernel PDL launch + global ``griddepcontrol_wait`` barrier
+     and redundant fused input rotation with ONE non-cooperative persistent
+     kernel (``grid = (3 * runtime_sms, 1, 1)``, ``block = 128`` = 4 warps/CTA
+     = 12 warps/SM) on the exact ``v41_exl3_core`` ABI.
+   - Phase 0 (``rot``): splits each live route block's ``H // 128`` H128 blocks
+     into 4 contiguous chunks across 4 warps/CTA, loading ``x_input`` and
+     ``suh`` once per chunk and writing L2-hot ``rotation_gate`` /
+     ``rotation_up``. Early FC1 CTAs prefetch cold LPDDR5X weight slabs while
+     waiting on per-block ``rot`` completion (``WS_STATE[rb]`` bits 28..30).
+   - Phase 1 (``FC1``) + fused last-CTA activation + Phase 2 (``FC2``): shares
+     ONE unified ``tile_n = 64, cta_threads = 128`` (``n_frags = 2``, 8 FP32
+     accumulator regs/thread, 100%-coalesced 512 B/warp K16 bursts) GEMM body
+     across both FC1 and FC2. Dead compact tiles are retired in ``tid == 0``
+     with zero barriers and zero SM skew. The final FC1 tile of each route
+     block ``rb`` immediately runs 4-warp vectorized activation out of L2 and
+     publishes ``rb`` into the dynamic ``WS_READY_LIST`` queue, unblocking FC2
+     for ``rb`` immediately in parallel with remaining FC1 blocks (no global
+     FC1->FC2 barrier, no second kernel launch, and safe under ``fc2`` aliasing
+     ``rotation_gate`` because each route belongs to a unique ``rb``).
+   - Monotonic atomic cursors guarantee deadlock-freedom for any resident CTA
+     count ``R >= 1``, and the unique last-exiting CTA resets ``workspace`` to
+     zeros for CUDA graph replay.
+   - Zero-line A SMEM addressing (``zero16_addr``) eliminates
+     ``_zero_invalid_a_stages`` across all paths and shrinks A SMEM to 256 B/
+     stage on compiled ``size_m == 1``, enabling a 4-stage branchless ring
+     (``stages = 4``, 27 KB at K6 -> 3 CTAs/SM = 12 warps/SM, 3 slabs in flight)
+     for ``m1`` and a 3-stage ring (26 KB at K6 -> 3 CTAs/SM) for ``m2..m11``.
+2. Multi-kernel PDL paths for larger small-M and medium-M waves:
+   - ``m12..m16``: fused-rotation ``fc1_tile_n = 64`` with fused last-CTA
+     activation -> PDL -> 2-stage ``fc2_tile_n = 128``.
+   - ``m17..m80``: vectorized live-route ``rot_kernel`` -> PDL ->
+     ``fc1_tile_n = 128`` (3-stage, 1024 B rows, adaptive L2 policy) -> PDL ->
+     vectorized ``act_kernel`` -> PDL -> 2-stage ``fc2_tile_n = 128``.
+3. Exact K-reduction and hoisted 64-bit addressing:
    - Every GEMM preserves the exact 2-chain K-reduction order
      (``K16 % 4 in {0, 1}`` and ``{2, 3}``) of the production K64 kernel, uses
      hoisted 64-bit B and A pointers outside the K-loop, 1-cycle ``prmt.b32``
-     K4 ring extraction, a zero-barrier warp-register prologue, a 2-barrier
-     disjoint-SMEM epilogue, and adaptive per-block L2 cache policy.
+     K4 ring extraction, and adaptive per-block L2 evict-first policy.
 """
 
 from __future__ import annotations
@@ -93,11 +95,33 @@ from .kernel import W4A16FusedMoeKernel
 from .mixed_trellis import W4A16MixedTrellisKernel
 
 
-_K4_NARROW_MAX_ROWS = 3
 _K4_SMALLM_MAX_ROWS = 16
 _FC1_SLAB_STAGES = 3
 _FC2_SLAB_STAGES = 2
-_A_SLAB_BYTES = 2048  # 8 rows x 128 FP16 = 2048 B
+_PERSISTENT_M1_STAGES = 4
+_PERSISTENT_SMALLM_STAGES = 3
+_PERSISTENT_CTAS_PER_SM = 3
+_A_SLAB_BYTES_FULL = 2048  # 8 rows x 128 FP16 = 2048 B
+_A_SLAB_BYTES_M1 = 256  # 1 row x 128 FP16 = 256 B
+
+_ROT_SPLITS = 4
+_ROT_DONE_STEP = 0x10000000
+_ROT_READY_VAL = 0x40000000
+_ROT_MASK = 0x70000000
+_FC1_CNT_MASK = 0x0FFFFFFF
+
+_WS_ROT_CURSOR = 0
+_WS_FC1_CURSOR = 1
+_WS_FC2_CURSOR = 2
+_WS_READY_COUNT = 3
+_WS_EXIT_COUNT = 4
+_WS_HEADER = 5
+
+_ACT_EXIT = 0
+_ACT_ROT = 1
+_ACT_FC1 = 2
+_ACT_ACT_ONLY = 3
+_ACT_FC2 = 4
 
 
 @dsl_user_op
@@ -264,6 +288,54 @@ def _atomic_add_acq_rel_gpu_i32(
 
 
 @dsl_user_op
+def _ld_global_acquire_gpu_i32(
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """GPU-scoped acquire global int32 load."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(addr).ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.b32 $0, [$1];",
+            "=r,l",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _st_global_release_gpu_i32(
+    addr: Int64,
+    val: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """GPU-scoped release global int32 store."""
+    llvm.inline_asm(
+        None,
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "st.release.gpu.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _st_global_relaxed_gpu_i32(
     addr: Int64,
     val: Int32,
@@ -271,7 +343,7 @@ def _st_global_relaxed_gpu_i32(
     loc=None,
     ip=None,
 ):
-    """GPU-scoped relaxed int32 global store (resets block completion counter)."""
+    """GPU-scoped relaxed int32 global store (resets workspace slots)."""
     llvm.inline_asm(
         None,
         [
@@ -288,21 +360,45 @@ def _st_global_relaxed_gpu_i32(
     )
 
 
+@dsl_user_op
+def _nanosleep(
+    nanoseconds: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Yield SM issue slots while polling a per-block completion flag."""
+    llvm.inline_asm(
+        None,
+        [Int32(nanoseconds).ir_value(loc=loc, ip=ip)],
+        "nanosleep.u32 $0;",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def _k4_smem_layout(
     tile_n: int,
     max_bits: int,
     stages: int,
 ) -> tuple[int, int, int, int]:
-    """Return ``(b_stage_bytes, a_off, fold_off, total_words)`` for one GEMM kernel.
+    """Return ``(b_stage_bytes, a_off, fold_off, total_words)`` for non-persistent GEMM.
 
     Output transpose aliases offset 0 after epilogue barrier 1 (the K-loop has
     completely finished), while ``fold_off`` sits strictly disjoint past the A
     ring so warp_row 1 never races with warp_row 0's final K-loop SMEM reads.
+    The 16-byte zero line aliases ``fold_off`` (read only during the K-loop,
+    overwritten only in the epilogue) so ``fc2_kernel`` stays at <= 32 KB even
+    at ``max_bits = 6``.
     """
     cta_n_blocks = tile_n // 16
     b_stage_bytes = 8 * cta_n_blocks * 32 * max_bits
     a_off = stages * b_stage_bytes
-    fold_off = a_off + stages * _A_SLAB_BYTES
+    fold_off = a_off + stages * _A_SLAB_BYTES_FULL
     tb_n_warps = 2 if tile_n == 128 else 1
     n_frags = 2 if tile_n == 32 else 4
     fold_bytes = tb_n_warps * 32 * n_frags * 16
@@ -312,10 +408,36 @@ def _k4_smem_layout(
     return b_stage_bytes, a_off, fold_off, total_bytes // 4
 
 
+def _k4_persistent_smem_layout(
+    max_bits: int,
+    stages: int,
+    a_slab_bytes: int,
+) -> tuple[int, int, int, int, int, int]:
+    """Return ``(b_stage_bytes, a_off, fold_off, zero16_off, ctrl_off, total_words)``
+    for the unified ``tile_n = 64, cta_threads = 128`` persistent kernel.
+
+    ``zero16_off`` (16 B) and ``ctrl_off`` (20 B: 4 dispatch words + 1
+    ``is_last`` word) are strictly disjoint from B, A, fold, and output
+    transpose so persistent tasks never race on control or zero-row reads.
+    """
+    cta_n_blocks = 4  # tile_n = 64
+    b_stage_bytes = 8 * cta_n_blocks * 32 * max_bits
+    a_off = stages * b_stage_bytes
+    fold_off = a_off + stages * a_slab_bytes
+    # tb_n_warps = 2, n_frags = 2 -> 2 * 32 * 2 * 16 = 2048 B
+    fold_bytes = 2 * 32 * 2 * 16
+    out_bytes = 8 * (64 + 8) * 2
+    zero16_off = max(fold_off + fold_bytes, out_bytes)
+    zero16_off = ((zero16_off + 15) // 16) * 16
+    ctrl_off = zero16_off + 16
+    total_bytes = ((ctrl_off + 20 + 15) // 16) * 16
+    return b_stage_bytes, a_off, fold_off, zero16_off, ctrl_off, total_bytes // 4
+
+
 class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     """SM121 (GB10) non-cooperative K4 mixed-Trellis decode/verify kernel."""
 
-    K4_DECODE_VERSION = 2
+    K4_DECODE_VERSION = 3
 
     def __init__(
         self,
@@ -355,23 +477,28 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 "W4A16MixedTrellisK4Decode requires SM121 MCG K4 cooperative m8 geometry"
             )
         self.max_bits = max(int(self.tier0.trellis_bits), int(self.tier1.trellis_bits))
-        self.narrow_fc1_tile_n = 32 if self.intermediate_size <= 384 else 64
+        self.is_m1_bucket = int(self.size_m) == 1
+        self.persistent_stages = (
+            _PERSISTENT_M1_STAGES if self.is_m1_bucket else _PERSISTENT_SMALLM_STAGES
+        )
+        self.persistent_a_slab_bytes = (
+            _A_SLAB_BYTES_M1 if self.is_m1_bucket else _A_SLAB_BYTES_FULL
+        )
         self.smallm_fc1_tile_n = 64
         self.medm_fc1_tile_n = 128
         self.fc2_tile_n = 128
-        self.has_smallm_n64 = (
-            int(self.size_m) > _K4_NARROW_MAX_ROWS
-            and self.narrow_fc1_tile_n != self.smallm_fc1_tile_n
-        )
         self.has_medm_arm = int(self.size_m) > _K4_SMALLM_MAX_ROWS
 
-        max_words = 0
+        _, _, _, _, _, persistent_words = _k4_persistent_smem_layout(
+            self.max_bits,
+            self.persistent_stages,
+            self.persistent_a_slab_bytes,
+        )
+        max_words = persistent_words
         specs = [
-            (self.narrow_fc1_tile_n, _FC1_SLAB_STAGES),
+            (self.smallm_fc1_tile_n, _FC1_SLAB_STAGES),
             (self.fc2_tile_n, _FC2_SLAB_STAGES),
         ]
-        if self.has_smallm_n64:
-            specs.append((self.smallm_fc1_tile_n, _FC1_SLAB_STAGES))
         if self.has_medm_arm:
             specs.append((self.medm_fc1_tile_n, _FC1_SLAB_STAGES))
         for tile_n, stages in specs:
@@ -384,13 +511,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     def __cache_key__(self) -> tuple[object, ...]:
         return super().__cache_key__ + (
             (
-                "sm121_k4_decode_noncoop_pdl",
+                "sm121_k4_decode_persistent_smallm",
                 self.K4_DECODE_VERSION,
-                self.narrow_fc1_tile_n,
+                self.is_m1_bucket,
+                self.persistent_stages,
+                self.persistent_a_slab_bytes,
                 self.smallm_fc1_tile_n,
                 self.medm_fc1_tile_n,
                 self.fc2_tile_n,
-                self.has_smallm_n64,
                 self.has_medm_arm,
             ),
         )
@@ -514,32 +642,36 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         # ``max(4 * sms, blocks_per_sm * sms) + 2`` zero-initialized int32s,
         # and callers pass ``grid_x = sms * blocks_per_sm``.
         runtime_sms = grid_x // Int32(self.blocks_per_sm)
+        if runtime_sms < Int32(1):
+            runtime_sms = Int32(1)
         ws_cap = runtime_sms * Int32(4)
-        do_fused_act = Int32(0)
-        if max_live_blocks <= ws_cap:
-            do_fused_act = Int32(1)
 
-        act_units = live_routes * Int32(self.intermediate_size // 128)
-        act_ctas = (act_units + Int32(3)) // Int32(4)
-        if act_ctas < Int32(1):
-            act_ctas = Int32(1)
+        can_persistent = Int32(0)
+        if (
+            active_m <= Int32(_K4_SMALLM_MAX_ROWS)
+            and Int32(_WS_HEADER) + Int32(2) * max_live_blocks <= ws_cap
+        ):
+            can_persistent = Int32(1)
 
-        narrow_fc1_n_tiles = (2 * self.intermediate_size) // self.narrow_fc1_tile_n
-        narrow_fc1_threads = 128 if self.narrow_fc1_tile_n == 128 else 64
-        fc2_n_tiles = self.hidden_size // self.fc2_tile_n
-        fc2_threads = 128 if self.fc2_tile_n == 128 else 64
-
-        if cutlass.const_expr(not self.has_smallm_n64 and not self.has_medm_arm):
-            self.fc1_fused_narrow_kernel(
+        if can_persistent != Int32(0):
+            persistent_ctas = runtime_sms * Int32(_PERSISTENT_CTAS_PER_SM)
+            self.persistent_smallm_kernel(
                 rotation_input,
+                rotation_gate,
+                rotation_up,
                 gate_suh,
                 up_suh,
                 t0_w13,
+                t0_w2,
                 t0_w13_global,
+                t0_w2_global,
                 t1_w13,
+                t1_w2,
                 t1_w13_global,
+                t1_w2_global,
                 fc1,
                 activated,
+                fc2,
                 intermediate_rotations,
                 workspace,
                 packed_route_indices,
@@ -552,101 +684,64 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 tier1_gate_experts,
                 tier0_up_experts,
                 tier1_up_experts,
+                tier0_fc2_experts,
+                tier1_fc2_experts,
                 active_m,
-                do_fused_act,
+                max_live_blocks,
+                persistent_ctas,
             ).launch(
-                grid=(narrow_fc1_n_tiles, max_live_blocks, 1),
-                block=[narrow_fc1_threads, 1, 1],
+                grid=(persistent_ctas, 1, 1),
+                block=[128, 1, 1],
                 stream=stream,
             )
-            if do_fused_act == Int32(0):
-                self.act_kernel(
+        else:
+            do_fused_act = Int32(0)
+            if max_live_blocks <= ws_cap:
+                do_fused_act = Int32(1)
+
+            act_units = live_routes * Int32(self.intermediate_size // 128)
+            act_ctas = (act_units + Int32(3)) // Int32(4)
+            if act_ctas < Int32(1):
+                act_ctas = Int32(1)
+
+            smallm_fc1_n_tiles = (2 * self.intermediate_size) // self.smallm_fc1_tile_n
+            smallm_fc1_threads = 128 if self.smallm_fc1_tile_n == 128 else 64
+            fc2_n_tiles = self.hidden_size // self.fc2_tile_n
+            fc2_threads = 128 if self.fc2_tile_n == 128 else 64
+
+            if cutlass.const_expr(not self.has_medm_arm):
+                self.fc1_fused_smallm_kernel(
+                    rotation_input,
+                    gate_suh,
+                    up_suh,
+                    t0_w13,
+                    t0_w13_global,
+                    t1_w13,
+                    t1_w13_global,
                     fc1,
                     activated,
                     intermediate_rotations,
-                    raw_topk_ids,
-                    global_to_combined,
+                    workspace,
+                    packed_route_indices,
+                    block_expert_ids,
+                    packed_route_count,
                     descriptor_map,
-                    route_num_experts,
-                    tier0_num_experts + tier1_num_experts,
+                    tier0_num_experts,
+                    tier1_num_experts,
+                    tier0_gate_experts,
+                    tier1_gate_experts,
+                    tier0_up_experts,
+                    tier1_up_experts,
                     active_m,
+                    do_fused_act,
                 ).launch(
-                    grid=(act_ctas, 1, 1),
-                    block=[128, 1, 1],
-                    use_pdl=True,
+                    grid=(smallm_fc1_n_tiles, max_live_blocks, 1),
+                    block=[smallm_fc1_threads, 1, 1],
                     stream=stream,
                 )
-        else:
-            if active_m <= Int32(_K4_SMALLM_MAX_ROWS):
-                if cutlass.const_expr(self.has_smallm_n64):
-                    if active_m <= Int32(_K4_NARROW_MAX_ROWS):
-                        self.fc1_fused_narrow_kernel(
-                            rotation_input,
-                            gate_suh,
-                            up_suh,
-                            t0_w13,
-                            t0_w13_global,
-                            t1_w13,
-                            t1_w13_global,
-                            fc1,
-                            activated,
-                            intermediate_rotations,
-                            workspace,
-                            packed_route_indices,
-                            block_expert_ids,
-                            packed_route_count,
-                            descriptor_map,
-                            tier0_num_experts,
-                            tier1_num_experts,
-                            tier0_gate_experts,
-                            tier1_gate_experts,
-                            tier0_up_experts,
-                            tier1_up_experts,
-                            active_m,
-                            do_fused_act,
-                        ).launch(
-                            grid=(narrow_fc1_n_tiles, max_live_blocks, 1),
-                            block=[narrow_fc1_threads, 1, 1],
-                            stream=stream,
-                        )
-                    else:
-                        smallm_fc1_n_tiles = (
-                            2 * self.intermediate_size
-                        ) // self.smallm_fc1_tile_n
-                        smallm_fc1_threads = (
-                            128 if self.smallm_fc1_tile_n == 128 else 64
-                        )
-                        self.fc1_fused_smallm_kernel(
-                            rotation_input,
-                            gate_suh,
-                            up_suh,
-                            t0_w13,
-                            t0_w13_global,
-                            t1_w13,
-                            t1_w13_global,
-                            fc1,
-                            activated,
-                            intermediate_rotations,
-                            workspace,
-                            packed_route_indices,
-                            block_expert_ids,
-                            packed_route_count,
-                            descriptor_map,
-                            tier0_num_experts,
-                            tier1_num_experts,
-                            tier0_gate_experts,
-                            tier1_gate_experts,
-                            tier0_up_experts,
-                            tier1_up_experts,
-                            active_m,
-                            do_fused_act,
-                        ).launch(
-                            grid=(smallm_fc1_n_tiles, max_live_blocks, 1),
-                            block=[smallm_fc1_threads, 1, 1],
-                            stream=stream,
-                        )
-                else:
-                    self.fc1_fused_narrow_kernel(
+            else:
+                if active_m <= Int32(_K4_SMALLM_MAX_ROWS):
+                    self.fc1_fused_smallm_kernel(
                         rotation_input,
                         gate_suh,
                         up_suh,
@@ -671,12 +766,11 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         active_m,
                         do_fused_act,
                     ).launch(
-                        grid=(narrow_fc1_n_tiles, max_live_blocks, 1),
-                        block=[narrow_fc1_threads, 1, 1],
+                        grid=(smallm_fc1_n_tiles, max_live_blocks, 1),
+                        block=[smallm_fc1_threads, 1, 1],
                         stream=stream,
                     )
-            else:
-                if cutlass.const_expr(self.has_medm_arm):
+                else:
                     rot_units = live_routes * Int32(self.hidden_size // 128)
                     rot_ctas = (rot_units + Int32(7)) // Int32(8)
                     if rot_ctas < Int32(1):
@@ -750,31 +844,31 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     stream=stream,
                 )
 
-        self.fc2_kernel(
-            activated,
-            t0_w2,
-            t0_w2_global,
-            t1_w2,
-            t1_w2_global,
-            fc2,
-            packed_route_indices,
-            block_expert_ids,
-            packed_route_count,
-            descriptor_map,
-            tier0_num_experts,
-            tier1_num_experts,
-            tier0_fc2_experts,
-            tier1_fc2_experts,
-            active_m,
-        ).launch(
-            grid=(fc2_n_tiles, max_live_blocks, 1),
-            block=[fc2_threads, 1, 1],
-            use_pdl=True,
-            stream=stream,
-        )
+            self.fc2_kernel(
+                activated,
+                t0_w2,
+                t0_w2_global,
+                t1_w2,
+                t1_w2_global,
+                fc2,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                descriptor_map,
+                tier0_num_experts,
+                tier1_num_experts,
+                tier0_fc2_experts,
+                tier1_fc2_experts,
+                active_m,
+            ).launch(
+                grid=(fc2_n_tiles, max_live_blocks, 1),
+                block=[fc2_threads, 1, 1],
+                use_pdl=True,
+                stream=stream,
+            )
 
     # ------------------------------------------------------------------
-    # Helper methods shared by FC1/FC2 kernels
+    # Helper methods shared by persistent and non-persistent GEMM kernels
     # ------------------------------------------------------------------
 
     @cute.jit
@@ -795,6 +889,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         tid: Int32,
         lane: Int32,
         use_evict_first: Int32,
+        b_l2_policy: Uint64,
     ):
         cta_n_blocks = tile_n // 16
         chunks_per_k16 = cta_n_blocks * 8
@@ -805,7 +900,6 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         b_dst_tid = cute.arch.shuffle_sync(b_stage_base + tid * Int32(16), lane)
 
         if use_evict_first != Int32(0):
-            b_l2_policy = create_l2_evict_first_policy()
             for i in cutlass.range_constexpr(iters):
                 _cp_async4_l2hint(
                     b_dst_tid + Int32(i * cta_threads * 16),
@@ -825,7 +919,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         bits: cutlass.Constexpr[int],
         tile_n: cutlass.Constexpr[int],
         cta_threads: cutlass.Constexpr[int],
-        b_flat: cute.Tensor,
+        b_tensor_base: Int64,
         b_stage_base: Int32,
         b_tile_base_u32: Int64,
         b_k16_stride_u32: Int64,
@@ -833,6 +927,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         tid: Int32,
         lane: Int32,
         use_evict_first: Int32,
+        b_l2_policy: Uint64,
     ):
         cta_n_blocks = tile_n // 16
         chunks_per_k16 = cta_n_blocks * 2 * bits
@@ -843,16 +938,16 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         b_dst_tid = cute.arch.shuffle_sync(b_stage_base + tid * Int32(16), lane)
 
         if use_evict_first != Int32(0):
-            b_l2_policy = create_l2_evict_first_policy()
             for i in cutlass.range_constexpr(iters):
                 chunk = Int32(i * cta_threads) + tid
                 k16 = chunk // Int32(chunks_per_k16)
                 in_k16 = chunk - k16 * Int32(chunks_per_k16)
                 dst = b_dst_tid + Int32(i * cta_threads * 16)
-                src_addr = get_ptr_as_int64(
-                    b_flat,
-                    slab_base_u32 + Int64(k16) * b_k16_stride_u32 + Int64(in_k16 * 4),
-                )
+                src_addr = b_tensor_base + (
+                    slab_base_u32
+                    + Int64(k16) * b_k16_stride_u32
+                    + Int64(in_k16 * 4)
+                ) * Int64(4)
                 if cutlass.const_expr(exact):
                     _cp_async4_l2hint(dst, src_addr, b_l2_policy)
                 else:
@@ -868,10 +963,11 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 k16 = chunk // Int32(chunks_per_k16)
                 in_k16 = chunk - k16 * Int32(chunks_per_k16)
                 dst = b_dst_tid + Int32(i * cta_threads * 16)
-                src_addr = get_ptr_as_int64(
-                    b_flat,
-                    slab_base_u32 + Int64(k16) * b_k16_stride_u32 + Int64(in_k16 * 4),
-                )
+                src_addr = b_tensor_base + (
+                    slab_base_u32
+                    + Int64(k16) * b_k16_stride_u32
+                    + Int64(in_k16 * 4)
+                ) * Int64(4)
                 if cutlass.const_expr(exact):
                     cp_async4_shared_global(dst, src_addr)
                 else:
@@ -887,7 +983,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         bits: cutlass.Constexpr[int],
         tile_n: cutlass.Constexpr[int],
         cta_threads: cutlass.Constexpr[int],
-        b_flat: cute.Tensor,
+        b_tensor_base: Int64,
         b_stage_base: Int32,
         b_tile_base_u32: Int64,
         b_k16_stride_u32: Int64,
@@ -898,6 +994,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         tid: Int32,
         lane: Int32,
         use_evict_first: Int32,
+        b_l2_policy: Uint64,
     ):
         if cutlass.const_expr(bits == 4):
             self._fetch_b_slab_k4(
@@ -911,13 +1008,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 tid,
                 lane,
                 use_evict_first,
+                b_l2_policy,
             )
         else:
             self._fetch_b_slab_generic(
                 bits,
                 tile_n,
                 cta_threads,
-                b_flat,
+                b_tensor_base,
                 b_stage_base,
                 b_tile_base_u32,
                 b_k16_stride_u32,
@@ -925,6 +1023,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 tid,
                 lane,
                 use_evict_first,
+                b_l2_policy,
             )
 
     @cute.jit
@@ -993,45 +1092,21 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 r += Int32(n_warps)
 
     @cute.jit
-    def _zero_invalid_a_stages(
-        self,
-        cta_threads: cutlass.Constexpr[int],
-        stages: cutlass.Constexpr[int],
-        a_base: Int32,
-        valid_rows: Int32,
-        tid: Int32,
-    ):
-        iters = (128 * stages) // cta_threads
-        for i in cutlass.range_constexpr(iters):
-            idx = Int32(i * cta_threads) + tid
-            stage_idx = idx >> Int32(7)
-            in_stage = idx & Int32(127)
-            row = in_stage >> Int32(4)
-            if row >= valid_rows:
-                c = in_stage & Int32(15)
-                dst = (
-                    a_base
-                    + stage_idx * Int32(_A_SLAB_BYTES)
-                    + (((row << Int32(4)) + (c ^ row)) << Int32(4))
-                )
-                st_shared_v4_u32(dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
-
-    @cute.jit
     def _consume_slab(
         self,
         bits: cutlass.Constexpr[int],
         tile_n: cutlass.Constexpr[int],
+        n_frags: cutlass.Constexpr[int],
         b_stage_base: Int32,
-        a_stage_base: Int32,
-        a_rd_off0: Int32,
-        a_rd_off1: Int32,
+        a_rd_stage0: Int32,
+        a_rd_stage1: Int32,
+        a_sub_stride: Int32,
         warp_row: Int32,
         w_n: Int32,
         lane: Int32,
         acc,
     ):
         cta_n_blocks = tile_n // 16
-        n_frags = 2 if tile_n == 32 else 4
         tile_u32 = 8 * bits
         tile_bytes = 32 * bits
         k16_bytes = cta_n_blocks * tile_bytes
@@ -1053,9 +1128,12 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             + w_n * Int32(n_frags * tile_bytes)
         )
         for sub in cutlass.range_constexpr(2):
+            sub_off = Int32(0) if cutlass.const_expr(sub == 0) else a_sub_stride
             for kk in cutlass.range_constexpr(2):
-                a_off = a_rd_off0 if cutlass.const_expr(kk == 0) else a_rd_off1
-                a0, a1 = ldmatrix_m8n8x2_b16(a_stage_base + a_off + Int32(sub * 128))
+                a_addr = (
+                    a_rd_stage0 if cutlass.const_expr(kk == 0) else a_rd_stage1
+                ) + sub_off
+                a0, a1 = ldmatrix_m8n8x2_b16(a_addr)
                 b_sub_base = b_warp_base + Int32((sub * 4 + kk) * k16_bytes)
 
                 if cutlass.const_expr(bits == 4):
@@ -1151,17 +1229,21 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         bits: cutlass.Constexpr[int],
         tile_n: cutlass.Constexpr[int],
         cta_threads: cutlass.Constexpr[int],
+        n_frags: cutlass.Constexpr[int],
         stages: cutlass.Constexpr[int],
+        a_slab_bytes: cutlass.Constexpr[int],
         fused_rot: cutlass.Constexpr[bool],
         pdl_wait: cutlass.Constexpr[bool],
         pdl_signal_after_wait: cutlass.Constexpr[bool],
+        enable_rot_wait: cutlass.Constexpr[bool],
         b_stage_bytes: cutlass.Constexpr[int],
         a_off: cutlass.Constexpr[int],
-        a_stride_bytes: cutlass.Constexpr[int],
+        zero16_off: cutlass.Constexpr[int],
+        a_stride_bytes: Int32,
         x_input: cute.Tensor,
         suh_ptr_base: Int64,
         a_tensor_base: Int64,
-        b_flat: cute.Tensor,
+        b_tensor_base: Int64,
         b_tile_base_u32: Int64,
         b_k16_stride_u32: Int64,
         k_slabs: Int32,
@@ -1175,15 +1257,40 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         w_n: Int32,
         lane: Int32,
         use_evict_first: Int32,
+        b_l2_policy: Uint64,
+        wait_rot: Int32,
+        ws_state_addr: Int64,
         acc,
     ):
         a_base = smem_base + Int32(a_off)
+        zero16_addr = smem_base + Int32(zero16_off)
         l16 = lane & Int32(15)
         r_ldm = l16 & Int32(7)
         c0_ldm = l16 >> Int32(3)
         k_base = (warp_row << Int32(2)) + c0_ldm
-        a_rd_off0 = (((r_ldm << Int32(4)) + (k_base ^ r_ldm)) << Int32(4))
-        a_rd_off1 = (((r_ldm << Int32(4)) + ((k_base + Int32(2)) ^ r_ldm)) << Int32(4))
+
+        # Point invalid A rows (r_ldm >= valid_rows) at the shared 16-byte zero
+        # line with zero stage/sub strides, eliminating per-CTA A-SMEM zeroing.
+        a_rd_base0 = zero16_addr
+        a_rd_base1 = zero16_addr
+        a_stage_stride = Int32(0)
+        a_sub_stride = Int32(0)
+        if cutlass.const_expr(a_slab_bytes == _A_SLAB_BYTES_M1):
+            if r_ldm == Int32(0) and valid_rows > Int32(0):
+                a_rd_base0 = a_base + (k_base << Int32(4))
+                a_rd_base1 = a_base + ((k_base + Int32(2)) << Int32(4))
+                a_stage_stride = Int32(a_slab_bytes)
+                a_sub_stride = Int32(128)
+        else:
+            if r_ldm < valid_rows:
+                a_rd_base0 = a_base + (
+                    ((r_ldm << Int32(4)) + (k_base ^ r_ldm)) << Int32(4)
+                )
+                a_rd_base1 = a_base + (
+                    ((r_ldm << Int32(4)) + ((k_base + Int32(2)) ^ r_ldm)) << Int32(4)
+                )
+                a_stage_stride = Int32(a_slab_bytes)
+                a_sub_stride = Int32(128)
 
         # Hoist K4 B addressing out of the K-loop (64-bit safe).
         b_base_addr = Int64(0)
@@ -1202,12 +1309,11 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             else:
                 k16_0 = tid >> Int32(6)
                 in_k16_0 = tid & Int32(63)
-            b_base_addr = get_ptr_as_int64(
-                b_flat,
+            b_base_addr = b_tensor_base + (
                 b_tile_base_u32
                 + Int64(k16_0) * b_k16_stride_u32
-                + Int64(in_k16_0 * 4),
-            )
+                + Int64(in_k16_0 * 4)
+            ) * Int64(4)
             b_iter_step_bytes = Int64(k16_step) * b_k16_stride_u32 * Int64(4)
             b_slab_step_bytes = Int64(8) * b_k16_stride_u32 * Int64(4)
 
@@ -1222,19 +1328,23 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             row0 = tid >> Int32(4)
             c0 = tid & Int32(15)
             route0 = cute.arch.shuffle_sync(route_lane, row0)
-            a_swz_off0 = (((row0 << Int32(4)) + (c0 ^ row0)) << Int32(4))
+            if cutlass.const_expr(a_slab_bytes == _A_SLAB_BYTES_M1):
+                a_swz_off0 = c0 << Int32(4)
+                a_valid0 = (row0 == Int32(0) and valid_rows > Int32(0)).to(Int32)
+            else:
+                a_swz_off0 = ((row0 << Int32(4)) + (c0 ^ row0)) << Int32(4)
+                a_valid0 = (row0 < valid_rows).to(Int32)
             a_row_base0 = (
                 a_tensor_base
                 + Int64(route0) * Int64(a_stride_bytes)
                 + Int64(c0 << Int32(4))
             )
-            a_valid0 = (row0 < valid_rows).to(Int32)
             if cutlass.const_expr(cta_threads == 64):
                 idx1 = tid + Int32(64)
                 row1 = idx1 >> Int32(4)
                 c1 = idx1 & Int32(15)
                 route1 = cute.arch.shuffle_sync(route_lane, row1)
-                a_swz_off1 = (((row1 << Int32(4)) + (c1 ^ row1)) << Int32(4))
+                a_swz_off1 = ((row1 << Int32(4)) + (c1 ^ row1)) << Int32(4)
                 a_row_base1 = (
                     a_tensor_base
                     + Int64(route1) * Int64(a_stride_bytes)
@@ -1242,16 +1352,13 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 )
                 a_valid1 = (row1 < valid_rows).to(Int32)
 
-        # Prologue: when ``pdl_wait`` is True (dependent GEMM), issue B slabs
-        # 0 and 1 from read-only weights and zero invalid A rows BEFORE
-        # ``griddepcontrol_wait`` so weight DRAM latency overlaps with the
-        # predecessor's tail wave, then fetch L2-hot A slabs after wait.
+        # Prologue
         if cutlass.const_expr(pdl_wait):
             self._fetch_b_slab(
                 bits,
                 tile_n,
                 cta_threads,
-                b_flat,
+                b_tensor_base,
                 smem_base,
                 b_tile_base_u32,
                 b_k16_stride_u32,
@@ -1262,13 +1369,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 tid,
                 lane,
                 use_evict_first,
+                b_l2_policy,
             )
             if k_slabs > Int32(1):
                 self._fetch_b_slab(
                     bits,
                     tile_n,
                     cta_threads,
-                    b_flat,
+                    b_tensor_base,
                     smem_base + Int32(b_stage_bytes),
                     b_tile_base_u32,
                     b_k16_stride_u32,
@@ -1279,9 +1387,9 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     tid,
                     lane,
                     use_evict_first,
+                    b_l2_policy,
                 )
             cute.arch.cp_async_commit_group()
-            self._zero_invalid_a_stages(cta_threads, stages, a_base, valid_rows, tid)
 
             cute.arch.griddepcontrol_wait()
             if cutlass.const_expr(pdl_signal_after_wait):
@@ -1302,7 +1410,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             if k_slabs > Int32(1):
                 self._fetch_a_prerot_slab(
                     cta_threads,
-                    a_base + Int32(_A_SLAB_BYTES),
+                    a_base + Int32(a_slab_bytes),
                     a_row_base0,
                     a_swz_off0,
                     a_valid0,
@@ -1316,12 +1424,225 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             else:
                 cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
+        elif cutlass.const_expr(enable_rot_wait):
+            if wait_rot != Int32(0):
+                # Prefetch initial cold B slabs while Phase 0 rotates this block.
+                self._fetch_b_slab(
+                    bits,
+                    tile_n,
+                    cta_threads,
+                    b_tensor_base,
+                    smem_base,
+                    b_tile_base_u32,
+                    b_k16_stride_u32,
+                    b_base_addr,
+                    b_iter_step_bytes,
+                    b_slab_step_bytes,
+                    Int32(0),
+                    tid,
+                    lane,
+                    use_evict_first,
+                    b_l2_policy,
+                )
+                if k_slabs > Int32(1):
+                    self._fetch_b_slab(
+                        bits,
+                        tile_n,
+                        cta_threads,
+                        b_tensor_base,
+                        smem_base + Int32(b_stage_bytes),
+                        b_tile_base_u32,
+                        b_k16_stride_u32,
+                        b_base_addr,
+                        b_iter_step_bytes,
+                        b_slab_step_bytes,
+                        Int32(1),
+                        tid,
+                        lane,
+                        use_evict_first,
+                        b_l2_policy,
+                    )
+                if cutlass.const_expr(stages == 4):
+                    if k_slabs > Int32(2):
+                        self._fetch_b_slab(
+                            bits,
+                            tile_n,
+                            cta_threads,
+                            b_tensor_base,
+                            smem_base + Int32(2 * b_stage_bytes),
+                            b_tile_base_u32,
+                            b_k16_stride_u32,
+                            b_base_addr,
+                            b_iter_step_bytes,
+                            b_slab_step_bytes,
+                            Int32(2),
+                            tid,
+                            lane,
+                            use_evict_first,
+                            b_l2_policy,
+                        )
+                cute.arch.cp_async_commit_group()
+
+                if tid == Int32(0):
+                    st_v = _ld_global_acquire_gpu_i32(ws_state_addr)
+                    while (st_v & Int32(_ROT_MASK)) != Int32(_ROT_READY_VAL):
+                        _nanosleep(Int32(64))
+                        st_v = _ld_global_acquire_gpu_i32(ws_state_addr)
+                cute.arch.sync_threads()
+
+                self._fetch_a_prerot_slab(
+                    cta_threads,
+                    a_base,
+                    a_row_base0,
+                    a_swz_off0,
+                    a_valid0,
+                    a_row_base1,
+                    a_swz_off1,
+                    a_valid1,
+                    Int32(0),
+                )
+                cute.arch.cp_async_commit_group()
+                if k_slabs > Int32(1):
+                    self._fetch_a_prerot_slab(
+                        cta_threads,
+                        a_base + Int32(a_slab_bytes),
+                        a_row_base0,
+                        a_swz_off0,
+                        a_valid0,
+                        a_row_base1,
+                        a_swz_off1,
+                        a_valid1,
+                        Int32(1),
+                    )
+                    cute.arch.cp_async_commit_group()
+                    if cutlass.const_expr(stages == 4):
+                        if k_slabs > Int32(2):
+                            self._fetch_a_prerot_slab(
+                                cta_threads,
+                                a_base + Int32(2 * a_slab_bytes),
+                                a_row_base0,
+                                a_swz_off0,
+                                a_valid0,
+                                a_row_base1,
+                                a_swz_off1,
+                                a_valid1,
+                                Int32(2),
+                            )
+                            cute.arch.cp_async_commit_group()
+                            cute.arch.cp_async_wait_group(2)
+                        else:
+                            cute.arch.cp_async_wait_group(1)
+                    else:
+                        cute.arch.cp_async_wait_group(1)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+            else:
+                self._fetch_b_slab(
+                    bits,
+                    tile_n,
+                    cta_threads,
+                    b_tensor_base,
+                    smem_base,
+                    b_tile_base_u32,
+                    b_k16_stride_u32,
+                    b_base_addr,
+                    b_iter_step_bytes,
+                    b_slab_step_bytes,
+                    Int32(0),
+                    tid,
+                    lane,
+                    use_evict_first,
+                    b_l2_policy,
+                )
+                self._fetch_a_prerot_slab(
+                    cta_threads,
+                    a_base,
+                    a_row_base0,
+                    a_swz_off0,
+                    a_valid0,
+                    a_row_base1,
+                    a_swz_off1,
+                    a_valid1,
+                    Int32(0),
+                )
+                cute.arch.cp_async_commit_group()
+
+                if k_slabs > Int32(1):
+                    self._fetch_b_slab(
+                        bits,
+                        tile_n,
+                        cta_threads,
+                        b_tensor_base,
+                        smem_base + Int32(b_stage_bytes),
+                        b_tile_base_u32,
+                        b_k16_stride_u32,
+                        b_base_addr,
+                        b_iter_step_bytes,
+                        b_slab_step_bytes,
+                        Int32(1),
+                        tid,
+                        lane,
+                        use_evict_first,
+                        b_l2_policy,
+                    )
+                    self._fetch_a_prerot_slab(
+                        cta_threads,
+                        a_base + Int32(a_slab_bytes),
+                        a_row_base0,
+                        a_swz_off0,
+                        a_valid0,
+                        a_row_base1,
+                        a_swz_off1,
+                        a_valid1,
+                        Int32(1),
+                    )
+                    cute.arch.cp_async_commit_group()
+                    if cutlass.const_expr(stages == 4):
+                        if k_slabs > Int32(2):
+                            self._fetch_b_slab(
+                                bits,
+                                tile_n,
+                                cta_threads,
+                                b_tensor_base,
+                                smem_base + Int32(2 * b_stage_bytes),
+                                b_tile_base_u32,
+                                b_k16_stride_u32,
+                                b_base_addr,
+                                b_iter_step_bytes,
+                                b_slab_step_bytes,
+                                Int32(2),
+                                tid,
+                                lane,
+                                use_evict_first,
+                                b_l2_policy,
+                            )
+                            self._fetch_a_prerot_slab(
+                                cta_threads,
+                                a_base + Int32(2 * a_slab_bytes),
+                                a_row_base0,
+                                a_swz_off0,
+                                a_valid0,
+                                a_row_base1,
+                                a_swz_off1,
+                                a_valid1,
+                                Int32(2),
+                            )
+                            cute.arch.cp_async_commit_group()
+                            cute.arch.cp_async_wait_group(2)
+                        else:
+                            cute.arch.cp_async_wait_group(1)
+                    else:
+                        cute.arch.cp_async_wait_group(1)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
         else:
             self._fetch_b_slab(
                 bits,
                 tile_n,
                 cta_threads,
-                b_flat,
+                b_tensor_base,
                 smem_base,
                 b_tile_base_u32,
                 b_k16_stride_u32,
@@ -1332,6 +1653,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 tid,
                 lane,
                 use_evict_first,
+                b_l2_policy,
             )
             if cutlass.const_expr(not fused_rot):
                 self._fetch_a_prerot_slab(
@@ -1352,7 +1674,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     bits,
                     tile_n,
                     cta_threads,
-                    b_flat,
+                    b_tensor_base,
                     smem_base + Int32(b_stage_bytes),
                     b_tile_base_u32,
                     b_k16_stride_u32,
@@ -1363,11 +1685,12 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     tid,
                     lane,
                     use_evict_first,
+                    b_l2_policy,
                 )
                 if cutlass.const_expr(not fused_rot):
                     self._fetch_a_prerot_slab(
                         cta_threads,
-                        a_base + Int32(_A_SLAB_BYTES),
+                        a_base + Int32(a_slab_bytes),
                         a_row_base0,
                         a_swz_off0,
                         a_valid0,
@@ -1377,8 +1700,6 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         Int32(1),
                     )
                 cute.arch.cp_async_commit_group()
-
-            self._zero_invalid_a_stages(cta_threads, stages, a_base, valid_rows, tid)
 
             if cutlass.const_expr(fused_rot):
                 self._rotate_a_fused_slab(
@@ -1397,7 +1718,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         cta_threads,
                         x_input,
                         suh_ptr_base,
-                        a_base + Int32(_A_SLAB_BYTES),
+                        a_base + Int32(a_slab_bytes),
                         tok_lane,
                         valid_rows,
                         Int32(1),
@@ -1411,17 +1732,20 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 cute.arch.cp_async_wait_group(0)
             cute.arch.sync_threads()
 
+        # Main K-loop
         if cutlass.const_expr(stages == 2):
             stage = Int32(0)
             s = Int32(0)
             while s < k_slabs:
+                a_stage_off = stage * a_stage_stride
                 self._consume_slab(
                     bits,
                     tile_n,
+                    n_frags,
                     smem_base + stage * Int32(b_stage_bytes),
-                    a_base + stage * Int32(_A_SLAB_BYTES),
-                    a_rd_off0,
-                    a_rd_off1,
+                    a_rd_base0 + a_stage_off,
+                    a_rd_base1 + a_stage_off,
+                    a_sub_stride,
                     warp_row,
                     w_n,
                     lane,
@@ -1434,7 +1758,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         bits,
                         tile_n,
                         cta_threads,
-                        b_flat,
+                        b_tensor_base,
                         smem_base + stage * Int32(b_stage_bytes),
                         b_tile_base_u32,
                         b_k16_stride_u32,
@@ -1445,11 +1769,12 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         tid,
                         lane,
                         use_evict_first,
+                        b_l2_policy,
                     )
                     if cutlass.const_expr(not fused_rot):
                         self._fetch_a_prerot_slab(
                             cta_threads,
-                            a_base + stage * Int32(_A_SLAB_BYTES),
+                            a_base + stage * Int32(a_slab_bytes),
                             a_row_base0,
                             a_swz_off0,
                             a_valid0,
@@ -1464,7 +1789,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             cta_threads,
                             x_input,
                             suh_ptr_base,
-                            a_base + stage * Int32(_A_SLAB_BYTES),
+                            a_base + stage * Int32(a_slab_bytes),
                             tok_lane,
                             valid_rows,
                             next2,
@@ -1479,6 +1804,70 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
 
                 stage = stage ^ Int32(1)
                 s += Int32(1)
+        elif cutlass.const_expr(stages == 4):
+            stage = Int32(0)
+            s = Int32(0)
+            while s < k_slabs:
+                wr_stage = (stage + Int32(3)) & Int32(3)
+                next3 = s + Int32(3)
+                if next3 < k_slabs:
+                    self._fetch_b_slab(
+                        bits,
+                        tile_n,
+                        cta_threads,
+                        b_tensor_base,
+                        smem_base + wr_stage * Int32(b_stage_bytes),
+                        b_tile_base_u32,
+                        b_k16_stride_u32,
+                        b_base_addr,
+                        b_iter_step_bytes,
+                        b_slab_step_bytes,
+                        next3,
+                        tid,
+                        lane,
+                        use_evict_first,
+                        b_l2_policy,
+                    )
+                    self._fetch_a_prerot_slab(
+                        cta_threads,
+                        a_base + wr_stage * Int32(a_slab_bytes),
+                        a_row_base0,
+                        a_swz_off0,
+                        a_valid0,
+                        a_row_base1,
+                        a_swz_off1,
+                        a_valid1,
+                        next3,
+                    )
+                    cute.arch.cp_async_commit_group()
+
+                a_stage_off = stage * a_stage_stride
+                self._consume_slab(
+                    bits,
+                    tile_n,
+                    n_frags,
+                    smem_base + stage * Int32(b_stage_bytes),
+                    a_rd_base0 + a_stage_off,
+                    a_rd_base1 + a_stage_off,
+                    a_sub_stride,
+                    warp_row,
+                    w_n,
+                    lane,
+                    acc,
+                )
+
+                if next3 < k_slabs:
+                    cute.arch.cp_async_wait_group(2)
+                    cute.arch.sync_threads()
+                elif s + Int32(2) < k_slabs:
+                    cute.arch.cp_async_wait_group(1)
+                    cute.arch.sync_threads()
+                elif s + Int32(1) < k_slabs:
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.sync_threads()
+
+                stage = (stage + Int32(1)) & Int32(3)
+                s += Int32(1)
         else:
             stage = Int32(0)
             s = Int32(0)
@@ -1492,7 +1881,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         bits,
                         tile_n,
                         cta_threads,
-                        b_flat,
+                        b_tensor_base,
                         smem_base + wr_stage * Int32(b_stage_bytes),
                         b_tile_base_u32,
                         b_k16_stride_u32,
@@ -1503,11 +1892,12 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                         tid,
                         lane,
                         use_evict_first,
+                        b_l2_policy,
                     )
                     if cutlass.const_expr(not fused_rot):
                         self._fetch_a_prerot_slab(
                             cta_threads,
-                            a_base + wr_stage * Int32(_A_SLAB_BYTES),
+                            a_base + wr_stage * Int32(a_slab_bytes),
                             a_row_base0,
                             a_swz_off0,
                             a_valid0,
@@ -1522,7 +1912,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             cta_threads,
                             x_input,
                             suh_ptr_base,
-                            a_base + wr_stage * Int32(_A_SLAB_BYTES),
+                            a_base + wr_stage * Int32(a_slab_bytes),
                             tok_lane,
                             valid_rows,
                             next2,
@@ -1530,13 +1920,15 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             lane,
                         )
 
+                a_stage_off = stage * a_stage_stride
                 self._consume_slab(
                     bits,
                     tile_n,
+                    n_frags,
                     smem_base + stage * Int32(b_stage_bytes),
-                    a_base + stage * Int32(_A_SLAB_BYTES),
-                    a_rd_off0,
-                    a_rd_off1,
+                    a_rd_base0 + a_stage_off,
+                    a_rd_base1 + a_stage_off,
+                    a_sub_stride,
                     warp_row,
                     w_n,
                     lane,
@@ -1559,9 +1951,10 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     def _epilogue_store(
         self,
         tile_n: cutlass.Constexpr[int],
-        c_stride_elem: cutlass.Constexpr[int],
+        n_frags: cutlass.Constexpr[int],
         fold_off: cutlass.Constexpr[int],
-        c_flat: cute.Tensor,
+        c_tensor_base: Int64,
+        c_stride_elem: Int32,
         acc,
         global_scale_f32: cutlass.Float32,
         output_n_tile: Int32,
@@ -1573,7 +1966,6 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         w_n: Int32,
         lane: Int32,
     ):
-        n_frags = 2 if tile_n == 32 else 4
         fold_base = smem_base + Int32(fold_off)
         out_base = smem_base
         out_stride_elem = tile_n + 8
@@ -1645,7 +2037,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 out_elem = Int64(route_idx) * Int64(c_stride_elem) + Int64(
                     output_n_tile * Int32(tile_n) + c8 * Int32(8)
                 )
-                st_global_v4_u32(get_ptr_as_int64(c_flat, out_elem), q0, q1, q2, q3)
+                st_global_v4_u32(c_tensor_base + out_elem * Int64(2), q0, q1, q2, q3)
 
     @cute.jit
     def _activate_h128_quad(
@@ -1739,8 +2131,8 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     def _run_fused_act_block(
         self,
         cta_threads: cutlass.Constexpr[int],
-        fc1: cute.Tensor,
-        activated: cute.Tensor,
+        fc1_base: Int64,
+        activated_base: Int64,
         intermediate_rotations: cute.Tensor,
         combined_expert: Int32,
         live_width: Int32,
@@ -1766,8 +2158,8 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
 
             # L2-coherent loads on ``fc1`` guarantee visibility of sibling FC1
             # CTA stores synchronized via ``atom.acq_rel.gpu``.
-            gp01, gp23 = _ld_global_cg_v2_u32(get_ptr_as_int64(fc1, g_off))
-            up01, up23 = _ld_global_cg_v2_u32(get_ptr_as_int64(fc1, u_off))
+            gp01, gp23 = _ld_global_cg_v2_u32(fc1_base + g_off * Int64(2))
+            up01, up23 = _ld_global_cg_v2_u32(fc1_base + u_off * Int64(2))
             svg01, svg23 = ld_global_nc_v2_u32(
                 get_ptr_as_int64(intermediate_rotations, s_off)
             )
@@ -1792,8 +2184,781 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 lane,
             )
             out_off = Int64(route) * isz + Int64(col0)
-            st_global_v2_u32(get_ptr_as_int64(activated, out_off), p01, p23)
+            st_global_v2_u32(activated_base + out_off * Int64(2), p01, p23)
             u += Int32(n_warps)
+
+    # ------------------------------------------------------------------
+    # Single-kernel persistent small-M (rot + FC1 + act + FC2)
+    # ------------------------------------------------------------------
+
+    @cute.kernel
+    def persistent_smallm_kernel(
+        self,
+        rotation_input: cute.Tensor,
+        rotation_gate: cute.Tensor,
+        rotation_up: cute.Tensor,
+        gate_suh: cute.Tensor,
+        up_suh: cute.Tensor,
+        t0_w13: cute.Tensor,
+        t0_w2: cute.Tensor,
+        t0_w13_global: cute.Tensor,
+        t0_w2_global: cute.Tensor,
+        t1_w13: cute.Tensor,
+        t1_w2: cute.Tensor,
+        t1_w13_global: cute.Tensor,
+        t1_w2_global: cute.Tensor,
+        fc1: cute.Tensor,
+        activated: cute.Tensor,
+        fc2: cute.Tensor,
+        intermediate_rotations: cute.Tensor,
+        workspace: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        descriptor_map: cute.Tensor,
+        tier0_num_experts: cutlass.Int32,
+        tier1_num_experts: cutlass.Int32,
+        tier0_gate_experts: cutlass.Int32,
+        tier1_gate_experts: cutlass.Int32,
+        tier0_up_experts: cutlass.Int32,
+        tier1_up_experts: cutlass.Int32,
+        tier0_fc2_experts: cutlass.Int32,
+        tier1_fc2_experts: cutlass.Int32,
+        active_m: cutlass.Int32,
+        max_live_blocks: cutlass.Int32,
+        persistent_ctas: cutlass.Int32,
+    ):
+        tile_n = 64
+        cta_threads = 128
+        n_frags = 2
+        stages = self.persistent_stages
+        a_slab_bytes = self.persistent_a_slab_bytes
+        (
+            b_stage_bytes,
+            a_off,
+            fold_off,
+            zero16_off,
+            ctrl_off,
+            smem_words,
+        ) = _k4_persistent_smem_layout(self.max_bits, stages, a_slab_bytes)
+
+        tidx, _, _ = cute.arch.thread_idx()
+        tid = Int32(tidx)
+        lane = tid & Int32(31)
+        warp_id = tid >> Int32(5)
+        w_n = warp_id & Int32(1)
+        warp_row = warp_id >> Int32(1)
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, smem_words], 128
+            ]
+
+        storage = smem.allocate(Storage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+        if tid == Int32(0):
+            st_shared_v4_u32(
+                smem_base + Int32(zero16_off),
+                Uint32(0),
+                Uint32(0),
+                Uint32(0),
+                Uint32(0),
+            )
+
+        actual_blocks = packed_route_count[Int32(0)].to(Int32) >> Int32(3)
+        if actual_blocks > max_live_blocks:
+            actual_blocks = max_live_blocks
+        if actual_blocks < Int32(0):
+            actual_blocks = Int32(0)
+
+        ws_base = get_ptr_as_int64(workspace, Int64(0))
+        ws_state_base = ws_base + Int64(_WS_HEADER * 4)
+        ws_ready_base = ws_state_base + Int64(max_live_blocks) * Int64(4)
+
+        if actual_blocks > Int32(0):
+            total_experts = tier0_num_experts + tier1_num_experts
+            live_routes = active_m * Int32(self.top_k)
+
+            fc1_half_tiles = self.intermediate_size // tile_n
+            fc1_n_tiles = 2 * fc1_half_tiles
+            fc2_n_tiles = self.hidden_size // tile_n
+            rot_nblk = self.hidden_size // 128
+            blks_per_chunk = (rot_nblk + _ROT_SPLITS - 1) // _ROT_SPLITS
+
+            total_rot_tasks = actual_blocks * Int32(_ROT_SPLITS)
+            total_fc1_tasks = actual_blocks * Int32(fc1_n_tiles)
+            total_fc2_tasks = actual_blocks * Int32(fc2_n_tiles)
+
+            rot_gate_base = get_ptr_as_int64(rotation_gate, Int64(0))
+            rot_up_base = get_ptr_as_int64(rotation_up, Int64(0))
+            fc1_base = get_ptr_as_int64(fc1, Int64(0))
+            activated_base = get_ptr_as_int64(activated, Int64(0))
+            fc2_base = get_ptr_as_int64(fc2, Int64(0))
+            t0_w13_base = get_ptr_as_int64(t0_w13, Int64(0))
+            t0_w2_base = get_ptr_as_int64(t0_w2, Int64(0))
+            t1_w13_base = get_ptr_as_int64(t1_w13, Int64(0))
+            t1_w2_base = get_ptr_as_int64(t1_w2, Int64(0))
+            t0_w13_plane_u32 = Int64(cute.size(t0_w13)) // Int64(2)
+            t1_w13_plane_u32 = Int64(cute.size(t1_w13)) // Int64(2)
+            b_l2_policy = create_l2_evict_first_policy()
+
+            phase = Int32(0)
+            running = Int32(1)
+            while running != Int32(0):
+                if tid == Int32(0):
+                    action_d = Int32(_ACT_EXIT)
+                    arg0_d = Int32(0)
+                    arg1_d = Int32(0)
+                    arg2_d = Int32(0)
+                    got_work = Int32(0)
+                    while got_work == Int32(0):
+                        if phase == Int32(0):
+                            t = _atomic_add_acq_rel_gpu_i32(
+                                ws_base + Int64(_WS_ROT_CURSOR * 4), Int32(1)
+                            )
+                            if t < total_rot_tasks:
+                                rb_t = t >> Int32(2)
+                                chk_t = t & Int32(3)
+                                ce_t = block_expert_ids[rb_t].to(Int32)
+                                valid_blk = (
+                                    ce_t >= Int32(0) and ce_t < total_experts
+                                ).to(Int32)
+                                if valid_blk != Int32(0):
+                                    r0_t = packed_route_indices[
+                                        rb_t * Int32(8)
+                                    ].to(Int32)
+                                    if r0_t < Int32(0) or r0_t >= live_routes:
+                                        valid_blk = Int32(0)
+                                    elif cutlass.const_expr(self.compact_weights):
+                                        lw_t = descriptor_map[
+                                            Int64(3) * Int64(total_experts)
+                                            + Int64(ce_t)
+                                        ].to(Int32)
+                                        if lw_t <= Int32(0):
+                                            valid_blk = Int32(0)
+                                if valid_blk != Int32(0):
+                                    action_d = Int32(_ACT_ROT)
+                                    arg0_d = rb_t
+                                    arg1_d = chk_t
+                                    got_work = Int32(1)
+                                else:
+                                    _atomic_add_acq_rel_gpu_i32(
+                                        ws_state_base + Int64(rb_t) * Int64(4),
+                                        Int32(_ROT_DONE_STEP),
+                                    )
+                            else:
+                                phase = Int32(1)
+                        elif phase == Int32(1):
+                            t = _atomic_add_acq_rel_gpu_i32(
+                                ws_base + Int64(_WS_FC1_CURSOR * 4), Int32(1)
+                            )
+                            if t < total_fc1_tasks:
+                                rb_t = t // Int32(fc1_n_tiles)
+                                nt_t = t - rb_t * Int32(fc1_n_tiles)
+                                ce_t = block_expert_ids[rb_t].to(Int32)
+                                valid_blk = (
+                                    ce_t >= Int32(0) and ce_t < total_experts
+                                ).to(Int32)
+                                lw_t = Int32(self.intermediate_size)
+                                if valid_blk != Int32(0):
+                                    r0_t = packed_route_indices[
+                                        rb_t * Int32(8)
+                                    ].to(Int32)
+                                    if r0_t < Int32(0) or r0_t >= live_routes:
+                                        valid_blk = Int32(0)
+                                    elif cutlass.const_expr(self.compact_weights):
+                                        lw_t = descriptor_map[
+                                            Int64(3) * Int64(total_experts)
+                                            + Int64(ce_t)
+                                        ].to(Int32)
+                                        if lw_t <= Int32(0):
+                                            valid_blk = Int32(0)
+                                active_tile = valid_blk
+                                if cutlass.const_expr(self.compact_weights):
+                                    if active_tile != Int32(0):
+                                        loc_nt = nt_t
+                                        if loc_nt >= Int32(fc1_half_tiles):
+                                            loc_nt -= Int32(fc1_half_tiles)
+                                        if loc_nt * Int32(tile_n) >= lw_t:
+                                            active_tile = Int32(0)
+                                if active_tile != Int32(0):
+                                    st_val = _ld_global_acquire_gpu_i32(
+                                        ws_state_base + Int64(rb_t) * Int64(4)
+                                    )
+                                    rot_done = (
+                                        (st_val & Int32(_ROT_MASK))
+                                        == Int32(_ROT_READY_VAL)
+                                    ).to(Int32)
+                                    action_d = Int32(_ACT_FC1)
+                                    arg0_d = rb_t
+                                    arg1_d = nt_t
+                                    arg2_d = rot_done
+                                    got_work = Int32(1)
+                                else:
+                                    old_st = _atomic_add_acq_rel_gpu_i32(
+                                        ws_state_base + Int64(rb_t) * Int64(4),
+                                        Int32(1),
+                                    )
+                                    if (old_st & Int32(_FC1_CNT_MASK)) + Int32(
+                                        1
+                                    ) == Int32(fc1_n_tiles):
+                                        if valid_blk != Int32(0):
+                                            action_d = Int32(_ACT_ACT_ONLY)
+                                            arg0_d = rb_t
+                                            got_work = Int32(1)
+                                        else:
+                                            slot_t = _atomic_add_acq_rel_gpu_i32(
+                                                ws_base + Int64(_WS_READY_COUNT * 4),
+                                                Int32(1),
+                                            )
+                                            _st_global_release_gpu_i32(
+                                                ws_ready_base
+                                                + Int64(slot_t) * Int64(4),
+                                                rb_t + Int32(1),
+                                            )
+                            else:
+                                phase = Int32(2)
+                        else:
+                            t = _atomic_add_acq_rel_gpu_i32(
+                                ws_base + Int64(_WS_FC2_CURSOR * 4), Int32(1)
+                            )
+                            if t < total_fc2_tasks:
+                                slot_t = t // Int32(fc2_n_tiles)
+                                nt_t = t - slot_t * Int32(fc2_n_tiles)
+                                ready_addr = ws_ready_base + Int64(slot_t) * Int64(4)
+                                rval = _ld_global_acquire_gpu_i32(ready_addr)
+                                while rval == Int32(0):
+                                    _nanosleep(Int32(128))
+                                    rval = _ld_global_acquire_gpu_i32(ready_addr)
+                                rb_t = rval - Int32(1)
+                                ce_t = block_expert_ids[rb_t].to(Int32)
+                                valid_blk = (
+                                    ce_t >= Int32(0) and ce_t < total_experts
+                                ).to(Int32)
+                                if valid_blk != Int32(0):
+                                    r0_t = packed_route_indices[
+                                        rb_t * Int32(8)
+                                    ].to(Int32)
+                                    if r0_t < Int32(0) or r0_t >= live_routes:
+                                        valid_blk = Int32(0)
+                                    elif cutlass.const_expr(self.compact_weights):
+                                        lw_t = descriptor_map[
+                                            Int64(3) * Int64(total_experts)
+                                            + Int64(ce_t)
+                                        ].to(Int32)
+                                        if lw_t <= Int32(0):
+                                            valid_blk = Int32(0)
+                                if valid_blk != Int32(0):
+                                    action_d = Int32(_ACT_FC2)
+                                    arg0_d = rb_t
+                                    arg1_d = nt_t
+                                    got_work = Int32(1)
+                            else:
+                                action_d = Int32(_ACT_EXIT)
+                                got_work = Int32(1)
+                    st_shared_i32(smem_base + Int32(ctrl_off + 0), action_d)
+                    st_shared_i32(smem_base + Int32(ctrl_off + 4), arg0_d)
+                    st_shared_i32(smem_base + Int32(ctrl_off + 8), arg1_d)
+                    st_shared_i32(smem_base + Int32(ctrl_off + 12), arg2_d)
+                cute.arch.sync_threads()
+
+                action = ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 0))
+                rb = ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 4))
+                arg1 = ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 8))
+                arg2 = ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 12))
+
+                if action == Int32(_ACT_EXIT):
+                    running = Int32(0)
+                elif action == Int32(_ACT_ROT):
+                    combined_expert = block_expert_ids[rb].to(Int32)
+                    r_lane = live_routes
+                    if lane < Int32(8):
+                        r_lane = packed_route_indices[rb * Int32(8) + lane].to(Int32)
+                    is_valid = (
+                        lane < Int32(8)
+                        and r_lane >= Int32(0)
+                        and r_lane < live_routes
+                    ).to(Int32)
+                    valid_rows = cute.arch.warp_redux_sync(is_valid, "add")
+                    route_lane = Int32(0)
+                    if is_valid != Int32(0):
+                        route_lane = r_lane
+                    tok_lane = route_lane // Int32(self.top_k)
+
+                    blk_start = arg1 * Int32(blks_per_chunk)
+                    blk_end = blk_start + Int32(blks_per_chunk)
+                    if blk_end > Int32(rot_nblk):
+                        blk_end = Int32(rot_nblk)
+
+                    blk = blk_start + warp_id
+                    while blk < blk_end:
+                        col0 = blk * Int32(128) + lane * Int32(4)
+                        s_off = Int64(combined_expert) * Int64(
+                            self.hidden_size
+                        ) + Int64(col0)
+                        gw0, gw1 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(gate_suh, s_off)
+                        )
+                        uw0, uw1 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(up_suh, s_off)
+                        )
+                        r_idx = Int32(0)
+                        while r_idx < valid_rows:
+                            route_r = cute.arch.shuffle_sync(route_lane, r_idx)
+                            tok_r = cute.arch.shuffle_sync(tok_lane, r_idx)
+                            x_off = Int64(tok_r) * Int64(self.hidden_size) + Int64(
+                                col0
+                            )
+                            out_off = Int64(route_r) * Int64(self.hidden_size) + Int64(
+                                col0
+                            )
+                            xw0, xw1 = ld_global_nc_v2_u32(
+                                get_ptr_as_int64(rotation_input, x_off)
+                            )
+                            xh0 = cvt_bf16x2_to_f16x2_via_f32(xw0)
+                            xh1 = cvt_bf16x2_to_f16x2_via_f32(xw1)
+
+                            gv0, gv1 = f16x2_to_f32x2(half2_mul(xh0, gw0))
+                            gv2, gv3 = f16x2_to_f32x2(half2_mul(xh1, gw1))
+                            gh0, gh1, gh2, gh3 = self.driver._had128_quad(
+                                gv0, gv1, gv2, gv3, lane
+                            )
+                            st_global_v2_u32(
+                                rot_gate_base + out_off * Int64(2),
+                                pack_f32x2_to_f16x2(gh0, gh1),
+                                pack_f32x2_to_f16x2(gh2, gh3),
+                            )
+
+                            uv0, uv1 = f16x2_to_f32x2(half2_mul(xh0, uw0))
+                            uv2, uv3 = f16x2_to_f32x2(half2_mul(xh1, uw1))
+                            uh0, uh1, uh2, uh3 = self.driver._had128_quad(
+                                uv0, uv1, uv2, uv3, lane
+                            )
+                            st_global_v2_u32(
+                                rot_up_base + out_off * Int64(2),
+                                pack_f32x2_to_f16x2(uh0, uh1),
+                                pack_f32x2_to_f16x2(uh2, uh3),
+                            )
+                            r_idx += Int32(1)
+                        blk += Int32(4)
+
+                    cute.arch.sync_threads()
+                    if tid == Int32(0):
+                        _atomic_add_acq_rel_gpu_i32(
+                            ws_state_base + Int64(rb) * Int64(4),
+                            Int32(_ROT_DONE_STEP),
+                        )
+                elif action == Int32(_ACT_ACT_ONLY):
+                    combined_expert = block_expert_ids[rb].to(Int32)
+                    live_width = Int32(self.intermediate_size)
+                    if cutlass.const_expr(self.compact_weights):
+                        live_width = descriptor_map[
+                            Int64(3) * Int64(total_experts) + Int64(combined_expert)
+                        ].to(Int32)
+                    r_lane = live_routes
+                    if lane < Int32(8):
+                        r_lane = packed_route_indices[rb * Int32(8) + lane].to(Int32)
+                    is_valid = (
+                        lane < Int32(8)
+                        and r_lane >= Int32(0)
+                        and r_lane < live_routes
+                    ).to(Int32)
+                    valid_rows = cute.arch.warp_redux_sync(is_valid, "add")
+                    route_lane = Int32(0)
+                    if is_valid != Int32(0):
+                        route_lane = r_lane
+                    if valid_rows > Int32(0) and live_width > Int32(0):
+                        self._run_fused_act_block(
+                            cta_threads,
+                            fc1_base,
+                            activated_base,
+                            intermediate_rotations,
+                            combined_expert,
+                            live_width,
+                            route_lane,
+                            valid_rows,
+                            warp_id,
+                            lane,
+                        )
+                    cute.arch.sync_threads()
+                    if tid == Int32(0):
+                        slot = _atomic_add_acq_rel_gpu_i32(
+                            ws_base + Int64(_WS_READY_COUNT * 4), Int32(1)
+                        )
+                        _st_global_release_gpu_i32(
+                            ws_ready_base + Int64(slot) * Int64(4),
+                            rb + Int32(1),
+                        )
+                else:
+                    # Unified FC1 / FC2 GEMM body (tile_n = 64, cta_threads = 128).
+                    is_fc1_rt = (action == Int32(_ACT_FC1)).to(Int32)
+                    output_n_tile = arg1
+                    combined_expert = block_expert_ids[rb].to(Int32)
+
+                    descriptor_row = Int32(2)
+                    proj = Int32(0)
+                    local_n_tile = output_n_tile
+                    if is_fc1_rt != Int32(0):
+                        if output_n_tile >= Int32(fc1_half_tiles):
+                            descriptor_row = Int32(1)
+                            proj = Int32(1)
+                            local_n_tile = output_n_tile - Int32(fc1_half_tiles)
+                        else:
+                            descriptor_row = Int32(0)
+
+                    live_width = Int32(self.intermediate_size)
+                    weight_offset = Int64(0)
+                    if cutlass.const_expr(self.compact_weights):
+                        live_width = descriptor_map[
+                            Int64(3) * Int64(total_experts) + Int64(combined_expert)
+                        ].to(Int32)
+                        weight_offset = descriptor_map[
+                            (Int64(descriptor_row) + Int64(4)) * Int64(total_experts)
+                            + Int64(combined_expert)
+                        ].to(Int64)
+
+                    r_lane = live_routes
+                    if lane < Int32(8):
+                        r_lane = packed_route_indices[rb * Int32(8) + lane].to(Int32)
+                    is_valid = (
+                        lane < Int32(8)
+                        and r_lane >= Int32(0)
+                        and r_lane < live_routes
+                    ).to(Int32)
+                    valid_rows = cute.arch.warp_redux_sync(is_valid, "add")
+                    route_lane = Int32(0)
+                    if is_valid != Int32(0):
+                        route_lane = r_lane
+
+                    descriptor = descriptor_map[
+                        Int64(descriptor_row) * Int64(total_experts)
+                        + Int64(combined_expert)
+                    ].to(Int32)
+
+                    if valid_rows > Int32(0) and descriptor >= Int32(0):
+                        tier = descriptor >> Int32(self.descriptor_bits)
+                        local_expert = descriptor & Int32(
+                            (1 << self.descriptor_bits) - 1
+                        )
+
+                        t0_lim = tier0_fc2_experts
+                        t1_lim = tier1_fc2_experts
+                        if is_fc1_rt != Int32(0):
+                            if proj != Int32(0):
+                                t0_lim = tier0_up_experts
+                                t1_lim = tier1_up_experts
+                            else:
+                                t0_lim = tier0_gate_experts
+                                t1_lim = tier1_gate_experts
+
+                        is_t0 = tier == Int32(0) and local_expert < t0_lim
+                        is_t1 = tier == Int32(1) and local_expert < t1_lim
+
+                        if is_t0 or is_t1:
+                            use_evict_first = Int32(1)
+                            if rb + Int32(1) < actual_blocks:
+                                if (
+                                    block_expert_ids[rb + Int32(1)].to(Int32)
+                                    == combined_expert
+                                ):
+                                    use_evict_first = Int32(0)
+
+                            a_tensor_base = activated_base
+                            a_stride_bytes = Int32(self.intermediate_size * 2)
+                            c_tensor_base = fc2_base
+                            c_stride_elem = Int32(self.hidden_size)
+                            k_slabs = live_width >> Int32(7)
+                            wait_rot = Int32(0)
+                            if is_fc1_rt != Int32(0):
+                                a_tensor_base = rot_gate_base
+                                if proj != Int32(0):
+                                    a_tensor_base = rot_up_base
+                                a_stride_bytes = Int32(self.hidden_size * 2)
+                                c_tensor_base = fc1_base
+                                c_stride_elem = Int32(2 * self.intermediate_size)
+                                k_slabs = Int32(self.hidden_size // 128)
+                                if arg2 == Int32(0):
+                                    wait_rot = Int32(1)
+
+                            acc = [
+                                cute.make_rmem_tensor((1,), cutlass.Float32)
+                                for _ in range(4 * n_frags)
+                            ]
+                            for idx in cutlass.range_constexpr(4 * n_frags):
+                                acc[idx].fill(0.0)
+
+                            global_scale_f32 = cutlass.Float32(1.0)
+                            cta_n_blocks = tile_n // 16
+                            ws_state_addr = ws_state_base + Int64(rb) * Int64(4)
+
+                            if is_t0:
+                                bits0 = self.tier0.trellis_bits
+                                tile_u32_0 = 8 * bits0
+                                b_base_0 = t0_w2_base
+                                b_k16_stride_0 = Int64(
+                                    (self.hidden_size // 16) * tile_u32_0
+                                )
+                                b_tile_base_0 = Int64(0)
+                                if is_fc1_rt != Int32(0):
+                                    b_base_0 = t0_w13_base
+                                    global_scale_f32 = t0_w13_global[local_expert].to(
+                                        cutlass.Float32
+                                    )
+                                    if cutlass.const_expr(self.compact_weights):
+                                        b_k16_stride_0 = (
+                                            live_width.to(Int64) >> Int64(4)
+                                        ) * Int64(tile_u32_0)
+                                        b_tile_base_0 = weight_offset + Int64(
+                                            local_n_tile
+                                        ) * Int64(cta_n_blocks * tile_u32_0)
+                                    else:
+                                        half_n16 = self.intermediate_size // 16
+                                        proj_expert_u32 = (
+                                            (self.hidden_size // 16)
+                                            * half_n16
+                                            * tile_u32_0
+                                        )
+                                        b_k16_stride_0 = Int64(half_n16 * tile_u32_0)
+                                        b_tile_base_0 = (
+                                            Int64(proj) * t0_w13_plane_u32
+                                            + Int64(local_expert)
+                                            * Int64(proj_expert_u32)
+                                            + Int64(local_n_tile)
+                                            * Int64(cta_n_blocks * tile_u32_0)
+                                        )
+                                else:
+                                    global_scale_f32 = t0_w2_global[local_expert].to(
+                                        cutlass.Float32
+                                    )
+                                    if cutlass.const_expr(self.compact_weights):
+                                        b_tile_base_0 = weight_offset + Int64(
+                                            output_n_tile
+                                        ) * Int64(cta_n_blocks * tile_u32_0)
+                                    else:
+                                        n16 = self.hidden_size // 16
+                                        expert_u32 = (
+                                            (self.intermediate_size // 16)
+                                            * n16
+                                            * tile_u32_0
+                                        )
+                                        b_tile_base_0 = Int64(local_expert) * Int64(
+                                            expert_u32
+                                        ) + Int64(output_n_tile) * Int64(
+                                            cta_n_blocks * tile_u32_0
+                                        )
+
+                                self._run_gemm_kloop(
+                                    bits0,
+                                    tile_n,
+                                    cta_threads,
+                                    n_frags,
+                                    stages,
+                                    a_slab_bytes,
+                                    False,
+                                    False,
+                                    False,
+                                    True,
+                                    b_stage_bytes,
+                                    a_off,
+                                    zero16_off,
+                                    a_stride_bytes,
+                                    rotation_input,
+                                    Int64(0),
+                                    a_tensor_base,
+                                    b_base_0,
+                                    b_tile_base_0,
+                                    b_k16_stride_0,
+                                    k_slabs,
+                                    route_lane,
+                                    Int32(0),
+                                    valid_rows,
+                                    smem_base,
+                                    tid,
+                                    warp_id,
+                                    warp_row,
+                                    w_n,
+                                    lane,
+                                    use_evict_first,
+                                    b_l2_policy,
+                                    wait_rot,
+                                    ws_state_addr,
+                                    acc,
+                                )
+                            else:
+                                bits1 = self.tier1.trellis_bits
+                                tile_u32_1 = 8 * bits1
+                                b_base_1 = t1_w2_base
+                                b_k16_stride_1 = Int64(
+                                    (self.hidden_size // 16) * tile_u32_1
+                                )
+                                b_tile_base_1 = Int64(0)
+                                if is_fc1_rt != Int32(0):
+                                    b_base_1 = t1_w13_base
+                                    global_scale_f32 = t1_w13_global[local_expert].to(
+                                        cutlass.Float32
+                                    )
+                                    if cutlass.const_expr(self.compact_weights):
+                                        b_k16_stride_1 = (
+                                            live_width.to(Int64) >> Int64(4)
+                                        ) * Int64(tile_u32_1)
+                                        b_tile_base_1 = weight_offset + Int64(
+                                            local_n_tile
+                                        ) * Int64(cta_n_blocks * tile_u32_1)
+                                    else:
+                                        half_n16 = self.intermediate_size // 16
+                                        proj_expert_u32 = (
+                                            (self.hidden_size // 16)
+                                            * half_n16
+                                            * tile_u32_1
+                                        )
+                                        b_k16_stride_1 = Int64(half_n16 * tile_u32_1)
+                                        b_tile_base_1 = (
+                                            Int64(proj) * t1_w13_plane_u32
+                                            + Int64(local_expert)
+                                            * Int64(proj_expert_u32)
+                                            + Int64(local_n_tile)
+                                            * Int64(cta_n_blocks * tile_u32_1)
+                                        )
+                                else:
+                                    global_scale_f32 = t1_w2_global[local_expert].to(
+                                        cutlass.Float32
+                                    )
+                                    if cutlass.const_expr(self.compact_weights):
+                                        b_tile_base_1 = weight_offset + Int64(
+                                            output_n_tile
+                                        ) * Int64(cta_n_blocks * tile_u32_1)
+                                    else:
+                                        n16 = self.hidden_size // 16
+                                        expert_u32 = (
+                                            (self.intermediate_size // 16)
+                                            * n16
+                                            * tile_u32_1
+                                        )
+                                        b_tile_base_1 = Int64(local_expert) * Int64(
+                                            expert_u32
+                                        ) + Int64(output_n_tile) * Int64(
+                                            cta_n_blocks * tile_u32_1
+                                        )
+
+                                self._run_gemm_kloop(
+                                    bits1,
+                                    tile_n,
+                                    cta_threads,
+                                    n_frags,
+                                    stages,
+                                    a_slab_bytes,
+                                    False,
+                                    False,
+                                    False,
+                                    True,
+                                    b_stage_bytes,
+                                    a_off,
+                                    zero16_off,
+                                    a_stride_bytes,
+                                    rotation_input,
+                                    Int64(0),
+                                    a_tensor_base,
+                                    b_base_1,
+                                    b_tile_base_1,
+                                    b_k16_stride_1,
+                                    k_slabs,
+                                    route_lane,
+                                    Int32(0),
+                                    valid_rows,
+                                    smem_base,
+                                    tid,
+                                    warp_id,
+                                    warp_row,
+                                    w_n,
+                                    lane,
+                                    use_evict_first,
+                                    b_l2_policy,
+                                    wait_rot,
+                                    ws_state_addr,
+                                    acc,
+                                )
+
+                            self._epilogue_store(
+                                tile_n,
+                                n_frags,
+                                fold_off,
+                                c_tensor_base,
+                                c_stride_elem,
+                                acc,
+                                global_scale_f32,
+                                output_n_tile,
+                                route_lane,
+                                valid_rows,
+                                smem_base,
+                                tid,
+                                warp_row,
+                                w_n,
+                                lane,
+                            )
+
+                    cute.arch.sync_threads()
+                    if is_fc1_rt != Int32(0):
+                        if tid == Int32(0):
+                            old = _atomic_add_acq_rel_gpu_i32(
+                                ws_state_base + Int64(rb) * Int64(4), Int32(1)
+                            )
+                            is_last = (
+                                (old & Int32(_FC1_CNT_MASK)) + Int32(1)
+                                == Int32(fc1_n_tiles)
+                            ).to(Int32)
+                            st_shared_i32(smem_base + Int32(ctrl_off + 16), is_last)
+                        cute.arch.sync_threads()
+                        if (
+                            ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 16))
+                            != Int32(0)
+                        ):
+                            if valid_rows > Int32(0) and live_width > Int32(0):
+                                self._run_fused_act_block(
+                                    cta_threads,
+                                    fc1_base,
+                                    activated_base,
+                                    intermediate_rotations,
+                                    combined_expert,
+                                    live_width,
+                                    route_lane,
+                                    valid_rows,
+                                    warp_id,
+                                    lane,
+                                )
+                            cute.arch.sync_threads()
+                            if tid == Int32(0):
+                                slot = _atomic_add_acq_rel_gpu_i32(
+                                    ws_base + Int64(_WS_READY_COUNT * 4), Int32(1)
+                                )
+                                _st_global_release_gpu_i32(
+                                    ws_ready_base + Int64(slot) * Int64(4),
+                                    rb + Int32(1),
+                                )
+
+        # Final CTA resets workspace back to zeros for CUDA graph replay.
+        cute.arch.sync_threads()
+        if tid == Int32(0):
+            exited = _atomic_add_acq_rel_gpu_i32(
+                ws_base + Int64(_WS_EXIT_COUNT * 4), Int32(1)
+            )
+            is_last_cta = (exited + Int32(1) == persistent_ctas).to(Int32)
+            st_shared_i32(smem_base + Int32(ctrl_off + 16), is_last_cta)
+        cute.arch.sync_threads()
+        if ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 16)) != Int32(0):
+            ws_used = Int32(_WS_HEADER) + Int32(2) * max_live_blocks
+            idx = tid
+            while idx < ws_used:
+                _st_global_relaxed_gpu_i32(ws_base + Int64(idx) * Int64(4), Int32(0))
+                idx += Int32(cta_threads)
+        cute.arch.griddepcontrol_launch_dependents()
+
+    # ------------------------------------------------------------------
+    # Non-persistent GEMM body (m12..m80 PDL paths)
+    # ------------------------------------------------------------------
 
     @cute.jit
     def _gemm_tile_body(
@@ -1851,7 +3016,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         @cute.struct
         class Storage:
             words: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint32, smem_words], 1024
+                cute.struct.MemRange[cutlass.Uint32, smem_words], 128
             ]
 
         storage = smem.allocate(Storage)
@@ -1943,14 +3108,20 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             is_t1 = tier == Int32(1) and local_expert < t1_lim
 
                             if is_t0 or is_t1:
+                                # Zero 16-byte sentinel at fold_off before prologue sync.
+                                if tid == Int32(0):
+                                    st_shared_v4_u32(
+                                        smem_base + Int32(fold_off),
+                                        Uint32(0),
+                                        Uint32(0),
+                                        Uint32(0),
+                                        Uint32(0),
+                                    )
+
                                 tok_lane = Int32(0)
                                 if cutlass.const_expr(fused_rot):
                                     tok_lane = route_lane // Int32(self.top_k)
 
-                                # Adaptive L2 policy: keep weights in L2 when the
-                                # immediately following block belongs to the same
-                                # expert (multi-block reuse); stream evict-first
-                                # on single/last expert blocks.
                                 use_evict_first = Int32(1)
                                 if rb + Int32(1) < actual_blocks:
                                     if (
@@ -1958,6 +3129,8 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         == combined_expert
                                     ):
                                         use_evict_first = Int32(0)
+
+                                b_l2_policy = create_l2_evict_first_policy()
 
                                 suh_ptr_base = Int64(0)
                                 a_tensor_base = Int64(0)
@@ -1984,16 +3157,17 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                                 a_up, Int64(0)
                                             )
 
-                                a_stride_bytes = (
+                                a_stride_bytes = Int32(
                                     self.hidden_size * 2
                                     if is_fc1
                                     else self.intermediate_size * 2
                                 )
-                                c_stride_elem = (
+                                c_stride_elem = Int32(
                                     2 * self.intermediate_size
                                     if is_fc1
                                     else self.hidden_size
                                 )
+                                c_tensor_base = get_ptr_as_int64(c_flat, Int64(0))
                                 k_slabs = (
                                     Int32(self.hidden_size // 128)
                                     if cutlass.const_expr(is_fc1)
@@ -2065,17 +3239,21 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         bits0,
                                         tile_n,
                                         cta_threads,
+                                        n_frags,
                                         stages,
+                                        _A_SLAB_BYTES_FULL,
                                         fused_rot,
                                         pdl_wait,
                                         pdl_signal_after_wait,
+                                        False,
                                         b_stage_bytes,
                                         a_off,
+                                        fold_off,
                                         a_stride_bytes,
                                         x_or_a_gate,
                                         suh_ptr_base,
                                         a_tensor_base,
-                                        t0_b,
+                                        get_ptr_as_int64(t0_b, Int64(0)),
                                         b_tile_base_0,
                                         b_k16_stride_0,
                                         k_slabs,
@@ -2089,6 +3267,9 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         w_n,
                                         lane,
                                         use_evict_first,
+                                        b_l2_policy,
+                                        Int32(0),
+                                        Int64(0),
                                         acc,
                                     )
                                 else:
@@ -2146,17 +3327,21 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         bits1,
                                         tile_n,
                                         cta_threads,
+                                        n_frags,
                                         stages,
+                                        _A_SLAB_BYTES_FULL,
                                         fused_rot,
                                         pdl_wait,
                                         pdl_signal_after_wait,
+                                        False,
                                         b_stage_bytes,
                                         a_off,
+                                        fold_off,
                                         a_stride_bytes,
                                         x_or_a_gate,
                                         suh_ptr_base,
                                         a_tensor_base,
-                                        t1_b,
+                                        get_ptr_as_int64(t1_b, Int64(0)),
                                         b_tile_base_1,
                                         b_k16_stride_1,
                                         k_slabs,
@@ -2170,14 +3355,18 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         w_n,
                                         lane,
                                         use_evict_first,
+                                        b_l2_policy,
+                                        Int32(0),
+                                        Int64(0),
                                         acc,
                                     )
 
                                 self._epilogue_store(
                                     tile_n,
-                                    c_stride_elem,
+                                    n_frags,
                                     fold_off,
-                                    c_flat,
+                                    c_tensor_base,
+                                    c_stride_elem,
                                     acc,
                                     global_scale_f32,
                                     output_n_tile,
@@ -2211,8 +3400,8 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                 if ld_shared_i32_relaxed(smem_base) != Int32(0):
                                     self._run_fused_act_block(
                                         cta_threads,
-                                        c_flat,
-                                        activated,
+                                        get_ptr_as_int64(c_flat, Int64(0)),
+                                        get_ptr_as_int64(activated, Int64(0)),
                                         intermediate_rotations,
                                         combined_expert,
                                         live_width,
@@ -2226,69 +3415,8 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             cute.arch.griddepcontrol_launch_dependents()
 
     # ------------------------------------------------------------------
-    # Compiled CUDA kernels
+    # Compiled CUDA kernels (m12..m80 PDL fallback paths)
     # ------------------------------------------------------------------
-
-    @cute.kernel
-    def fc1_fused_narrow_kernel(
-        self,
-        rotation_input: cute.Tensor,
-        gate_suh: cute.Tensor,
-        up_suh: cute.Tensor,
-        t0_w13: cute.Tensor,
-        t0_w13_global: cute.Tensor,
-        t1_w13: cute.Tensor,
-        t1_w13_global: cute.Tensor,
-        fc1: cute.Tensor,
-        activated: cute.Tensor,
-        intermediate_rotations: cute.Tensor,
-        workspace: cute.Tensor,
-        packed_route_indices: cute.Tensor,
-        block_expert_ids: cute.Tensor,
-        packed_route_count: cute.Tensor,
-        descriptor_map: cute.Tensor,
-        tier0_num_experts: cutlass.Int32,
-        tier1_num_experts: cutlass.Int32,
-        tier0_gate_experts: cutlass.Int32,
-        tier1_gate_experts: cutlass.Int32,
-        tier0_up_experts: cutlass.Int32,
-        tier1_up_experts: cutlass.Int32,
-        active_m: cutlass.Int32,
-        do_fused_act: cutlass.Int32,
-    ):
-        self._gemm_tile_body(
-            True,
-            self.narrow_fc1_tile_n,
-            _FC1_SLAB_STAGES,
-            True,
-            False,
-            True,
-            False,
-            rotation_input,
-            rotation_input,
-            gate_suh,
-            up_suh,
-            t0_w13,
-            t0_w13_global,
-            t1_w13,
-            t1_w13_global,
-            fc1,
-            activated,
-            intermediate_rotations,
-            workspace,
-            packed_route_indices,
-            block_expert_ids,
-            packed_route_count,
-            descriptor_map,
-            tier0_num_experts,
-            tier1_num_experts,
-            tier0_gate_experts,
-            tier1_gate_experts,
-            tier0_up_experts,
-            tier1_up_experts,
-            active_m,
-            do_fused_act,
-        )
 
     @cute.kernel
     def fc1_fused_smallm_kernel(
@@ -2489,8 +3617,6 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         nblk = Int32(self.hidden_size // 128)
         total_units = active_m * Int32(self.top_k) * nblk
         if unit < total_units:
-            # Group by (token, H128 block) across warps of a CTA so all warps
-            # share the token input block in L1.
             tb = unit // Int32(self.top_k)
             k = unit - tb * Int32(self.top_k)
             token = tb // nblk
