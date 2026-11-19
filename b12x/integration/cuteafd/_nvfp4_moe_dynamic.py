@@ -51,7 +51,9 @@ from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar,
     create_l2_evict_first_policy,
     ld_global_nc_u32_l2hint,
+    ld_global_nc_v2_u32_l2hint,
     ld_global_nc_v4_u32,
+    ld_global_nc_v4_u32_l2hint,
     ld_global_v4_u32,
     ld_shared_u32 as ld_shared_u32_at,
     ldmatrix_m8n8x4_b16,
@@ -1029,7 +1031,7 @@ class GateUpSmallDyn:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
 
     def key(self) -> tuple:
-        return ("gate_up_small_dyn", 2, self.inter, self.hidden, self.experts, self.w_ring,
+        return ("gate_up_small_dyn", 3, self.inter, self.hidden, self.experts, self.w_ring,
                 self.gate_cap, self.up_cap, self.max_live)
 
     def _w_layout(self):
@@ -1042,9 +1044,11 @@ class GateUpSmallDyn:
         class Storage:
             pass
 
+        # Place 1024B-aligned w (12,288 B) before mbar (24 B) to avoid 1,000 B of alignment padding
+        # (12,312 B vs 13,312 B -> +1 resident CTA/SM under both 64 KiB and 100 KiB SMEM carveouts).
         Storage.__annotations__ = {
-            "mbar": cute.struct.MemRange[cutlass.Int64, self.w_ring],
             "w": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, cute.cosize(w_layout)], 1024],
+            "mbar": cute.struct.MemRange[cutlass.Int64, self.w_ring],
         }
         return cute.struct(Storage)
 
@@ -1190,7 +1194,8 @@ class GateUpSmallDyn:
                 for step in cutlass.range(self.k_steps, unroll=1):
                     slot = step % Int32(self.w_ring)
                     cute.arch.mbarrier_wait(mbar + slot, (step // Int32(self.w_ring)) & Int32(1))
-                    cute.arch.sync_threads()
+                    if (step > Int32(0)) & (step + Int32(self.w_ring - 1) < Int32(self.k_steps)):
+                        cute.arch.sync_threads()
                     if warp_id == Int32(0):
                         if step + Int32(self.w_ring - 1) < Int32(self.k_steps):
                             self._load_w(step + Int32(self.w_ring - 1), tma_g, tma_u, t_wg, t_wu, t_ws, mbar, w_tile)
@@ -1350,7 +1355,7 @@ class DownSmallDyn:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("down_small_dyn", 2, self.n, self.k, self.experts, self.tile_n, self.max_live)
+        return ("down_small_dyn", 3, self.n, self.k, self.experts, self.tile_n, self.max_live)
 
     def _storage(self):
         class Storage:
@@ -1439,7 +1444,6 @@ class DownSmallDyn:
             expert_factor = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
                 * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)))
 
-            cute.arch.mbarrier_wait(mbar, 0)
             w_ldm_row = sw + (warp_id * Int32(8) + mrow) * Int32(self.row_bytes) + mat * Int32(16)
             w_smem_row = sw + (warp_id * Int32(8) + q) * Int32(self.row_bytes) + c * Int32(4)
 
@@ -1472,6 +1476,9 @@ class DownSmallDyn:
                 acc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
                 for v in cutlass.range_constexpr(4):
                     acc[v] = Float32(0.0)
+
+                if m_chunk == Int32(0):
+                    cute.arch.mbarrier_wait(mbar, 0)
 
                 # Unrolled K = 576 = 4 * 128 + 64 directly from TMA-loaded SMEM tile.
                 self._mma_smem_k128(acc, w_ldm_row, a_lo_ptr, a_hi_ptr, 0, live_lo, live_hi, has_hi,
@@ -1560,5 +1567,414 @@ class CombineSmallDyn:
             pack_f32x2_to_bfloat2(acc[4], acc[5]), pack_f32x2_to_bfloat2(acc[6], acc[7]))
 
 
-__all__ += ["ChunkActDyn", "PrepQuantSmallDyn", "GateUpSmallDyn",
-            "ChunkActSmallDyn", "DownSmallDyn", "CombineSmallDyn"]
+class GateUpSmallDynReg:
+    """Thin-wave zero-barrier register-streaming W4A4 gate/up + SiTU x gamma for small-M
+    Inkling 2 NVFP4 TP4 (``hidden=4608, inter=576``, ``rows <= 3``).
+
+    Grid ``(inter // 16, grid_tiles)``, 4 warps (128 threads): warps 0..1 own 16 gate rows
+    (``w1``), warps 2..3 own the matching 16 up rows (``w3``). Uses 2-deep K=256 (128 B/row)
+    register ping-pong with ``L1::no_allocate`` + ``L2::evict_first`` weight loads, naturally
+    4-byte aligned ``ld_global_nc_u32_l2hint`` loads on ``s1``/``s3`` (preserving the 4-byte
+    scale ABI), on-demand L1-cached ``a_s`` reads, zero K-loop barriers, and 1,152 B SMEM for
+    the BF16 gate/up epilogue exchange."""
+
+    threads = 128
+    half_n = 16
+    x_stride = 72      # 32 BF16 (16 gate + 16 up) = 64 B + 8 B padding (conflict-free)
+
+    def __init__(self, *, inter: int, hidden: int, experts: int, gate_cap: float = 4.0,
+                 up_cap: float = 25.0, max_live: int = 16):
+        self.inter, self.hidden, self.experts = int(inter), int(hidden), int(experts)
+        self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
+        self.max_live = int(max_live)
+        if self.hidden <= 0 or self.hidden % 512 or self.inter <= 0 or self.inter % self.half_n:
+            raise ValueError("GateUpSmallDynReg requires H % 512 == 0 and I % 16 == 0")
+        self.blocks512 = self.hidden // 512
+        self.row_bytes = self.hidden // 2
+        self.scale_bytes = self.hidden // 16
+        self.amax_offset = nvfp4_amax_offset(experts, self.inter, self.hidden)
+        self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
+
+    def key(self) -> tuple:
+        return ("gate_up_small_dyn_reg", 1, self.inter, self.hidden, self.experts,
+                self.gate_cap, self.up_cap, self.max_live)
+
+    def _storage(self):
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "xch": cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, 16 * self.x_stride], 16],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer,
+                 w1: cute.Pointer, s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer,
+                 row_amax: cute.Pointer, gamma: cute.Pointer, act_bf16: cute.Pointer,
+                 act_amax_part: cute.Pointer, grid_tiles: Int32, stream: cuda.CUstream):
+        self.kernel(aq, a_s, pair_row, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16,
+                    act_amax_part).launch(
+            grid=(self.inter // self.half_n, grid_tiles, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _mma_k128(self, acc: cute.Tensor, w_buf: cute.Tensor, w_off: cutlass.Constexpr,
+                  a_lo_ptr: Int64, a_hi_ptr: Int64, k_byte: Int64, live_lo: Int32, live_hi: Int32,
+                  has_hi: Int32, sfa_lo_w: Uint32, sfa_hi_w: Uint32, sfb_w: Uint32,
+                  lane0: Int32, lane1: Int32, c: Int32):
+        al0, al1, al2, al3 = _ld_nc_v4_u32_pred(a_lo_ptr + k_byte + Int64(c) * Int64(16), live_lo)
+        al0, al1, al2, al3 = _quad_transpose_x4(al0, al1, al2, al3, c)
+        ah0, ah1, ah2, ah3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+        if const_expr(self.max_live > 8):
+            if has_hi != Int32(0):
+                th0, th1, th2, th3 = _ld_nc_v4_u32_pred(a_hi_ptr + k_byte + Int64(c) * Int64(16), live_hi)
+                th0, th1, th2, th3 = _quad_transpose_x4(th0, th1, th2, th3, c)
+                ah0 = th0
+                ah1 = th1
+                ah2 = th2
+                ah3 = th3
+        b0, b1, b2, b3 = _quad_transpose_x4(
+            w_buf[w_off], w_buf[w_off + 1], w_buf[w_off + 2], w_buf[w_off + 3], c)
+        sfa0 = _shfl_idx_u32(sfa_lo_w, lane0)
+        sfa1 = _shfl_idx_u32(sfa_lo_w, lane1)
+        if const_expr(self.max_live > 8):
+            if has_hi != Int32(0):
+                sfa0_h = _shfl_idx_u32(sfa_hi_w, lane0)
+                sfa1_h = _shfl_idx_u32(sfa_hi_w, lane1)
+                sfa0 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa0_h, sfa0))
+                sfa1 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa1_h, sfa1))
+        d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+            acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa0, _shfl_idx_u32(sfb_w, lane0))
+        d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+            d0, d1, d2, d3, al2, ah2, al3, ah3, b2, b3, sfa1, _shfl_idx_u32(sfb_w, lane1))
+        acc[0], acc[1], acc[2], acc[3] = d0, d1, d2, d3
+
+    @cute.kernel
+    def kernel(self, aq: cute.Pointer, a_s: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer,
+               w1: cute.Pointer, s1: cute.Pointer, w3: cute.Pointer, s3: cute.Pointer,
+               row_amax: cute.Pointer, gamma: cute.Pointer, act_bf16: cute.Pointer,
+               act_amax_part: cute.Pointer):
+        n_blk = Int32(cute.arch.block_idx()[0])
+        tile = Int32(cute.arch.block_idx()[1])
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        if tile < _i32_at(Int64(meta.toint()), 1):
+            e, first, live = _chunk(meta, self.experts, tile)
+            tidx = Int32(cute.arch.thread_idx()[0])
+            warp_id = tidx // Int32(32)
+            lane = tidx % Int32(32)
+            q = lane // Int32(4)
+            c = lane % Int32(4)
+            quad_base = q * Int32(4)
+            side = warp_id // Int32(2)
+            sub_n = warp_id % Int32(2)
+            n0 = n_blk * Int32(self.half_n)
+            wp = cutlass.select_(side == Int32(0), Int64(w1.toint()), Int64(w3.toint()))
+            sp = cutlass.select_(side == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
+            w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
+            w_row = wp + w_row_idx * Int64(self.row_bytes)
+            s_row = sp + w_row_idx * Int64(self.scale_bytes)
+            expert_factor = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
+                * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)))
+            xch = shared_ptr_to_u32(storage.xch.data_ptr())
+            policy = create_l2_evict_first_policy()
+
+            m_chunks = (live + Int32(15)) // Int32(16)
+            for m_chunk in cutlass.range(m_chunks, unroll=1):
+                m0 = m_chunk * Int32(16)
+                chunk_live = live - m0
+                if chunk_live > Int32(16):
+                    chunk_live = Int32(16)
+                has_hi = Int32(cutlass.select_(chunk_live > Int32(8), Int32(1), Int32(0)))
+                live_lo = Int32(cutlass.select_(q < chunk_live, Int32(1), Int32(0)))
+                live_hi = Int32(cutlass.select_(q + Int32(8) < chunk_live, Int32(1), Int32(0)))
+                src_lo = Int32(0)
+                if q < chunk_live:
+                    src_lo = _i32_at(Int64(pair_row.toint()), first + m0 + q)
+                src_hi = Int32(0)
+                if const_expr(self.max_live > 8):
+                    if q + Int32(8) < chunk_live:
+                        src_hi = _i32_at(Int64(pair_row.toint()), first + m0 + q + Int32(8))
+                a_lo_ptr = Int64(aq.toint()) + Int64(src_lo) * Int64(self.row_bytes)
+                as_lo_ptr = Int64(a_s.toint()) + Int64(src_lo) * Int64(self.scale_bytes)
+                a_hi_ptr = Int64(aq.toint()) + Int64(src_hi) * Int64(self.row_bytes)
+                as_hi_ptr = Int64(a_s.toint()) + Int64(src_hi) * Int64(self.scale_bytes)
+
+                acc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                for v in cutlass.range_constexpr(4):
+                    acc[v] = Float32(0.0)
+                w0 = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+                w1_buf = cute.make_rmem_tensor(cute.make_layout((8,), stride=(1,)), Uint32)
+
+                # Prologue: prefetch blk512=0 Half 0 (K=0..255, 128 B) and naturally 4-byte aligned s1/s3 scales.
+                p0, p1, p2, p3 = ld_global_nc_v4_u32_l2hint(w_row + Int64(c) * Int64(16), policy, no_allocate=True)
+                p4, p5, p6, p7 = ld_global_nc_v4_u32_l2hint(w_row + Int64(64) + Int64(c) * Int64(16), policy, no_allocate=True)
+                w0[0], w0[1], w0[2], w0[3] = p0, p1, p2, p3
+                w0[4], w0[5], w0[6], w0[7] = p4, p5, p6, p7
+                sfb0 = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
+                sfb1 = ld_global_nc_u32_l2hint(s_row + Int64(16) + Int64(c) * Int64(4), policy)
+
+                for blk512 in cutlass.range(self.blocks512, unroll=1):
+                    k_base = Int64(blk512) * Int64(256)
+                    s_base = Int64(blk512) * Int64(32)
+                    # Prefetch Half 1 (K +256..+511, 128 B) while computing Half 0.
+                    r0, r1, r2, r3 = ld_global_nc_v4_u32_l2hint(
+                        w_row + k_base + Int64(128) + Int64(c) * Int64(16), policy, no_allocate=True)
+                    r4, r5, r6, r7 = ld_global_nc_v4_u32_l2hint(
+                        w_row + k_base + Int64(192) + Int64(c) * Int64(16), policy, no_allocate=True)
+                    w1_buf[0], w1_buf[1], w1_buf[2], w1_buf[3] = r0, r1, r2, r3
+                    w1_buf[4], w1_buf[5], w1_buf[6], w1_buf[7] = r4, r5, r6, r7
+
+                    sfa_lo_0 = _ld_nc_u32_pred(as_lo_ptr + s_base + Int64(c) * Int64(4), live_lo)
+                    sfa_hi_0 = Uint32(0)
+                    if const_expr(self.max_live > 8):
+                        if has_hi != Int32(0):
+                            sfa_hi_0 = _ld_nc_u32_pred(as_hi_ptr + s_base + Int64(c) * Int64(4), live_hi)
+                    self._mma_k128(acc, w0, 0, a_lo_ptr, a_hi_ptr, k_base, live_lo, live_hi,
+                                   has_hi, sfa_lo_0, sfa_hi_0, sfb0, quad_base, quad_base + Int32(1), c)
+                    self._mma_k128(acc, w0, 4, a_lo_ptr, a_hi_ptr, k_base + Int64(64), live_lo, live_hi,
+                                   has_hi, sfa_lo_0, sfa_hi_0, sfb0, quad_base + Int32(2), quad_base + Int32(3), c)
+
+                    # Prefetch next blk512 Half 0 weights and 4-byte aligned s1/s3 scales.
+                    sfb0_nxt = sfb0
+                    sfb1_nxt = sfb1
+                    if blk512 + Int32(1) < Int32(self.blocks512):
+                        nk = Int64(blk512 + Int32(1)) * Int64(256)
+                        q0, q1, q2, q3 = ld_global_nc_v4_u32_l2hint(
+                            w_row + nk + Int64(c) * Int64(16), policy, no_allocate=True)
+                        q4, q5, q6, q7 = ld_global_nc_v4_u32_l2hint(
+                            w_row + nk + Int64(64) + Int64(c) * Int64(16), policy, no_allocate=True)
+                        w0[0], w0[1], w0[2], w0[3] = q0, q1, q2, q3
+                        w0[4], w0[5], w0[6], w0[7] = q4, q5, q6, q7
+                        ns = Int64(blk512 + Int32(1)) * Int64(32)
+                        sfb0_nxt = ld_global_nc_u32_l2hint(s_row + ns + Int64(c) * Int64(4), policy)
+                        sfb1_nxt = ld_global_nc_u32_l2hint(s_row + ns + Int64(16) + Int64(c) * Int64(4), policy)
+
+                    sfa_lo_1 = _ld_nc_u32_pred(as_lo_ptr + s_base + Int64(16) + Int64(c) * Int64(4), live_lo)
+                    sfa_hi_1 = Uint32(0)
+                    if const_expr(self.max_live > 8):
+                        if has_hi != Int32(0):
+                            sfa_hi_1 = _ld_nc_u32_pred(as_hi_ptr + s_base + Int64(16) + Int64(c) * Int64(4), live_hi)
+                    self._mma_k128(acc, w1_buf, 0, a_lo_ptr, a_hi_ptr, k_base + Int64(128), live_lo, live_hi,
+                                   has_hi, sfa_lo_1, sfa_hi_1, sfb1, quad_base, quad_base + Int32(1), c)
+                    self._mma_k128(acc, w1_buf, 4, a_lo_ptr, a_hi_ptr, k_base + Int64(192), live_lo, live_hi,
+                                   has_hi, sfa_lo_1, sfa_hi_1, sfb1, quad_base + Int32(2), quad_base + Int32(3), c)
+                    sfb0 = sfb0_nxt
+                    sfb1 = sfb1_nxt
+
+                # Epilogue: exchange BF16 gate/up via 1,152 B SMEM, compute SiTU x gamma and group amax.
+                col_xch = side * Int32(16) + sub_n * Int32(8) + Int32(2) * c
+                if q < chunk_live:
+                    factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(src_lo) * Int64(4)) * expert_factor
+                    st_shared_u32(xch + q * Int32(self.x_stride) + col_xch * Int32(2),
+                                  pack_f32x2_to_bfloat2(acc[0] * factor_lo, acc[1] * factor_lo))
+                if const_expr(self.max_live > 8):
+                    if q + Int32(8) < chunk_live:
+                        factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(src_hi) * Int64(4)) * expert_factor
+                        st_shared_u32(xch + (q + Int32(8)) * Int32(self.x_stride) + col_xch * Int32(2),
+                                      pack_f32x2_to_bfloat2(acc[2] * factor_hi, acc[3] * factor_hi))
+                cute.arch.sync_threads()
+                erow = tidx // Int32(8)
+                epair = tidx % Int32(8)
+                local = Float32(0.0)
+                if erow < chunk_live:
+                    p = first + m0 + erow
+                    g_row = _ld_f32(Int64(gamma.toint()) + Int64(p) * Int64(4))
+                    gw = ld_shared_u32_at(xch + erow * Int32(self.x_stride) + epair * Int32(4))
+                    uw = ld_shared_u32_at(xch + erow * Int32(self.x_stride) + Int32(self.half_n * 2) + epair * Int32(4))
+                    v0 = situ_vendor(_bf16_lo(gw), _bf16_lo(uw), g_row, gate_cap=self.gate_cap, up_cap=self.up_cap)
+                    v1 = situ_vendor(_bf16_hi(gw), _bf16_hi(uw), g_row, gate_cap=self.gate_cap, up_cap=self.up_cap)
+                    local = fmax_f32(fabs_f32(v0), fabs_f32(v1))
+                    out_at = Int64(act_bf16.toint()) + (Int64(p) * Int64(self.inter) + Int64(n0) + Int64(epair) * Int64(2)) * Int64(2)
+                    st_global_u32(out_at, pack_f32x2_to_bfloat2(v0, v1))
+                local = fmax_f32(local, Float32(cute.arch.shuffle_sync_bfly(local, offset=1)))
+                local = fmax_f32(local, Float32(cute.arch.shuffle_sync_bfly(local, offset=2)))
+                local = fmax_f32(local, Float32(cute.arch.shuffle_sync_bfly(local, offset=4)))
+                if (erow < chunk_live) & (epair == Int32(0)):
+                    p = first + m0 + erow
+                    st_global_f32(Int64(act_amax_part.toint())
+                                  + (Int64(p) * Int64(self.inter // 16) + Int64(n_blk)) * Int64(4), local)
+                if m_chunks > Int32(1):
+                    cute.arch.sync_threads()
+
+
+class DownSmallDynReg:
+    """Thin-wave zero-SMEM, zero-barrier register-streaming W4A4 down projection for small-M
+    Inkling 2 NVFP4 TP4 (``n=4608, k=576``, ``rows <= 3``).
+
+    Grid ``(n // 32, grid_tiles)`` = ``(144, grid_tiles)`` (exact multiple of 48 SMs), 4 warps
+    (128 threads, 1 group = 8 output columns per warp for half the register pressure of G=2).
+    Preloads all 9 naturally 4-byte aligned ``s2`` scale words with ``L2::evict_first``, streams
+    ``w2`` via unrolled 2-deep K=128 ping-pong (``L1::no_allocate`` + ``L2::evict_first``) plus
+    the 8B-aligned K=64 tail on 16B-aligned ``w2``, and writes coalesced BF16 ``y [pairs, n]``."""
+
+    threads = 128
+    tile_n = 32
+
+    def __init__(self, *, n: int, k: int, experts: int, max_live: int = 16):
+        self.n, self.k, self.experts = int(n), int(k), int(experts)
+        self.max_live = int(max_live)
+        if self.n <= 0 or self.n % self.tile_n or self.k != 576:
+            raise ValueError("DownSmallDynReg requires N % 32 == 0 and K == 576")
+        self.row_bytes = self.k // 2       # 288 B
+        self.scale_bytes = self.k // 16    # 36 B (9 u32 words)
+        self.amax_offset = nvfp4_amax_offset(experts, self.n, self.k)
+        self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
+
+    def key(self) -> tuple:
+        return ("down_small_dyn_reg", 1, self.n, self.k, self.experts, self.tile_n, self.max_live)
+
+    @cute.jit
+    def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer,
+                 s: cute.Pointer, y: cute.Pointer, row_amax: cute.Pointer, grid_tiles: Int32,
+                 stream: cuda.CUstream):
+        self.kernel(aq, a_s, meta, w, s, y, row_amax).launch(
+            grid=(self.n // self.tile_n, grid_tiles, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.jit
+    def _load_w128(self, buf: cute.Tensor, w_row: Int64, k_byte: cutlass.Constexpr, c: Int32, policy: Uint64):
+        r0, r1, r2, r3 = ld_global_nc_v4_u32_l2hint(
+            w_row + Int64(k_byte) + Int64(c) * Int64(16), policy, no_allocate=True)
+        buf[0], buf[1], buf[2], buf[3] = r0, r1, r2, r3
+
+    @cute.jit
+    def _mma_k128(self, acc: cute.Tensor, w_buf: cute.Tensor, a_lo_ptr: Int64, a_hi_ptr: Int64,
+                  k_byte: cutlass.Constexpr, live_lo: Int32, live_hi: Int32, has_hi: Int32,
+                  sfa_lo_w: Uint32, sfa_hi_w: Uint32, sfb_w: Uint32, lane0: Int32, lane1: Int32,
+                  c: Int32):
+        al0, al1, al2, al3 = _ld_nc_v4_u32_pred(a_lo_ptr + Int64(k_byte) + Int64(c) * Int64(16), live_lo)
+        al0, al1, al2, al3 = _quad_transpose_x4(al0, al1, al2, al3, c)
+        ah0, ah1, ah2, ah3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+        if const_expr(self.max_live > 8):
+            if has_hi != Int32(0):
+                th0, th1, th2, th3 = _ld_nc_v4_u32_pred(a_hi_ptr + Int64(k_byte) + Int64(c) * Int64(16), live_hi)
+                th0, th1, th2, th3 = _quad_transpose_x4(th0, th1, th2, th3, c)
+                ah0 = th0
+                ah1 = th1
+                ah2 = th2
+                ah3 = th3
+        sfa_0 = _shfl_idx_u32(sfa_lo_w, lane0)
+        sfa_1 = _shfl_idx_u32(sfa_lo_w, lane1)
+        if const_expr(self.max_live > 8):
+            if has_hi != Int32(0):
+                sfa_0h = _shfl_idx_u32(sfa_hi_w, lane0)
+                sfa_1h = _shfl_idx_u32(sfa_hi_w, lane1)
+                sfa_0 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa_0h, sfa_0))
+                sfa_1 = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa_1h, sfa_1))
+        b0, b1, b2, b3 = _quad_transpose_x4(w_buf[0], w_buf[1], w_buf[2], w_buf[3], c)
+        d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+            acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa_0, _shfl_idx_u32(sfb_w, lane0))
+        d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+            d0, d1, d2, d3, al2, ah2, al3, ah3, b2, b3, sfa_1, _shfl_idx_u32(sfb_w, lane1))
+        acc[0], acc[1], acc[2], acc[3] = d0, d1, d2, d3
+
+    @cute.kernel
+    def kernel(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer,
+               s: cute.Pointer, y: cute.Pointer, row_amax: cute.Pointer):
+        n_blk = Int32(cute.arch.block_idx()[0])
+        tile = Int32(cute.arch.block_idx()[1])
+        if tile < _i32_at(Int64(meta.toint()), 1):
+            e, first, live = _chunk(meta, self.experts, tile)
+            tidx = Int32(cute.arch.thread_idx()[0])
+            warp_id = tidx // Int32(32)
+            lane = tidx % Int32(32)
+            q = lane // Int32(4)
+            c = lane % Int32(4)
+            quad_base = q * Int32(4)
+            n0 = n_blk * Int32(self.tile_n) + warp_id * Int32(8)
+            w_idx = Int64(e) * Int64(self.n) + Int64(n0 + q)
+            w_row = Int64(w.toint()) + w_idx * Int64(self.row_bytes)
+            s_row = Int64(s.toint()) + w_idx * Int64(self.scale_bytes)
+            expert_factor = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
+                * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)))
+            policy = create_l2_evict_first_policy()
+
+            # Preload all 9 naturally 4-byte aligned s2 scale words (ABI align=4).
+            sfb0 = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
+            sfb1 = ld_global_nc_u32_l2hint(s_row + Int64(16) + Int64(c) * Int64(4), policy)
+            sfb2 = ld_global_nc_u32_l2hint(s_row + Int64(32), policy)
+
+            m_chunks = (live + Int32(15)) // Int32(16)
+            for m_chunk in cutlass.range(m_chunks, unroll=1):
+                m0 = m_chunk * Int32(16)
+                chunk_live = live - m0
+                if chunk_live > Int32(16):
+                    chunk_live = Int32(16)
+                has_hi = Int32(cutlass.select_(chunk_live > Int32(8), Int32(1), Int32(0)))
+                live_lo = Int32(cutlass.select_(q < chunk_live, Int32(1), Int32(0)))
+                live_hi = Int32(cutlass.select_(q + Int32(8) < chunk_live, Int32(1), Int32(0)))
+                p_lo = Int32(cutlass.select_(q < chunk_live, first + m0 + q, first))
+                p_hi = Int32(cutlass.select_(q + Int32(8) < chunk_live, first + m0 + q + Int32(8), first))
+                a_lo_ptr = Int64(aq.toint()) + Int64(p_lo) * Int64(self.row_bytes)
+                as_lo_ptr = Int64(a_s.toint()) + Int64(p_lo) * Int64(self.scale_bytes)
+                a_hi_ptr = Int64(aq.toint()) + Int64(p_hi) * Int64(self.row_bytes)
+                as_hi_ptr = Int64(a_s.toint()) + Int64(p_hi) * Int64(self.scale_bytes)
+
+                sfa0_lo = _ld_nc_u32_pred(as_lo_ptr + Int64(c) * Int64(4), live_lo)
+                sfa1_lo = _ld_nc_u32_pred(as_lo_ptr + Int64(16) + Int64(c) * Int64(4), live_lo)
+                sfa2_lo = _ld_nc_u32_pred(as_lo_ptr + Int64(32), live_lo)
+                sfa0_hi, sfa1_hi, sfa2_hi = Uint32(0), Uint32(0), Uint32(0)
+                if const_expr(self.max_live > 8):
+                    if has_hi != Int32(0):
+                        sfa0_hi = _ld_nc_u32_pred(as_hi_ptr + Int64(c) * Int64(4), live_hi)
+                        sfa1_hi = _ld_nc_u32_pred(as_hi_ptr + Int64(16) + Int64(c) * Int64(4), live_hi)
+                        sfa2_hi = _ld_nc_u32_pred(as_hi_ptr + Int64(32), live_hi)
+
+                acc = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+                for v in cutlass.range_constexpr(4):
+                    acc[v] = Float32(0.0)
+                w0 = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
+                w1_buf = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Uint32)
+
+                # Unrolled 2-deep ping-pong over K = 576 = 4 * 128 + 64.
+                self._load_w128(w0, w_row, 0, c, policy)
+
+                self._load_w128(w1_buf, w_row, 64, c, policy)
+                self._mma_k128(acc, w0, a_lo_ptr, a_hi_ptr, 0, live_lo, live_hi, has_hi,
+                               sfa0_lo, sfa0_hi, sfb0, quad_base, quad_base + Int32(1), c)
+
+                self._load_w128(w0, w_row, 128, c, policy)
+                self._mma_k128(acc, w1_buf, a_lo_ptr, a_hi_ptr, 64, live_lo, live_hi, has_hi,
+                               sfa0_lo, sfa0_hi, sfb0, quad_base + Int32(2), quad_base + Int32(3), c)
+
+                self._load_w128(w1_buf, w_row, 192, c, policy)
+                self._mma_k128(acc, w0, a_lo_ptr, a_hi_ptr, 128, live_lo, live_hi, has_hi,
+                               sfa1_lo, sfa1_hi, sfb1, quad_base, quad_base + Int32(1), c)
+
+                # Prefetch final K64 tail (32 B at 16B-aligned offset 256 on align=16 w2) before block 3.
+                t0, t1 = ld_global_nc_v2_u32_l2hint(w_row + Int64(256) + Int64(c) * Int64(8), policy)
+                self._mma_k128(acc, w1_buf, a_lo_ptr, a_hi_ptr, 192, live_lo, live_hi, has_hi,
+                               sfa1_lo, sfa1_hi, sfb1, quad_base + Int32(2), quad_base + Int32(3), c)
+
+                # Step 8 (K = 512..575).
+                al0, al1 = _ld_nc_v2_u32_pred(a_lo_ptr + Int64(256) + Int64(c) * Int64(8), live_lo)
+                al0, al1 = _quad_unpack_v2(al0, al1, lane)
+                ah0, ah1 = Uint32(0), Uint32(0)
+                if const_expr(self.max_live > 8):
+                    if has_hi != Int32(0):
+                        th0, th1 = _ld_nc_v2_u32_pred(a_hi_ptr + Int64(256) + Int64(c) * Int64(8), live_hi)
+                        th0, th1 = _quad_unpack_v2(th0, th1, lane)
+                        ah0 = th0
+                        ah1 = th1
+                sfa_t = sfa2_lo
+                if const_expr(self.max_live > 8):
+                    if has_hi != Int32(0):
+                        sfa_t = Uint32(cutlass.select_((c & Int32(1)) != Int32(0), sfa2_hi, sfa2_lo))
+                b0, b1 = _quad_unpack_v2(t0, t1, lane)
+                d0, d1, d2, d3 = nvfp4_mma_m16n8k64_f32_e2m1(
+                    acc[0], acc[1], acc[2], acc[3], al0, ah0, al1, ah1, b0, b1, sfa_t, sfb2)
+
+                # Epilogue: coalesced BF16 stores directly to y [pairs, n].
+                if q < chunk_live:
+                    factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(p_lo) * Int64(4)) * expert_factor
+                    y_lo = Int64(y.toint()) + (Int64(p_lo) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
+                    st_global_u32(y_lo, pack_f32x2_to_bfloat2(d0 * factor_lo, d1 * factor_lo))
+                if const_expr(self.max_live > 8):
+                    if q + Int32(8) < chunk_live:
+                        factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(p_hi) * Int64(4)) * expert_factor
+                        y_hi = Int64(y.toint()) + (Int64(p_hi) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
+                        st_global_u32(y_hi, pack_f32x2_to_bfloat2(d2 * factor_hi, d3 * factor_hi))
+
+
+__all__ += ["ChunkActDyn", "PrepQuantSmallDyn", "GateUpSmallDyn", "GateUpSmallDynReg",
+            "ChunkActSmallDyn", "DownSmallDyn", "DownSmallDynReg", "CombineSmallDyn"]

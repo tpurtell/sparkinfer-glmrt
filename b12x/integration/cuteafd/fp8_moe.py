@@ -93,8 +93,8 @@ from ._mxfp4_down_a8_plan import mxfp8_down_row_bytes, mxfp4_scale_row_bytes
 from ._nvfp4_moe_kernels import nvfp4_alpha_offset
 from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, StreamNvfp4LinearA4
 from ._nvfp4_moe_dynamic import (ChunkActDyn, ChunkActSmallDyn, ChunkRowsDyn, CombineSmallDyn, DownSmallDyn,
-                                 GateUpSmallDyn, PrepQuantSmallDyn, StreamNvfp4GateUpDyn,
-                                 StreamNvfp4LinearDyn, nvfp4_amax_offset)
+                                 DownSmallDynReg, GateUpSmallDyn, GateUpSmallDynReg, PrepQuantSmallDyn,
+                                 StreamNvfp4GateUpDyn, StreamNvfp4LinearDyn, nvfp4_amax_offset)
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
            "prefill_forms", "fp8_moe_segment_scratch_bytes"]
@@ -960,22 +960,29 @@ class _StreamNvfp4DynRoute:
         self.fast_small_m = (
             h == 4608 and i == 576 and e == 384 and k == 8 and int(max_rows) <= 16
         )
+        self.small_m_hybrid = self.fast_small_m and int(max_rows) > 1
         if self.fast_small_m:
             max_live = 8 if int(max_rows) == 1 else 16
             self.prep_quant_small = PrepQuantSmallDyn(k=h, experts=e, top_k=k, max_tiles=self.max_tiles,
                                                       input_kind=input_kind or "bf16")
-            self.gate_small = GateUpSmallDyn(inter=i, hidden=h, experts=e, max_live=max_live, **caps)
+            self.gate_small_reg = GateUpSmallDynReg(inter=i, hidden=h, experts=e, max_live=max_live, **caps)
             self.act_small = ChunkActSmallDyn(inter=i)
-            self.down_small = DownSmallDyn(n=h, k=i, experts=e, max_live=max_live)
+            self.down_small_reg = DownSmallDynReg(n=h, k=i, experts=e, max_live=max_live)
             self.combine_small = CombineSmallDyn(hidden=h, top_k=k)
+            if self.small_m_hybrid:
+                self.gate_small = GateUpSmallDyn(inter=i, hidden=h, experts=e, max_live=max_live, **caps)
+                self.down_small = DownSmallDyn(n=h, k=i, experts=e, max_live=max_live)
 
     def key(self) -> tuple:
         base = ("stream_nvfp4_dyn", self.max_tiles, self.rows_in.key(), self.gamma.key(), self.gate_up.key(),
                 self.act.key(), self.down.key(), self.combine.key(),
                 tuple(p.key() for p in self.small_gate), tuple(p.key() for p in self.small_down))
         if self.fast_small_m:
-            return base + ("small_m_fast", 2, self.prep_quant_small.key(), self.gate_small.key(),
-                           self.act_small.key(), self.down_small.key(), self.combine_small.key())
+            tail = (self.prep_quant_small.key(), self.gate_small_reg.key(), self.act_small.key(),
+                    self.down_small_reg.key(), self.combine_small.key())
+            if self.small_m_hybrid:
+                tail = tail + (self.gate_small.key(), self.down_small.key())
+            return base + ("small_m_fast", 3) + tail
         return base
 
     @cute.jit
@@ -1015,9 +1022,20 @@ class _StreamNvfp4DynRoute:
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
         if cutlass.const_expr(self.fast_small_m):
             self.prep_quant_small(x, ids_i, weights, meta, pair_row, pair_pos, gamma, xq, xs, xamax, rows, stream)
-            self.gate_small(xq, xs, pair_row, meta, w1, s1, w3, s3, xamax, gamma, act16, part, pairs, stream)
-            self.act_small(act16, part, meta, aq, a_s, aamax, pairs, stream)
-            self.down_small(aq, a_s, meta, w2, s2, y, aamax, pairs, stream)
+            if cutlass.const_expr(self.small_m_hybrid):
+                if rows <= Int32(3):
+                    self.gate_small_reg(xq, xs, pair_row, meta, w1, s1, w3, s3, xamax, gamma, act16, part, pairs, stream)
+                else:
+                    self.gate_small(xq, xs, pair_row, meta, w1, s1, w3, s3, xamax, gamma, act16, part, pairs, stream)
+                self.act_small(act16, part, meta, aq, a_s, aamax, pairs, stream)
+                if rows <= Int32(3):
+                    self.down_small_reg(aq, a_s, meta, w2, s2, y, aamax, pairs, stream)
+                else:
+                    self.down_small(aq, a_s, meta, w2, s2, y, aamax, pairs, stream)
+            else:
+                self.gate_small_reg(xq, xs, pair_row, meta, w1, s1, w3, s3, xamax, gamma, act16, part, pairs, stream)
+                self.act_small(act16, part, meta, aq, a_s, aamax, pairs, stream)
+                self.down_small_reg(aq, a_s, meta, w2, s2, y, aamax, pairs, stream)
             if cutlass.const_expr(not self.core_only):
                 self.combine_small(y, pair_pos, out, rows, stream)
         else:
