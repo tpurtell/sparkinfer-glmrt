@@ -64,7 +64,13 @@ def _glm_config() -> dict[str, object]:
     }
 
 
-@pytest.mark.parametrize("value", [_k3_config(), _glm_config()])
+def _mul1_config() -> dict[str, object]:
+    value = _glm_config()
+    value["codebook"] = "mul1"
+    return value
+
+
+@pytest.mark.parametrize("value", [_k3_config(), _glm_config(), _mul1_config()])
 def test_trellis_config_round_trips(value: dict[str, object]) -> None:
     config = TrellisConfig.from_dict(value)
     assert config.to_dict() == value

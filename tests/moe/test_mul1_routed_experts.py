@@ -1,0 +1,1059 @@
+"""Bitwise reference oracles for MUL1 (0x83DCD12D) and unchanged MCG (0xCBAC1FED) routed experts.
+
+Synthetic fixtures use GPTQModel ``exl3_lib``'s exact tensor contract:
+  - ``.trellis``: ``int16[K // 16, N // 16, 16 * bits]``
+  - ``.suh``: ``float16[K]``
+  - ``.svh``: ``float16[N]``
+  - ``.mul1``: ``int32`` scalar ``0x83DCD12D`` (or ``.mcg`` ``0xCBAC1FED``)
+
+Weight reconstruction runs exclusively on CPU through the kernel-independent
+``tests._reference.native_trellis.Reference`` MSB-first tail-biting decoder.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import Float32, Int32, Int64, Uint32
+import numpy as np
+import pytest
+import torch
+
+from b12x._lib.intrinsics import (
+    f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
+    pack_f32x2_to_f16x2,
+)
+from b12x._lib.runtime_control import kernel_resolution_guard
+from b12x.moe._shared.kernels.activations import (
+    SITU_DEFAULT_BETA,
+    SITU_DEFAULT_LINEAR_BETA,
+)
+from b12x.moe._shared.kernels.w4a16.host import (
+    make_w4a16_packed_buffers,
+    max_packed_route_slots,
+    packed_gemm_scratch_elements,
+)
+from b12x.moe._shared.kernels.w4a16.kernel import (
+    _W4A16GemmLaunch,
+    compile_w4a16_fused_moe,
+    compile_w4a16_gemm,
+    compile_w4a16_topk_sum,
+    run_trellis256_dense,
+    run_w4a16_moe,
+)
+from b12x.moe._shared.kernels.w4a16.prepare import (
+    prepare_trellis256_dense_weight,
+    prepare_trellis256_moe_weights,
+)
+from b12x.moe._shared.kernels.w4a16.route_pack import (
+    compile_w4a16_route_pack_launches,
+)
+import b12x.moe._shared.trellis_codebooks as _trellis_codebooks
+from tests._reference.native_trellis import Reference
+
+MCG_MULTIPLIER = _trellis_codebooks.MCG_MULTIPLIER
+MUL1_MULTIPLIER = getattr(_trellis_codebooks, "MUL1_MULTIPLIER", 0x83DCD12D)
+
+
+def _sm12x_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return major == 12 and minor in (0, 1)
+
+
+@dataclass(frozen=True)
+class SyntheticExl3Projection:
+    """One projection tensor bundle packed identically to GPTQModel's exl3_lib."""
+
+    trellis: torch.Tensor  # int16 [K // 16, N // 16, 16 * bits]
+    suh: torch.Tensor  # float16 [K]
+    svh: torch.Tensor  # float16 [N]
+    marker_name: str  # "mul1" or "mcg"
+    marker: torch.Tensor  # int32 scalar (0x83DCD12D or 0xCBAC1FED)
+
+
+def make_gptqmodel_exl3_projection(
+    in_features: int,
+    out_features: int,
+    bits: int,
+    *,
+    codebook: str,
+    seed: int,
+    device: torch.device,
+) -> SyntheticExl3Projection:
+    rng = np.random.default_rng(seed)
+    trellis_np = rng.integers(
+        -32768,
+        32768,
+        size=(in_features // 16, out_features // 16, 16 * bits),
+        dtype=np.int16,
+    )
+    suh_np = (0.75 + 0.5 * rng.random(in_features)) * rng.choice(
+        np.array([-1.0, 1.0]), size=in_features
+    )
+    svh_np = (0.75 + 0.5 * rng.random(out_features)) * rng.choice(
+        np.array([-1.0, 1.0]), size=out_features
+    )
+    marker_val = MUL1_MULTIPLIER if codebook == "mul1" else MCG_MULTIPLIER
+    return SyntheticExl3Projection(
+        trellis=torch.from_numpy(trellis_np).to(device=device),
+        suh=torch.from_numpy(suh_np.astype(np.float16)).to(device=device),
+        svh=torch.from_numpy(svh_np.astype(np.float16)).to(device=device),
+        marker_name=codebook,
+        marker=torch.tensor(np.int32(np.uint32(marker_val)), dtype=torch.int32, device=device),
+    )
+
+
+def decode_exl3_projection_cpu(proj: SyntheticExl3Projection, bits: int) -> torch.Tensor:
+    """Independent CPU decode of a ``[K/16, N/16, 16*bits]`` int16 ``.trellis`` tensor to FP16 ``[K, N]``."""
+    raw = proj.trellis.detach().cpu().contiguous().numpy()
+    k16, n16, width = raw.shape
+    assert width == 16 * bits
+    ref = Reference(proj.marker_name)
+    tiles = ref.decode_tiles(raw.tobytes(), bits)  # float32 [k16 * n16, 16, 16]
+    dense = (
+        tiles.astype(np.float16)
+        .reshape(k16, n16, 16, 16)
+        .transpose(0, 2, 1, 3)
+        .reshape(k16 * 16, n16 * 16)
+        .copy()
+    )
+    return torch.from_numpy(dense)
+
+
+_REF_GEMM_CACHE: dict[tuple[int, int], object] = {}
+_REF_HAD_CACHE: dict[int, object] = {}
+
+
+@cute.jit
+def _pack_half2_u32(v0_f16: cute.Tensor, idx0: Int32, idx1: Int32) -> Uint32:
+    return pack_f32x2_to_f16x2(
+        v0_f16[idx0].to(Float32),
+        v0_f16[idx1].to(Float32),
+    )
+
+
+def _run_exact_fp16_mma_gemm_2chain(
+    a_f16: torch.Tensor,
+    b_f16: torch.Tensor,
+    *,
+    tile_k: int = 64,
+) -> torch.Tensor:
+    """Standalone dense FP16 reference GEMM using ``m16n8k16`` (no trellis code).
+
+    Matches ``W4A16GemmKernel``'s ``m8`` 2-chain (``tile_k=64``) or 4-chain
+    (``tile_k=128``) warp-row accumulation order bit-for-bit on dense FP16 inputs.
+    """
+    assert a_f16.dtype == torch.float16 and b_f16.dtype == torch.float16
+    m, k = a_f16.shape
+    k_b, n = b_f16.shape
+    assert k == k_b and k % tile_k == 0 and n % 16 == 0
+    chains = tile_k // 32
+    assert chains in (2, 4)
+
+    a_pad_rows = ((max(m, 1) + 7) // 8) * 8
+    if a_pad_rows != m:
+        a_work = torch.zeros((a_pad_rows, k), dtype=torch.float16, device=a_f16.device)
+        a_work[:m].copy_(a_f16)
+    else:
+        a_work = a_f16.contiguous()
+    b_work = b_f16.contiguous()
+    c_work = torch.empty((a_pad_rows, n), dtype=torch.float16, device=a_f16.device)
+
+    a_flat = a_work.reshape(-1)
+    b_flat = b_work.reshape(-1)
+    c_flat = c_work.reshape(-1)
+
+    key = (k, n, chains, a_pad_rows)
+    if key not in _REF_GEMM_CACHE:
+        k_iters = k // tile_k
+
+        @cute.kernel
+        def _gemm_kernel(a_t: cute.Tensor, b_t: cute.Tensor, c_t: cute.Tensor):
+            lane, _, _ = cute.arch.thread_idx()
+            m_blk, n_tile, _ = cute.arch.block_idx()
+            r = Int32(2) * (lane % Int32(4))
+            c = lane // Int32(4)
+            m_row = m_blk * Int32(8) + c
+            n_col0 = n_tile * Int32(16) + c
+            n_col1 = n_col0 + Int32(8)
+
+            acc = cute.make_rmem_tensor((chains, 4), Float32)
+            for ch in cutlass.range_constexpr(chains):
+                for j in cutlass.range_constexpr(4):
+                    acc[ch, j] = Float32(0.0)
+
+            for kt in range(k_iters):
+                for ch in cutlass.range_constexpr(chains):
+                    for sub in cutlass.range_constexpr(2):
+                        k_base = Int32((kt * tile_k) + (ch * 32) + (sub * 16))
+                        k0 = k_base + r
+                        k1 = k0 + Int32(1)
+                        k2 = k0 + Int32(8)
+                        k3 = k0 + Int32(9)
+                        a0 = _pack_half2_u32(
+                            a_t,
+                            m_row * Int32(k) + k0,
+                            m_row * Int32(k) + k1,
+                        )
+                        a1 = _pack_half2_u32(
+                            a_t,
+                            m_row * Int32(k) + k2,
+                            m_row * Int32(k) + k3,
+                        )
+                        o0 = _pack_half2_u32(
+                            b_t,
+                            k0 * Int32(n) + n_col0,
+                            k1 * Int32(n) + n_col0,
+                        )
+                        o1 = _pack_half2_u32(
+                            b_t,
+                            k2 * Int32(n) + n_col0,
+                            k3 * Int32(n) + n_col0,
+                        )
+                        o2 = _pack_half2_u32(
+                            b_t,
+                            k0 * Int32(n) + n_col1,
+                            k1 * Int32(n) + n_col1,
+                        )
+                        o3 = _pack_half2_u32(
+                            b_t,
+                            k2 * Int32(n) + n_col1,
+                            k3 * Int32(n) + n_col1,
+                        )
+                        d0, d1, d2, d3 = f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
+                            acc[ch, 0],
+                            acc[ch, 1],
+                            acc[ch, 2],
+                            acc[ch, 3],
+                            o0,
+                            o2,
+                            o1,
+                            o3,
+                            a0,
+                            a1,
+                        )
+                        acc[ch, 0] = d0
+                        acc[ch, 1] = d1
+                        acc[ch, 2] = d2
+                        acc[ch, 3] = d3
+
+            s0 = acc[0, 0] + acc[1, 0]
+            s1 = acc[0, 1] + acc[1, 1]
+            s2 = acc[0, 2] + acc[1, 2]
+            s3 = acc[0, 3] + acc[1, 3]
+            if cutlass.const_expr(chains == 4):
+                s0 = (s0 + acc[2, 0]) + acc[3, 0]
+                s1 = (s1 + acc[2, 1]) + acc[3, 1]
+                s2 = (s2 + acc[2, 2]) + acc[3, 2]
+                s3 = (s3 + acc[2, 3]) + acc[3, 3]
+
+            out_r0 = m_blk * Int32(8) + Int32(2) * (lane % Int32(4))
+            out_r1 = out_r0 + Int32(1)
+            c_t[out_r0 * Int32(n) + n_col0] = s0.to(cutlass.Float16)
+            c_t[out_r1 * Int32(n) + n_col0] = s1.to(cutlass.Float16)
+            c_t[out_r0 * Int32(n) + n_col1] = s2.to(cutlass.Float16)
+            c_t[out_r1 * Int32(n) + n_col1] = s3.to(cutlass.Float16)
+
+        @cute.jit
+        def _launch_gemm(a_t: cute.Tensor, b_t: cute.Tensor, c_t: cute.Tensor, stream):
+            _gemm_kernel(a_t, b_t, c_t).launch(
+                grid=(a_pad_rows // 8, n // 16, 1),
+                block=(32, 1, 1),
+                stream=stream,
+            )
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        _REF_GEMM_CACHE[key] = cute.compile(
+            _launch_gemm,
+            from_dlpack(a_flat),
+            from_dlpack(b_flat),
+            from_dlpack(c_flat),
+            stream,
+        )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _REF_GEMM_CACHE[key](
+        from_dlpack(a_flat),
+        from_dlpack(b_flat),
+        from_dlpack(c_flat),
+        stream,
+    )
+    return c_work[:m]
+
+
+def _run_exact_had128_f32(x_f32: torch.Tensor) -> torch.Tensor:
+    """Exact warp-butterfly H128 matching ``had_hf_r_128_inner`` (``scale = 0.088388347648``)."""
+    orig_shape = x_f32.shape
+    assert orig_shape[-1] % 128 == 0
+    blocks = x_f32.contiguous().reshape(-1, 128)
+    num_blocks = int(blocks.shape[0])
+    out = torch.empty_like(blocks)
+    in_flat = blocks.reshape(-1)
+    out_flat = out.reshape(-1)
+
+    if num_blocks not in _REF_HAD_CACHE:
+        @cute.kernel
+        def _had_kernel(src: cute.Tensor, dst: cute.Tensor):
+            lane, _, _ = cute.arch.thread_idx()
+            blk, _, _ = cute.arch.block_idx()
+            base = blk * Int32(128) + lane * Int32(4)
+            v0 = src[base + Int32(0)].to(Float32)
+            v1 = src[base + Int32(1)].to(Float32)
+            v2 = src[base + Int32(2)].to(Float32)
+            v3 = src[base + Int32(3)].to(Float32)
+            s0 = v0 + v1
+            d0 = v0 - v1
+            s1 = v2 + v3
+            d1 = v2 - v3
+            h0 = s0 + s1
+            h1 = d0 + d1
+            h2 = s0 - s1
+            h3 = d0 - d1
+            for i in cutlass.range_constexpr(5):
+                st = 1 << i
+                p0 = cute.arch.shuffle_sync_bfly(h0, offset=st)
+                p1 = cute.arch.shuffle_sync_bfly(h1, offset=st)
+                p2 = cute.arch.shuffle_sync_bfly(h2, offset=st)
+                p3 = cute.arch.shuffle_sync_bfly(h3, offset=st)
+                if (lane & Int32(st)) != Int32(0):
+                    h0 = p0 - h0
+                    h1 = p1 - h1
+                    h2 = p2 - h2
+                    h3 = p3 - h3
+                else:
+                    h0 = p0 + h0
+                    h1 = p1 + h1
+                    h2 = p2 + h2
+                    h3 = p3 + h3
+            rs = Float32(0.088388347648)
+            dst[base + Int32(0)] = h0 * rs
+            dst[base + Int32(1)] = h1 * rs
+            dst[base + Int32(2)] = h2 * rs
+            dst[base + Int32(3)] = h3 * rs
+
+        @cute.jit
+        def _launch_had(src: cute.Tensor, dst: cute.Tensor, stream):
+            _had_kernel(src, dst).launch(
+                grid=(num_blocks, 1, 1),
+                block=(32, 1, 1),
+                stream=stream,
+            )
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        _REF_HAD_CACHE[num_blocks] = cute.compile(
+            _launch_had,
+            from_dlpack(in_flat),
+            from_dlpack(out_flat),
+            stream,
+        )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _REF_HAD_CACHE[num_blocks](from_dlpack(in_flat), from_dlpack(out_flat), stream)
+    return out.reshape(orig_shape)
+
+
+_REF_INTER_ACT_CACHE: dict[tuple[str, float | None, bool, int, int], object] = {}
+_REF_FC2_ROT_CACHE: dict[tuple[int, int], object] = {}
+
+
+@cute.jit
+def _had128_quad_ref(
+    v0: Float32, v1: Float32, v2: Float32, v3: Float32, lane: Int32
+):
+    s0 = v0 + v1
+    d0 = v0 - v1
+    s1 = v2 + v3
+    d1 = v2 - v3
+    h0 = s0 + s1
+    h1 = d0 + d1
+    h2 = s0 - s1
+    h3 = d0 - d1
+    for i in cutlass.range_constexpr(5):
+        st = 1 << i
+        p0 = cute.arch.shuffle_sync_bfly(h0, offset=st)
+        p1 = cute.arch.shuffle_sync_bfly(h1, offset=st)
+        p2 = cute.arch.shuffle_sync_bfly(h2, offset=st)
+        p3 = cute.arch.shuffle_sync_bfly(h3, offset=st)
+        if (lane & Int32(st)) != Int32(0):
+            h0 = p0 - h0
+            h1 = p1 - h1
+            h2 = p2 - h2
+            h3 = p3 - h3
+        else:
+            h0 = p0 + h0
+            h1 = p1 + h1
+            h2 = p2 + h2
+            h3 = p3 + h3
+    rs = Float32(0.088388347648)
+    return h0 * rs, h1 * rs, h2 * rs, h3 * rs
+
+
+def _run_exact_inter_rot_act_f16(
+    fc1_g_f16: torch.Tensor,
+    fc1_u_f16: torch.Tensor,
+    rot_row_f16: torch.Tensor,
+    *,
+    activation: str,
+    swiglu_limit: float | None,
+    fast_math: bool = True,
+) -> torch.Tensor:
+    """Single-kernel post-FC1 ``H128 -> * svg/svu -> gated_act -> * sd -> H128 -> fp16``."""
+    rows, intermediate = fc1_g_f16.shape
+    assert fc1_u_f16.shape == (rows, intermediate)
+    assert rot_row_f16.shape == (3 * intermediate,)
+    assert intermediate % 128 == 0
+    nblk = intermediate // 128
+    total_units = rows * nblk
+    out_f16 = torch.empty((rows, intermediate), dtype=torch.float16, device=fc1_g_f16.device)
+    g_flat = fc1_g_f16.contiguous().reshape(-1)
+    u_flat = fc1_u_f16.contiguous().reshape(-1)
+    r_flat = rot_row_f16.contiguous().reshape(-1)
+    o_flat = out_f16.reshape(-1)
+
+    key = (activation, swiglu_limit, bool(fast_math), rows, intermediate)
+    if key not in _REF_INTER_ACT_CACHE:
+        is_situ = activation == "situ"
+        is_post_clamp = activation == "silu_post_clamp"
+        has_limit = swiglu_limit is not None
+        limit_val = float(swiglu_limit or 0.0)
+        use_fast = bool(fast_math)
+
+        @cute.jit
+        def _eval_one(ig: Float32, iu: Float32, sd: Float32) -> Float32:
+            if cutlass.const_expr(has_limit):
+                lim = Float32(limit_val)
+                neg_lim = Float32(-limit_val)
+                if cutlass.const_expr(not is_post_clamp):
+                    if ig > lim:
+                        ig = lim
+                if iu < neg_lim:
+                    iu = neg_lim
+                if iu > lim:
+                    iu = lim
+            if cutlass.const_expr(use_fast):
+                e = cute.math.exp(-ig, fastmath=True)
+            else:
+                e = cute.math.exp(-ig, fastmath=False)
+            sig = Float32(1.0) / (Float32(1.0) + e)
+            if cutlass.const_expr(is_situ):
+                beta = Float32(SITU_DEFAULT_BETA)
+                lbeta = Float32(SITU_DEFAULT_LINEAR_BETA)
+                return (
+                    beta
+                    * cute.math.tanh(ig / beta, fastmath=use_fast)
+                    * sig
+                    * lbeta
+                    * cute.math.tanh(iu / lbeta, fastmath=use_fast)
+                    * sd
+                )
+            silu = ig * sig
+            if cutlass.const_expr(is_post_clamp and has_limit):
+                lim = Float32(limit_val)
+                if silu > lim:
+                    silu = lim
+            return silu * iu * sd
+
+        @cute.kernel
+        def _inter_act_kernel(
+            g_t: cute.Tensor, u_t: cute.Tensor, r_t: cute.Tensor, o_t: cute.Tensor
+        ):
+            lane, _, _ = cute.arch.thread_idx()
+            unit, _, _ = cute.arch.block_idx()
+            row = unit // Int32(nblk)
+            blk = unit - row * Int32(nblk)
+            col0 = blk * Int32(128) + lane * Int32(4)
+            base = row * Int32(intermediate) + col0
+            g0 = g_t[base + Int32(0)].to(Float32)
+            g1 = g_t[base + Int32(1)].to(Float32)
+            g2 = g_t[base + Int32(2)].to(Float32)
+            g3 = g_t[base + Int32(3)].to(Float32)
+            u0 = u_t[base + Int32(0)].to(Float32)
+            u1 = u_t[base + Int32(1)].to(Float32)
+            u2 = u_t[base + Int32(2)].to(Float32)
+            u3 = u_t[base + Int32(3)].to(Float32)
+            gh0, gh1, gh2, gh3 = _had128_quad_ref(g0, g1, g2, g3, lane)
+            uh0, uh1, uh2, uh3 = _had128_quad_ref(u0, u1, u2, u3, lane)
+            isz = Int32(intermediate)
+            down = isz + isz
+            ig0 = gh0 * r_t[col0 + Int32(0)].to(Float32)
+            ig1 = gh1 * r_t[col0 + Int32(1)].to(Float32)
+            ig2 = gh2 * r_t[col0 + Int32(2)].to(Float32)
+            ig3 = gh3 * r_t[col0 + Int32(3)].to(Float32)
+            iu0 = uh0 * r_t[col0 + isz + Int32(0)].to(Float32)
+            iu1 = uh1 * r_t[col0 + isz + Int32(1)].to(Float32)
+            iu2 = uh2 * r_t[col0 + isz + Int32(2)].to(Float32)
+            iu3 = uh3 * r_t[col0 + isz + Int32(3)].to(Float32)
+            sd0 = r_t[col0 + down + Int32(0)].to(Float32)
+            sd1 = r_t[col0 + down + Int32(1)].to(Float32)
+            sd2 = r_t[col0 + down + Int32(2)].to(Float32)
+            sd3 = r_t[col0 + down + Int32(3)].to(Float32)
+            a0 = _eval_one(ig0, iu0, sd0)
+            a1 = _eval_one(ig1, iu1, sd1)
+            a2 = _eval_one(ig2, iu2, sd2)
+            a3 = _eval_one(ig3, iu3, sd3)
+            o0, o1, o2, o3 = _had128_quad_ref(a0, a1, a2, a3, lane)
+            o_t[base + Int32(0)] = o0.to(cutlass.Float16)
+            o_t[base + Int32(1)] = o1.to(cutlass.Float16)
+            o_t[base + Int32(2)] = o2.to(cutlass.Float16)
+            o_t[base + Int32(3)] = o3.to(cutlass.Float16)
+
+        @cute.jit
+        def _launch_inter_act(
+            g_t: cute.Tensor, u_t: cute.Tensor, r_t: cute.Tensor, o_t: cute.Tensor, stream
+        ):
+            _inter_act_kernel(g_t, u_t, r_t, o_t).launch(
+                grid=(total_units, 1, 1),
+                block=(32, 1, 1),
+                stream=stream,
+            )
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        _REF_INTER_ACT_CACHE[key] = cute.compile(
+            _launch_inter_act,
+            from_dlpack(g_flat),
+            from_dlpack(u_flat),
+            from_dlpack(r_flat),
+            from_dlpack(o_flat),
+            stream,
+        )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _REF_INTER_ACT_CACHE[key](
+        from_dlpack(g_flat),
+        from_dlpack(u_flat),
+        from_dlpack(r_flat),
+        from_dlpack(o_flat),
+        stream,
+    )
+    return out_f16
+
+
+def _run_exact_fc2_rot_f32(
+    fc2_f16: torch.Tensor,
+    svh_f16: torch.Tensor,
+) -> torch.Tensor:
+    """Single-kernel post-FC2 ``H128(fc2_f16) * svh_f16`` in Float32."""
+    rows, hidden = fc2_f16.shape
+    assert svh_f16.shape == (hidden,)
+    assert hidden % 128 == 0
+    nblk = hidden // 128
+    total_units = rows * nblk
+    out_f32 = torch.empty((rows, hidden), dtype=torch.float32, device=fc2_f16.device)
+    in_flat = fc2_f16.contiguous().reshape(-1)
+    s_flat = svh_f16.contiguous().reshape(-1)
+    out_flat = out_f32.reshape(-1)
+    key = (rows, hidden)
+    if key not in _REF_FC2_ROT_CACHE:
+        @cute.kernel
+        def _fc2_rot_kernel(src: cute.Tensor, svh: cute.Tensor, dst: cute.Tensor):
+            lane, _, _ = cute.arch.thread_idx()
+            unit, _, _ = cute.arch.block_idx()
+            row = unit // Int32(nblk)
+            blk = unit - row * Int32(nblk)
+            col0 = blk * Int32(128) + lane * Int32(4)
+            base = row * Int32(hidden) + col0
+            v0 = src[base + Int32(0)].to(Float32)
+            v1 = src[base + Int32(1)].to(Float32)
+            v2 = src[base + Int32(2)].to(Float32)
+            v3 = src[base + Int32(3)].to(Float32)
+            h0, h1, h2, h3 = _had128_quad_ref(v0, v1, v2, v3, lane)
+            dst[base + Int32(0)] = h0 * svh[col0 + Int32(0)].to(Float32)
+            dst[base + Int32(1)] = h1 * svh[col0 + Int32(1)].to(Float32)
+            dst[base + Int32(2)] = h2 * svh[col0 + Int32(2)].to(Float32)
+            dst[base + Int32(3)] = h3 * svh[col0 + Int32(3)].to(Float32)
+
+        @cute.jit
+        def _launch_fc2_rot(src: cute.Tensor, svh: cute.Tensor, dst: cute.Tensor, stream):
+            _fc2_rot_kernel(src, svh, dst).launch(
+                grid=(total_units, 1, 1),
+                block=(32, 1, 1),
+                stream=stream,
+            )
+
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        _REF_FC2_ROT_CACHE[key] = cute.compile(
+            _launch_fc2_rot,
+            from_dlpack(in_flat),
+            from_dlpack(s_flat),
+            from_dlpack(out_flat),
+            stream,
+        )
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    _REF_FC2_ROT_CACHE[key](
+        from_dlpack(in_flat),
+        from_dlpack(s_flat),
+        from_dlpack(out_flat),
+        stream,
+    )
+    return out_f32
+
+
+def reference_exl3_routed_moe_bitwise(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gate_weights_f16: list[torch.Tensor],
+    up_weights_f16: list[torch.Tensor],
+    down_weights_f16: list[torch.Tensor],
+    gate_suh: torch.Tensor,
+    up_suh: torch.Tensor,
+    intermediate_rotations: torch.Tensor,
+    down_svh: torch.Tensor,
+    *,
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+    output_dtype: torch.dtype = torch.float32,
+    tile_k: int = 64,
+) -> torch.Tensor:
+    """Bitwise reference MoE over CPU-decoded ``Reference(codebook)`` FP16 expert weights."""
+    device = x.device
+    m, hidden = x.shape
+    _, top_k = topk_ids.shape
+    intermediate = int(gate_weights_f16[0].shape[1])
+
+    route_outputs = torch.zeros((m, top_k, hidden), dtype=torch.float32, device=device)
+    ids_cpu = topk_ids.detach().cpu().numpy()
+
+    for expert in sorted({int(e) for e in ids_cpu.reshape(-1) if int(e) >= 0}):
+        positions = np.argwhere(ids_cpu == expert)
+        token_idx = torch.from_numpy(positions[:, 0]).to(device=device, dtype=torch.long)
+        slot_idx = torch.from_numpy(positions[:, 1]).to(device=device, dtype=torch.long)
+
+        x_e = x.index_select(0, token_idx).to(torch.float16).to(torch.float32)
+        g_suh = gate_suh[0 if gate_suh.shape[0] == 1 else expert].to(torch.float32)
+        u_suh = up_suh[0 if up_suh.shape[0] == 1 else expert].to(torch.float32)
+
+        rot_g = _run_exact_had128_f32(
+            (x_e * g_suh).to(torch.float16).to(torch.float32)
+        ).to(torch.float16)
+        rot_u = _run_exact_had128_f32(
+            (x_e * u_suh).to(torch.float16).to(torch.float32)
+        ).to(torch.float16)
+
+        w_g = gate_weights_f16[expert].to(device=device)
+        w_u = up_weights_f16[expert].to(device=device)
+        w_d = down_weights_f16[expert].to(device=device)
+
+        fc1_g = _run_exact_fp16_mma_gemm_2chain(rot_g, w_g, tile_k=tile_k)
+        fc1_u = _run_exact_fp16_mma_gemm_2chain(rot_u, w_u, tile_k=tile_k)
+
+        act_f16 = _run_exact_inter_rot_act_f16(
+            fc1_g,
+            fc1_u,
+            intermediate_rotations[expert],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+        )
+
+        fc2_f16 = _run_exact_fp16_mma_gemm_2chain(act_f16, w_d, tile_k=tile_k)
+        d_svh_f16 = down_svh[0 if down_svh.shape[0] == 1 else expert]
+        fc2_rot = _run_exact_fc2_rot_f32(fc2_f16, d_svh_f16)
+        route_outputs[token_idx, slot_idx] = fc2_rot
+
+    acc = torch.zeros((m, hidden), dtype=torch.float32, device=device)
+    w_f32 = topk_weights.to(torch.float32)
+    for slot in range(top_k):
+        acc = torch.addcmul(acc, route_outputs[:, slot], w_f32[:, slot : slot + 1])
+    return acc.to(output_dtype)
+
+
+def assert_bitwise_equal(actual: torch.Tensor, expected: torch.Tensor, label: str = "") -> None:
+    assert actual.shape == expected.shape, f"{label}: shape {actual.shape} != {expected.shape}"
+    assert actual.dtype == expected.dtype, f"{label}: dtype {actual.dtype} != {expected.dtype}"
+    assert bool(torch.isfinite(actual).all()), f"{label}: non-finite values in actual"
+    assert int(actual.count_nonzero().item()) > 0, f"{label}: all-zero output"
+    bit_dtype = torch.uint16 if actual.element_size() == 2 else torch.uint32
+    a_bits = actual.contiguous().view(bit_dtype)
+    e_bits = expected.contiguous().view(bit_dtype)
+    if not torch.equal(a_bits, e_bits):
+        mismatches = int((a_bits != e_bits).sum().item())
+        max_abs = float((actual.float() - expected.float()).abs().max().item())
+        raise AssertionError(
+            f"{label}: {mismatches}/{actual.numel()} elements differ bitwise "
+            f"(max_abs={max_abs:.6e})"
+        )
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120 or SM121 GPU")
+@pytest.mark.parametrize("codebook", ["mul1", "mcg"])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+def test_w4a16_gemm_trellis256_bitwise_matches_reference(codebook: str, bits: int) -> None:
+    """Bitwise check of GPTQModel-packed ``.trellis`` through W4A16GemmKernel (no trellis_linear edits)."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    m, k, n = 8, 256, 256
+    proj = make_gptqmodel_exl3_projection(
+        k, n, bits, codebook=codebook, seed=10_000 + bits * 17 + (1 if codebook == "mul1" else 0), device=device
+    )
+    decoded_b = decode_exl3_projection_cpu(proj, bits).to(device=device)
+
+    unit_k = torch.ones((k,), dtype=torch.float16, device=device)
+    unit_n = torch.ones((n,), dtype=torch.float16, device=device)
+    weight = prepare_trellis256_dense_weight(
+        proj.trellis,
+        unit_k,
+        unit_n,
+        codebook=codebook,
+        params_dtype=torch.float16,
+    )
+    assert weight.trellis_codebook == codebook
+    assert weight.trellis.data_ptr() == proj.trellis.data_ptr()
+
+    rng = torch.Generator(device=device).manual_seed(20_000 + bits)
+    x = (torch.randn((m, k), generator=rng, device=device) * 0.125).to(torch.float16)
+    output = torch.empty((m, n), dtype=torch.float16, device=device)
+    gemm_output = torch.empty((m, n), dtype=torch.float16, device=device)
+    rotated_f16 = torch.empty((m, k), dtype=torch.float16, device=device)
+    c_tmp = torch.empty(
+        (
+            packed_gemm_scratch_elements(
+                size_n=n,
+                route_slots=m,
+                moe_block_size=8,
+                sms=sms,
+            ),
+        ),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    def identity_hadamard(src: torch.Tensor, dst: torch.Tensor, _ls, _rs, _sc: float) -> None:
+        dst.copy_(src)
+
+    compiled_gemm = compile_w4a16_gemm(
+        size_m=m,
+        size_n=n,
+        size_k=k,
+        num_experts=1,
+        top_k=1,
+        mul_topk_weights=False,
+        tile_n=128,
+        tile_k=64,
+        moe_block_size=8,
+        max_m_blocks=1,
+        element_dtype="fp16",
+        weight_layout="trellis_t256",
+        scale_format="e4m3_k32",
+        w13_layout="packed",
+        trellis_bits=bits,
+        trellis_codebook=codebook,
+        dense_route_fast_path=True,
+    )
+    launch = _W4A16GemmLaunch(kernel=compiled_gemm, c_tmp=c_tmp)
+    output.fill_(float("nan"))
+    actual = run_trellis256_dense(
+        x,
+        weight,
+        launch=launch,
+        execution_lut=None,
+        grid_cap=sms * compiled_gemm.blocks_per_sm,
+        output=output,
+        gemm_output=gemm_output,
+        rotated_f16=rotated_f16,
+        hadamard_128=identity_hadamard,
+    ).clone()
+    torch.cuda.synchronize(device)
+    expected = _run_exact_fp16_mma_gemm_2chain(x, decoded_b, tile_k=64)
+    assert_bitwise_equal(actual, expected, f"w4a16_gemm_{codebook}_k{bits}")
+
+
+@pytest.mark.skipif(not _sm12x_available(), reason="requires an SM120 or SM121 GPU")
+@pytest.mark.parametrize("codebook", ["mul1", "mcg"])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize(
+    ("activation", "swiglu_limit", "out_dtype"),
+    [
+        ("silu", None, torch.bfloat16),
+        ("silu", None, torch.float32),
+        ("silu_post_clamp", 7.0, torch.bfloat16),
+        ("situ", None, torch.bfloat16),
+    ],
+)
+def test_w4a16_fused_moe_routed_experts_bitwise_matches_reference(
+    codebook: str,
+    bits: int,
+    activation: str,
+    swiglu_limit: float | None,
+    out_dtype: torch.dtype,
+) -> None:
+    """Bitwise oracle for W4A16FusedMoeKernel across K2..K6, activations, and output dtypes."""
+    if (activation, out_dtype) != ("silu", torch.bfloat16) and bits not in (2, 4, 6):
+        pytest.skip("non-default activation/dtype spot-checked on K2, K4, K6")
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    experts, top_k = 4, 2
+    capacity_m = 8
+    hidden, intermediate = 256, 256
+    tile_config = (64, 128, 64, 128)
+
+    gate_projs = [
+        make_gptqmodel_exl3_projection(
+            hidden, intermediate, bits, codebook=codebook, seed=30_000 + bits * 100 + e * 3, device=device
+        )
+        for e in range(experts)
+    ]
+    up_projs = [
+        make_gptqmodel_exl3_projection(
+            hidden, intermediate, bits, codebook=codebook, seed=30_000 + bits * 100 + e * 3 + 1, device=device
+        )
+        for e in range(experts)
+    ]
+    down_projs = [
+        make_gptqmodel_exl3_projection(
+            intermediate, hidden, bits, codebook=codebook, seed=30_000 + bits * 100 + e * 3 + 2, device=device
+        )
+        for e in range(experts)
+    ]
+
+    w13 = torch.stack(
+        (
+            torch.stack([p.trellis for p in gate_projs], dim=0),
+            torch.stack([p.trellis for p in up_projs], dim=0),
+        ),
+        dim=0,
+    ).contiguous()
+    w2 = torch.stack([p.trellis for p in down_projs], dim=0).contiguous()
+    gate_suh = torch.stack([p.suh for p in gate_projs], dim=0).contiguous()
+    up_suh = torch.stack([p.suh for p in up_projs], dim=0).contiguous()
+    intermediate_rotations = torch.cat(
+        (
+            torch.stack([p.svh for p in gate_projs], dim=0),
+            torch.stack([p.svh for p in up_projs], dim=0),
+            torch.stack([p.suh for p in down_projs], dim=0),
+        ),
+        dim=1,
+    ).contiguous()
+    down_svh = torch.stack([p.svh for p in down_projs], dim=0).contiguous()
+
+    prepared = prepare_trellis256_moe_weights(
+        w13,
+        w2,
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_experts=experts,
+        activation=activation,
+        fc1_tile_n=tile_config[1],
+        fc2_tile_n=tile_config[3],
+        params_dtype=torch.float16,
+        w13_layout="trellis_t256_proj",
+        trellis_bits=bits,
+        codebook=codebook,
+        gate_suh=gate_suh,
+        up_suh=up_suh,
+        intermediate_rotations=intermediate_rotations,
+        down_svh=down_svh,
+        tile_config=tile_config,
+    )
+    assert prepared.trellis_codebook == codebook
+
+    gate_w = [decode_exl3_projection_cpu(p, bits) for p in gate_projs]
+    up_w = [decode_exl3_projection_cpu(p, bits) for p in up_projs]
+    down_w = [decode_exl3_projection_cpu(p, bits) for p in down_projs]
+
+    rng = torch.Generator(device="cpu").manual_seed(40_000 + bits * 13)
+    x_full = (torch.randn((capacity_m, hidden), generator=rng) * 0.05).to(
+        device=device, dtype=torch.bfloat16
+    )
+    ids_full = torch.stack(
+        [torch.randperm(experts, generator=rng)[:top_k] for _ in range(capacity_m)]
+    ).to(device=device, dtype=torch.int32)
+    weights_full = torch.softmax(
+        torch.randn((capacity_m, top_k), generator=rng, dtype=torch.float32), dim=-1
+    ).to(device=device)
+
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=capacity_m,
+        topk=top_k,
+        dtype=torch.float16,
+        device=device,
+        full_rotation=True,
+        block_size_m=8,
+    )
+    out_buf = torch.empty((capacity_m, hidden), dtype=out_dtype, device=device)
+
+    def run_live(live_m: int) -> torch.Tensor:
+        return run_w4a16_moe(
+            x_full[:live_m],
+            prepared,
+            weights_full[:live_m],
+            ids_full[:live_m],
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=out_buf[:live_m],
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            expert_counts=buffers.expert_counts,
+            route_block_size_m=8,
+            intermediate_rotation_scales=intermediate_rotations,
+            full_rotation=True,
+            suh_gate_table=gate_suh,
+            suh_up_table=up_suh,
+            svh_table=down_svh,
+            rotation_a_gate=buffers.rotation_a_gate,
+            rotation_a_up=buffers.rotation_a_up,
+        )
+
+    out_buf.fill_(float("nan"))
+    eager_full = run_live(capacity_m).clone()
+    torch.cuda.synchronize(device)
+
+    expected_full = reference_exl3_routed_moe_bitwise(
+        x_full,
+        ids_full,
+        weights_full,
+        gate_w,
+        up_w,
+        down_w,
+        gate_suh,
+        up_suh,
+        intermediate_rotations,
+        down_svh,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        output_dtype=out_dtype,
+        tile_k=tile_config[0],
+    )
+    assert_bitwise_equal(
+        eager_full,
+        expected_full,
+        f"fused_moe_{codebook}_k{bits}_{activation}_{out_dtype}",
+    )
+
+    # Precompiled capacity reuse across live M counts + CUDA graph capture/replay under frozen resolution.
+    if bits == 4 and activation == "silu" and out_dtype == torch.bfloat16:
+        props = torch.cuda.get_device_properties(device)
+        sms = int(props.multi_processor_count)
+        max_shared_mem = int(getattr(props, "shared_memory_per_block_optin", 101376))
+        route_slots_cap = max_packed_route_slots(capacity_m * top_k, 8, experts)
+        max_m_blocks = (route_slots_cap + 7) // 8
+        fused_launch = compile_w4a16_fused_moe(
+            size_m=capacity_m,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            num_experts=experts,
+            top_k=top_k,
+            activation=activation,
+            apply_router_weight_on_input=False,
+            zero_fc2_output=False,
+            moe_block_size=8,
+            max_m_blocks=max_m_blocks,
+            element_dtype="fp16",
+            fast_math=True,
+            sms=sms,
+            max_shared_mem=max_shared_mem,
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="trellis_t256_proj",
+            trellis_bits=bits,
+            trellis_codebook=codebook,
+            intermediate_rotation=True,
+            full_rotation=True,
+            rotation_input_dtype="bf16",
+            force_tile_config=tile_config,
+        )
+        topk_sum_launch = compile_w4a16_topk_sum(
+            m=capacity_m,
+            topk=top_k,
+            hidden_size=hidden,
+            element_dtype="fp16",
+            full_rotation=True,
+            full_rotation_output_dtype="bf16",
+            num_experts=experts,
+        )
+        route_pack_launches = compile_w4a16_route_pack_launches(
+            tokens=capacity_m,
+            topk=top_k,
+            block_size=8,
+            num_experts=experts,
+            ordinal=int(device.index),
+        )
+
+        def run_preplanned(live_m: int) -> torch.Tensor:
+            return run_w4a16_moe(
+                x_full[:live_m],
+                prepared,
+                weights_full[:live_m],
+                ids_full[:live_m],
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                intermediate_cache13=buffers.intermediate_cache13,
+                intermediate_cache2=buffers.intermediate_cache2,
+                output=out_buf[:live_m],
+                fc1_c_tmp=buffers.fc1_c_tmp,
+                fc2_c_tmp=buffers.fc2_c_tmp,
+                packed_route_indices=buffers.packed_route_indices,
+                block_expert_ids=buffers.block_expert_ids,
+                packed_route_count=buffers.packed_route_count,
+                expert_offsets=buffers.expert_offsets,
+                expert_counts=buffers.expert_counts,
+                fused_launch=fused_launch,
+                topk_sum_launch=topk_sum_launch,
+                route_pack_launches=route_pack_launches,
+                route_block_size_m=8,
+                intermediate_rotation_scales=intermediate_rotations,
+                full_rotation=True,
+                suh_gate_table=gate_suh,
+                suh_up_table=up_suh,
+                svh_table=down_svh,
+                rotation_a_gate=buffers.rotation_a_gate,
+                rotation_a_up=buffers.rotation_a_up,
+            )
+
+        with kernel_resolution_guard("frozen W4A16 precompiled capacity"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_preplanned(capacity_m)
+            for _ in range(2):
+                out_buf.fill_(float("nan"))
+                buffers.intermediate_cache13.fill_(float("nan"))
+                buffers.intermediate_cache2.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize(device)
+                assert_bitwise_equal(out_buf, expected_full, f"graph_{codebook}_k4")
+
+            x_saved = x_full.clone()
+            w_saved = weights_full.clone()
+            try:
+                for live_m in (1, 3, capacity_m):
+                    x_full.copy_(x_saved)
+                    weights_full.copy_(w_saved)
+                    if live_m < capacity_m:
+                        x_full[live_m:].fill_(float("nan"))
+                        weights_full[live_m:].fill_(float("nan"))
+                    out_buf.fill_(float("nan"))
+                    short = run_preplanned(live_m).clone()
+                    torch.cuda.synchronize(device)
+                    expected_live = reference_exl3_routed_moe_bitwise(
+                        x_saved[:live_m],
+                        ids_full[:live_m],
+                        w_saved[:live_m],
+                        gate_w,
+                        up_w,
+                        down_w,
+                        gate_suh,
+                        up_suh,
+                        intermediate_rotations,
+                        down_svh,
+                        activation=activation,
+                        swiglu_limit=swiglu_limit,
+                        output_dtype=out_dtype,
+                        tile_k=tile_config[0],
+                    )
+                    assert_bitwise_equal(short, expected_live, f"frozen_m{live_m}_{codebook}_k4")
+            finally:
+                x_full.copy_(x_saved)
+                weights_full.copy_(w_saved)
