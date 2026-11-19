@@ -19,7 +19,8 @@ from unittest.mock import patch
 def snapshot_prefill_sources(root: Path) -> tuple[str, int]:
     """Freeze runner and compiler-input provenance before loading CUDA modules."""
     paths = [root / "benchmarks/benchmark_mixed_trellis.py",
-             root / "benchmarks/spark_expert_replay.py", *(root / "b12x").rglob("*.py")]
+             root / "benchmarks/spark_expert_replay.py",
+             root / "benchmarks/spark_native_replay.py", *(root / "b12x").rglob("*.py")]
     entries = sorted(
         f"{path.relative_to(root).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
         for path in paths
@@ -569,7 +570,7 @@ def _make_kimi_replay_weights(torch, seed):
 
 
 class _AotReplayVariant:
-    def __init__(self, torch, directory, capacity, weights, geometry=None, io=None):
+    def __init__(self, torch, directory, capacity, weights, geometry=None, io=None, *, load_library=None):
         self.torch = torch
         self.capacity = capacity
         meta = json.loads((directory / 'v41_exl3.json').read_text())
@@ -612,11 +613,14 @@ class _AotReplayVariant:
         self.scalar = dict(scalar, grid_x=torch.cuda.get_device_properties('cuda').multi_processor_count
                            * meta['blocks_per_sm'])
         self.io = io(self, hidden, experts) if io else None
-        self.lib = c.CDLL(str(directory / 'libcuteafd_exl3.so'))
+        def load(path):
+            return load_library(path) if load_library is not None else c.CDLL(str(path))
+
+        self.lib = load(directory / 'libcuteafd_exl3.so')
         route = directory / meta['route_preparation']['manifest']
         check(hashlib.sha256(route.read_bytes()).hexdigest() == meta['route_preparation']['sha256'],
               'route manifest checksum mismatch')
-        self.route_lib = c.CDLL(str(route.parent / 'libv41_exl3_routes.so'))
+        self.route_lib = load(route.parent / 'libv41_exl3_routes.so')
         self.ctx, self.route_ctx = c.c_void_p(), c.c_void_p()
         self.destroy = bind(self.lib, 'destroy', [c.c_void_p], None)
         self.destroy_routes = bind(self.route_lib, 'routes_destroy', [c.c_void_p])
@@ -2509,6 +2513,8 @@ def benchmark_parser():
     )
     parser.add_argument("--spark-replay", type=Path, help="planned Spark replay fixture JSON")
     parser.add_argument("--aot-root", type=Path, help="sealed Spark rank packages root")
+    parser.add_argument("--replay-native-library", type=Path,
+                        help="explicit override for libcuteafd_native.so in --spark-replay")
     parser.add_argument("--replay-shape", action="append", help="replay fixture shape ID (repeatable)")
     parser.add_argument("--replay-reference", type=Path, help="require byte-identical outputs against a prior Spark replay JSON")
     parser.add_argument("--profile-replay", action="store_true", help="capture one NVTX-marked sample per cell under Nsight Compute")

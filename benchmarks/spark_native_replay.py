@@ -4,7 +4,6 @@ import ctypes as c
 import hashlib
 import json
 import math
-import os
 
 import torch
 
@@ -16,10 +15,6 @@ P, U, I, Q = c.c_void_p, c.c_uint32, c.c_int32, c.c_uint64
 def _read(path):
     body = path.read_bytes()
     return json.loads(body), hashlib.sha256(body).hexdigest()
-
-
-def _lib(root):
-    return c.CDLL(os.environ.get('CUTEAFD_NATIVE_LIB', str(root / 'lib/libcuteafd_native.so')))
 
 
 def _byte(count, value=None):
@@ -117,7 +112,8 @@ class _Fp8Wave(_Wave):
 
 
 class _Fp8Plan(_Plan):
-    def __init__(self, shape, root):
+    def __init__(self, shape, root, libraries):
+        self.libraries = libraries
         folder = root / shape['package']
         self.layout_name = shape['layout']
         manifest, self.digest = _read(folder / 'manifest.json')
@@ -147,9 +143,7 @@ class _Fp8Plan(_Plan):
             self.plane_sizes.append((nr * nc // (1 if self.storage == (6,) else 2), nr * stride))
 
     def _open(self, seed):
-        if hashlib.sha256(self.path.read_bytes()).hexdigest() != self.core:
-            raise ValueError('FP8 MoE library digest mismatch')
-        self.lib = c.CDLL(str(self.path))
+        self.lib = self.libraries.load(self.path, expected=self.core)
         sym = lambda suffix, types, result=I: _bind(self.lib, 'cuteafd_fp8moe_' + suffix, types, result)
         words = (U * 18)()
         _check(sym('info', [c.POINTER(U), U])(words, len(words)), 'FP8 MoE info')
@@ -180,7 +174,7 @@ class _Fp8Plan(_Plan):
         self.launch = sym('launch_core' if self.reply else 'launch', [P, U, c.POINTER(P), I, P])
         if self.reply:
             self.reply_layout = sym('reply_layout', [U, U, U, U, c.POINTER(Q), U])
-            self.programs = _ProgramTable(self.root)
+            self.programs = _ProgramTable(self.root, self.libraries)
             self.reply_spec = self.programs.specs[f'expert_reply_fp8_h{self.h}_k{self.topk}_{self.reply}']
         self.destroy = sym('destroy', [P], None)
         _check(sym('create', [c.POINTER(P)])(c.byref(self.context)), 'FP8 MoE create')
@@ -273,10 +267,12 @@ class _Mxfp4Wave(_Wave):
 
 
 class _Mxfp4Plan(_Plan):
-    def __init__(self, shape, root):
+    def __init__(self, shape, root, libraries):
+        self.libraries = libraries
         self.root = root
         self.role, self.reply = shape['role'], _reply_kind(shape)
         manifest, self.digest = _read(root / 'share/V41_EXPERT_TP_AOT.json')
+        self.native_digest = manifest.get('native_library_sha256')
         self.meta = manifest['native_packages'][self.role]
         self.h, self.n, self.e, self.topk = (shape[k] for k in ('hidden', 'intermediate', 'experts', 'top_k'))
         geom = self.meta['geometry']
@@ -292,9 +288,9 @@ class _Mxfp4Plan(_Plan):
         self.weights = None
 
     def _open(self, seed):
-        self.lib = _lib(self.root)
+        self.lib = self.libraries.native(expected=self.native_digest)
         if self.reply:
-            self.programs = _ProgramTable(self.root)
+            self.programs = _ProgramTable(self.root, self.libraries)
         _check(_bind(self.lib, 'cuteafd_set_expert_hidden', [U])(self.h), 'set expert hidden')
         family, role = self.role.split(':')
         prefix = f'cuteafd_{family}' + (f'_{role}' if role != 'spark' else '') + '_expert_'
@@ -330,20 +326,20 @@ class _Mxfp4Plan(_Plan):
                     tile=v.get('width'), route_block=v.get('group_rows'), ws=v['implementation'] == 'native_stream')
 
 
-def native_plan(shape, root):
+def native_plan(shape, root, libraries):
     fmt = shape['format']
     if fmt == 'mxfp4' and 'role' in shape:
-        return _Mxfp4Plan(shape, root)
+        return _Mxfp4Plan(shape, root, libraries)
     if fmt in ('mxfp4', 'mxfp8', 'nvfp4'):
-        return _Fp8Plan(shape, root)
+        return _Fp8Plan(shape, root, libraries)
     if fmt == 'exlr8':
-        return _Exlr8Plan(shape, root)
+        return _Exlr8Plan(shape, root, libraries)
     raise ValueError(f'unsupported native replay format: {fmt}')
 
 
 class _ProgramTable:
-    def __init__(self, root):
-        self.lib = lib = _lib(root)
+    def __init__(self, root, libraries):
+        self.lib = lib = libraries.native()
         self.specs = {p['name']: p for p in _read(root / 'share/PROGRAMS.json')[0]['programs']}
         count = _bind(lib, 'cuteafd_dsv4_program_count', [], U)
         info = _bind(lib, 'cuteafd_dsv4_program_info', [U, c.POINTER(_ProgramInfo)])
@@ -421,7 +417,8 @@ class _Exlr8Wave(_Wave):
 
 
 class _Exlr8Plan:
-    def __init__(self, shape, root):
+    def __init__(self, shape, root, libraries):
+        self.libraries = libraries
         self.root = root
         self.h, self.e, self.topk = (shape[k] for k in ('hidden', 'experts', 'top_k'))
         self.units, self.reply = shape['units'], _reply_kind(shape)
@@ -446,7 +443,7 @@ class _Exlr8Plan:
         return {m: 2 if m > self.specs[0][0]['capacity_rows'] else int(m >= self.threshold) for m in rows}
 
     def _open(self, seed):
-        self.programs = _ProgramTable(self.root)
+        self.programs = _ProgramTable(self.root, self.libraries)
         self.sms = torch.cuda.get_device_properties(0).multi_processor_count
         self.l2 = _bind(self.programs.lib, 'cuteafd_l2_cache_bytes', [], c.c_int64)()
         if self.l2 <= 0:
