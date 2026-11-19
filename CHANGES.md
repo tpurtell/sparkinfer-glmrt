@@ -1,11 +1,50 @@
 # Changes
 
-- SM120 native trellis body: prototype a 128x128 prefill tile for selected
-  BF16-ingress K6/K8 MCG projections. Preserve packed operands, H128 stages,
-  the ordered K128/K1024 accumulation and the launch ABI. Across selected
-  shapes, measured body time drops 10.1%/10.8% at 2752 rows (K6/K8) and
-  6.9%/7.3% at 4096, with 140 bitwise route and prefix checks. Existing
-  adjacent-band cliffs still need qualification; see tpurtell/cuteafd#2528.
+- SM120 native trellis body: use 128x128 prefill for selected BF16-ingress
+  K6/K8 MCG projections. Preserve packed operands, H128 stages, ordered
+  K128/K1024 accumulation, decode routing and the launch ABI. All 140
+  route and poisoned-prefix cases passed bitwise. At 2752 rows, median
+  body time dropped 10.1%/10.8% and local projection-chain time dropped
+  9.8%/10.0% (K6/K8). No server speedup is asserted. Expected changed
+  placement group: `programs` (SM120 dense trellis; Kimi, GLM, GLM Flash
+  and Step-5). See tpurtell/cuteafd#2528 for conditions and the full curve.
+
+| Shape | K6 body at 2752 (us/row) | K8 body at 2752 (us/row) | K6 2048 to 2240 body jump | K8 2048 to 2240 body jump |
+| --- | ---: | ---: | ---: | ---: |
+| `glmf_o` | 0.7092 -> 0.6370 | 0.6668 -> 0.6006 | +42.16% -> +57.75% | +35.83% -> +47.28% |
+| `glmf_o_tp2` | 0.3103 -> 0.2791 | 0.3118 -> 0.2806 | +13.91% -> +27.58% | +13.38% -> +27.91% |
+| `glmf_dense_gate_up` | 0.4815 -> 0.4435 | 0.4807 -> 0.4398 | +27.11% -> +25.15% | +29.03% -> +26.90% |
+| `glmf_dense_gate_up_tp2` | 0.2374 -> 0.2113 | 0.2396 -> 0.2113 | +0.43% -> -6.64% | +0.62% -> -6.18% |
+| `glmf_dense_down` | 0.4971 -> 0.4458 | 0.5083 -> 0.4547 | +35.49% -> +48.15% | +37.02% -> +46.61% |
+| `glmf_dense_down_tp2` | 0.2255 -> 0.2032 | 0.2359 -> 0.2099 | +4.90% -> +18.33% | +6.59% -> +19.60% |
+| `glm_o` | 1.0154 -> 0.9127 | 1.0634 -> 0.9630 | +13.50% -> +6.03% | +12.41% -> +6.03% |
+| `glm_o_tp2` | 0.4979 -> 0.4480 | 0.5425 -> 0.4822 | +26.88% -> +15.96% | +33.33% -> +22.89% |
+| `mla_o_owned` | 0.8986 -> 0.8074 | 0.9034 -> 0.8041 | +30.07% -> +34.87% | +13.28% -> +17.53% |
+| `step5_q` | 0.5016 -> 0.4592 | 0.5269 -> 0.4793 | +30.85% -> +28.47% | +36.90% -> +33.22% |
+| `step5_q_tp2` | 0.2374 -> 0.2151 | 0.2560 -> 0.2277 | +1.80% -> -7.14% | +8.26% -> -0.00% |
+| `step5_o` | 0.5038 -> 0.4487 | 0.5187 -> 0.4629 | +32.78% -> +45.78% | +37.26% -> +47.92% |
+| `step5_o_tp2` | 0.2322 -> 0.2076 | 0.2493 -> 0.2218 | +9.33% -> +22.05% | +8.95% -> +20.33% |
+| `muse_o_tp2` | 0.3051 -> 0.3044 | 0.3297 -> 0.3297 | +22.41% -> +22.10% | +29.55% -> +28.29% |
+
+The 2048-to-2240 step reflects the pre-existing 128-row M tiling: 16 full
+M tiles become 18, the last only half full; that is 12.5% more tile
+work for 9.375% more rows before discrete CTA waves, partial-row masks,
+and cache locality. Both paths have this step; the wider N tile does not
+remove it and a larger speedup at 2048 can make the measured jump bigger.
+The forward cliffs per width above 10% after the change are `glmf_o`,
+`glmf_o_tp2`, `glmf_dense_gate_up`, `glmf_dense_down`,
+`glmf_dense_down_tp2`, `glm_o_tp2`, `mla_o_owned`, `step5_q`, `step5_o`,
+and `step5_o_tp2` (10 per width). In fact they replace `glm_o`, which
+falls below +10%, with TP2 dense-down and TP2 O, whose already-positive
+steps cross +10% when 2048 gets faster. The only forward 2240-to-2688
+body flags in changed shapes are `glmf_dense_gate_up_tp2` and `step5_q_tp2`
+(K6/K8); K6 `glmf_dense_down` also has a reverse 2688-to-2240 flag.
+Counting either adjacent direction across the curve, 12/13 changed shapes
+flag in each candidate width (paired original: K6 12/13, K8 13/13).
+No broad row-curve pass is claimed. Original FP8 also steps on GLM Flash
+full O (0.2911 -> 0.3612 us/row for the K6 session). The three slightly
+slower K6 2240-row body cells are under 1% individually. `muse_o_tp2`
+is an unchanged control.
 
 - DeepSeek V4 Flash on SM121: accelerate the ordered native MXFP4 m4096
   expert wave for the N=256, 288 and 320 Spark shards with a single-CTA route
