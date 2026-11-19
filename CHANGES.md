@@ -7,7 +7,9 @@
   body time dropped 10.1%/10.8% and local projection-chain time dropped
   9.8%/10.0% (K6/K8). No server speedup is asserted. Expected changed
   placement group: `programs` (SM120 dense trellis; Kimi, GLM, GLM Flash
-  and Step-5). See tpurtell/cuteafd#2528 for conditions and the full curve.
+  and Step-5). All 14 legacy K8 128x128 head exports, including the Kimi
+  head and Inkling compact-head shards, retain identical SM120 instruction
+  bytes and ABI headers. See tpurtell/cuteafd#2528 for the full curve.
 
 | Shape | K6 body at 2752 (us/row) | K8 body at 2752 (us/row) | K6 2048 to 2240 body jump | K8 2048 to 2240 body jump |
 | --- | ---: | ---: | ---: | ---: |
@@ -21,7 +23,7 @@
 | `glm_o_tp2` | 0.4979 -> 0.4480 | 0.5425 -> 0.4822 | +26.88% -> +15.96% | +33.33% -> +22.89% |
 | `mla_o_owned` | 0.8986 -> 0.8074 | 0.9034 -> 0.8041 | +30.07% -> +34.87% | +13.28% -> +17.53% |
 | `step5_q` | 0.5016 -> 0.4592 | 0.5269 -> 0.4793 | +30.85% -> +28.47% | +36.90% -> +33.22% |
-| `step5_q_tp2` | 0.2374 -> 0.2151 | 0.2560 -> 0.2277 | +1.80% -> -7.14% | +8.26% -> -0.00% |
+| `step5_q_tp2` | 0.2374 -> 0.2151 | 0.2560 -> 0.2277 | +1.80% -> -7.14% | +8.26% -> 0.00% |
 | `step5_o` | 0.5038 -> 0.4487 | 0.5187 -> 0.4629 | +32.78% -> +45.78% | +37.26% -> +47.92% |
 | `step5_o_tp2` | 0.2322 -> 0.2076 | 0.2493 -> 0.2218 | +9.33% -> +22.05% | +8.95% -> +20.33% |
 | `muse_o_tp2` | 0.3051 -> 0.3044 | 0.3297 -> 0.3297 | +22.41% -> +22.10% | +29.55% -> +28.29% |
@@ -34,9 +36,9 @@ remove it and a larger speedup at 2048 can make the measured jump bigger.
 The forward cliffs per width above 10% after the change are `glmf_o`,
 `glmf_o_tp2`, `glmf_dense_gate_up`, `glmf_dense_down`,
 `glmf_dense_down_tp2`, `glm_o_tp2`, `mla_o_owned`, `step5_q`, `step5_o`,
-and `step5_o_tp2` (10 per width). In fact they replace `glm_o`, which
-falls below +10%, with TP2 dense-down and TP2 O, whose already-positive
-steps cross +10% when 2048 gets faster. The only forward 2240-to-2688
+and `step5_o_tp2` (10 per width). `glm_o` falls below +10%, while the
+already-positive steps for TP2 dense-down and TP2 O cross +10% as 2048
+gets faster. The only forward 2240-to-2688
 body flags in changed shapes are `glmf_dense_gate_up_tp2` and `step5_q_tp2`
 (K6/K8); K6 `glmf_dense_down` also has a reverse 2688-to-2240 flag.
 Counting either adjacent direction across the curve, 12/13 changed shapes
