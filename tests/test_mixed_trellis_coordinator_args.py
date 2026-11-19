@@ -18,6 +18,8 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
     runner = tmp_path / "benchmarks/benchmark_mixed_trellis.py"
     runner.parent.mkdir()
     runner.write_text("runner-v1")
+    replay = runner.with_name("spark_expert_replay.py")
+    replay.write_text("replay-v1")
     package = tmp_path / "b12x"
     package.mkdir()
     first, second = package / "a.py", package / "z.py"
@@ -30,13 +32,16 @@ def test_source_provenance_is_frozen_before_cuda_imports(tmp_path, monkeypatch):
     snapshot = scope["snapshot_prefill_sources"]
     frozen = snapshot(tmp_path)
     entries = sorted(f"{path.relative_to(tmp_path).as_posix()}:{hashlib.sha256(path.read_bytes()).hexdigest()}\n"
-                     for path in (runner, first, second))
-    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 3)
+                     for path in (runner, replay, first, second))
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 4)
     monkeypatch.setattr(Path, "rglob", lambda self, pattern: iter((second, first)))
     assert snapshot(tmp_path) == frozen
+    replay.write_text("replay-v2")
+    assert snapshot(tmp_path) != frozen
+    replay.write_text("replay-v1")
     first.write_text("a-v2")
     assert snapshot(tmp_path) != frozen
-    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 3)
+    assert frozen == (hashlib.sha256("".join(entries).encode()).hexdigest(), 4)
     startup = next(i for i, node in enumerate(TREE.body) if isinstance(node, ast.Assign)
                    and any(isinstance(target, ast.Tuple)
                            and any(isinstance(name, ast.Name) and name.id == "PREFILL_SOURCE_SHA256"
