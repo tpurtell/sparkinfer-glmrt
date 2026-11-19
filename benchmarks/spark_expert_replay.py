@@ -217,7 +217,7 @@ def _run_replay(args, shape, rows, source, selected, prefixes, make, metadata):
             v = variants[cap]
             v.poison_output()
             v.run(m)
-            first = v.output(1).view(torch.int16)
+            first = v.output(1).view(torch.uint8)
             if prefix is None:
                 prefix = first.clone()
             prefix_exact[m] = torch.equal(prefix, first)
@@ -228,12 +228,12 @@ def _run_replay(args, shape, rows, source, selected, prefixes, make, metadata):
             v.poison_output()
             v.run(m)
             out = v.output(m).clone()
-            if not bool(out.isfinite().all() and out.count_nonzero()):
+            if not bool(out.count_nonzero()) or out.dtype != torch.uint8 and not bool(out.isfinite().all()):
                 raise ValueError(f'invalid eager output at m{m}')
             graph = graphs[m] = v.capture(m)
             v.poison_output()
             graph.replay()
-            if not torch.equal(out.view(torch.int16), v.output(m).view(torch.int16)):
+            if not torch.equal(out.view(torch.uint8), v.output(m).view(torch.uint8)):
                 raise ValueError(f'eager/graph bit mismatch at m{m}')
             distinct = sorted({expert for row in ids[:m] for expert in row})
             cells[m] = dict(rows=m, capacity=v.capacity, distinct=len(distinct), samples_us=[],
