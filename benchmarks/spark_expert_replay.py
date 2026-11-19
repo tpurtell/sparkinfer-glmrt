@@ -166,14 +166,36 @@ def _replay_buckets(shape, root, rows):
 
 
 def _run_shape(args, shape, rows, cls, source):
+    if shape['format'] != 'exl3':
+        from spark_native_replay import native_plan
+        plan = native_plan(shape, args.aot_root)
+        return _run_replay(args, shape, rows, source, plan.select(rows),
+                           plan.select(tuple(shape.get('prefix_rows', (1, 8, 80)))),
+                           plan.make, plan.metadata)
     paths, metas, selected = _replay_buckets(shape, args.aot_root, rows)
-    ids = routes(shape, max(max(rows), 80), args.seed)
     resolved = [shape[k] for k in ('hidden', 'intermediate', 'experts', 'top_k', 'bits')]
-    h, _, e, top_k, _ = resolved
+    h, _, e, _, _ = resolved
     lib = c.CDLL(os.environ.get('CUTEAFD_NATIVE_LIB', '/opt/cuteafd/lib/libcuteafd_native.so'))
     _check(_bind(lib, 'cuteafd_set_expert_hidden', [c.c_uint32])(h), 'set expert hidden')
     io = lambda v, hidden, experts: _SparkIO(v, hidden, experts, lib, shape['epilogue'])
     weights = _weights(shape, args.seed)
+
+    def make(cap, _seed):
+        return cls(torch, paths[cap], cap, weights, resolved, io)
+
+    def metadata(cap, _rows, distinct):
+        return dict(weight_bytes=sum(h * shape['expert_widths'][expert] * sum(
+                        p[expert] for p in shape['projection_bits']) // 8 for expert in distinct),
+                    manifest_sha256=hashlib.sha256((paths[cap] / 'v41_exl3.json').read_bytes()).hexdigest(),
+                    core_sha256=metas[cap]['objects'][0]['object_sha256'], tile=metas[cap]['tile'],
+                    route_block=metas[cap].get('route_block', 8), ws=bool(metas[cap].get('warp_specialized')))
+
+    return _run_replay(args, shape, rows, source, selected, {1: 1, 8: 80, 80: 80}, make, metadata)
+
+
+def _run_replay(args, shape, rows, source, selected, prefixes, make, metadata):
+    ids = routes(shape, max(max(rows), max(prefixes), 80), args.seed)
+    h, top_k = shape['hidden'], shape['top_k']
     rng = torch.Generator(device='cuda').manual_seed(args.seed + 1)
     x = (torch.randn((len(ids), h), device='cuda', generator=rng) * 2.).to(torch.float8_e4m3fn).view(torch.uint8)
     x = torch.cat((x, torch.full((len(ids), h // 32), 121, device='cuda', dtype=torch.uint8)), dim=1)
@@ -186,40 +208,37 @@ def _run_shape(args, shape, rows, cls, source):
     graphs = {}
     cells = {}
     try:
-        for cap in sorted(set(selected.values()) | {1, 80}):
-            variants[cap] = cls(torch, paths[cap], cap, weights, resolved, io)
-            if cap in selected.values():
-                variants[cap].load(data, min(cap, len(ids)))
-        # Recheck bitwise single-row prefix at 1, 8 and 80 active rows.
-        variants[1].load(data, 1)
-        variants[80].load(data, 80)
-        variants[1].run(1)
-        prefix = variants[1].output(1).clone().view(torch.int16)
-        for m in (1, 8, 80):
-            variants[80].poison_output()
-            variants[80].run(m)
-            if not torch.equal(prefix, variants[80].output(1).view(torch.int16)):
-                raise ValueError(f'canonical m1/m8/m80 prefix mismatch at {m}')
+        for cap in sorted(set(selected.values()) | set(prefixes.values())):
+            v = variants[cap] = make(cap, args.seed)
+            v.load(data, min(v.capacity, len(ids)))
+        prefix = None
+        prefix_exact = {}
+        for m, cap in prefixes.items():
+            v = variants[cap]
+            v.poison_output()
+            v.run(m)
+            first = v.output(1).view(torch.uint8)
+            if prefix is None:
+                prefix = first.clone()
+            prefix_exact[m] = torch.equal(prefix, first)
+        if shape['format'] == 'exl3' and not all(prefix_exact.values()):
+            raise ValueError(f'canonical m1/m8/m80 prefix mismatch: {prefix_exact}')
         for m, cap in selected.items():
             v = variants[cap]
             v.poison_output()
             v.run(m)
             out = v.output(m).clone()
-            if not bool(out.isfinite().all() and out.count_nonzero()):
+            if not bool(out.count_nonzero()) or out.dtype != torch.uint8 and not bool(out.isfinite().all()):
                 raise ValueError(f'invalid eager output at m{m}')
             graph = graphs[m] = v.capture(m)
             v.poison_output()
             graph.replay()
-            if not torch.equal(out.view(torch.int16), v.output(m).view(torch.int16)):
+            if not torch.equal(out.view(torch.uint8), v.output(m).view(torch.uint8)):
                 raise ValueError(f'eager/graph bit mismatch at m{m}')
             distinct = sorted({expert for row in ids[:m] for expert in row})
-            weight_bytes = sum(h * shape['expert_widths'][expert] * sum(
-                p[expert] for p in shape['projection_bits']) // 8 for expert in distinct)
-            cells[m] = dict(rows=m, capacity=cap, distinct=len(distinct), weight_bytes=weight_bytes,
-                            samples_us=[], digest=hashlib.sha256(out.view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
-                            manifest_sha256=hashlib.sha256((paths[cap] / 'v41_exl3.json').read_bytes()).hexdigest(),
-                            core_sha256=metas[cap]['objects'][0]['object_sha256'], tile=metas[cap]['tile'],
-                            route_block=metas[cap].get('route_block', 8), ws=bool(metas[cap].get('warp_specialized')))
+            cells[m] = dict(rows=m, capacity=v.capacity, distinct=len(distinct), samples_us=[],
+                            digest=hashlib.sha256(out.view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+                            **metadata(cap, m, distinct))
             for _ in range(args.warmup if not args.profile_replay else 1):
                 graph.replay()
         order = list(rows)
@@ -257,8 +276,9 @@ def _run_shape(args, shape, rows, cls, source):
                 cell.update(median_us=statistics.median(samples), samples=len(samples),
                             min_us=min(samples), max_us=max(samples))
         return dict(id=shape['id'], source_sha256=source, device=torch.cuda.get_device_name(),
-                    routes_sha256=hashlib.sha256(json.dumps(ids).encode()).hexdigest(), cells=list(cells.values()))
+                    prefix_exact=prefix_exact, routes_sha256=hashlib.sha256(json.dumps(ids).encode()).hexdigest(), cells=list(cells.values()))
     finally:
+        torch.cuda.synchronize()
         for graph in graphs.values():
             graph.reset()
         for variant in variants.values():
@@ -274,10 +294,17 @@ def replay_spark_shapes(args, cls, source):
     if len(shapes) != 1:
         raise ValueError('select exactly one --replay-shape per process (native hidden size is process-global)')
     shape = shapes[0]
-    if shape['format'] != 'exl3' or not rows or rows[0] < 1:
+    if not rows or rows[0] < 1:
         raise ValueError('unsupported replay format or invalid live rows')
     if args.preflight_only:
-        print(json.dumps(_replay_buckets(shape, args.aot_root, rows)[2]))
+        if shape['format'] == 'exl3':
+            plan = _replay_buckets(shape, args.aot_root, rows)[2]
+        else:
+            from spark_native_replay import native_plan
+            native = native_plan(shape, args.aot_root)
+            native.select(tuple(shape.get('prefix_rows', (1, 8, 80))))
+            plan = native.select(rows)
+        print(json.dumps(plan))
         return
     if torch.cuda.get_device_capability() != (12, 1):
         raise ValueError('Spark AOT replay requires SM121')
