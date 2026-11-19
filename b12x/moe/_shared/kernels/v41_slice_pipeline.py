@@ -11,6 +11,12 @@ import cuda.bindings.driver as cuda
 from cutlass import Int32, Int64, Float32
 from b12x._lib.utils import runtime_num_sm
 from b12x.moe._shared.kernels.v41_route_plan import V41RoutePlan, V41SliceReduce
+from b12x.moe._shared.kernels.w4a8_dsv4f_prefill import (
+    Dsv4fNarrowFc1,
+    Dsv4fNarrowFc2,
+    Dsv4fNarrowPrep,
+    dsv4f_narrow_prefill_qualified,
+)
 from b12x.moe._shared.kernels.w4a8_v41_slice import (
     V41FusedSliceKernel,
     V41SliceFc1Kernel,
@@ -45,6 +51,40 @@ class V41SlicePipeline:
                                          hidden=hidden, exact_storage=exact_storage, fc2_n_splits=fc2_n_splits,
                                          scale_codes=scale_codes)
         self.reduce = V41SliceReduce(width, capacity, topk, intermediate=intermediate, hidden=hidden)
+        self.narrow_prefill = dsv4f_narrow_prefill_qualified(
+            capacity=capacity,
+            width=width,
+            atomic_tokens=atomic_tokens,
+            experts=experts,
+            topk=topk,
+            intermediate=intermediate,
+            hidden=hidden,
+            fc2_n_splits=fc2_n_splits,
+            scale_codes=scale_codes,
+            fc1_k_splits=fc1_k_splits,
+        )
+        if self.narrow_prefill:
+            self.narrow_prep = Dsv4fNarrowPrep(capacity=capacity, experts=experts, topk=topk)
+            self.narrow_fc1 = Dsv4fNarrowFc1(
+                capacity=capacity,
+                topk=topk,
+                experts=experts,
+                hidden=hidden,
+                intermediate=intermediate,
+                exact_storage=exact_storage,
+            )
+            self.narrow_fc2 = Dsv4fNarrowFc2(
+                capacity=capacity,
+                topk=topk,
+                experts=experts,
+                hidden=hidden,
+                intermediate=intermediate,
+                exact_storage=exact_storage,
+            )
+        else:
+            self.narrow_prep = None
+            self.narrow_fc1 = None
+            self.narrow_fc2 = None
 
     @cute.jit
     def __call__(
@@ -69,42 +109,59 @@ class V41SlicePipeline:
         rows: Int32,
         stream: cuda.CUstream,
     ):
-        self.publish(live, rows).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
-        self.plan(
-            ids,
-            routing,
-            live,
-            packed,
-            counts,
-            prefixes,
-            metadata,
-            grouped,
-            inverse,
-            stream,
-        )
-        groups = max(1, min(rows * self.topk, self.experts + max(rows * self.topk - self.experts, 0) // 16))
-        if cutlass.const_expr(self.atomic_tokens):
-            self.clear_output(output, rows).launch(
-                grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
-                block=(256, 1, 1), stream=stream,
+        if cutlass.const_expr(self.narrow_prefill):
+            clamped = max(Int32(0), min(rows, Int32(self.capacity)))
+            pairs = clamped * Int32(self.topk)
+            max_tiles = max(
+                Int32(1),
+                (pairs + Int32(127)) // Int32(128) + min(pairs, Int32(self.experts)),
             )
-            self.compute(
-                x,
-                xs,
-                w13,
-                s13,
-                w2,
-                s2,
-                grouped,
-                output,
-                rows,
-                stream,
-                metadata,
-                groups,
+            self.narrow_prep(
+                ids, routing, live, counts, prefixes, metadata, grouped, rows, stream
+            )
+            self.narrow_fc1(
+                x, xs, w13, s13, counts, prefixes, metadata, grouped, partial, max_tiles, stream
+            )
+            self.narrow_fc2(
+                w2, s2, counts, prefixes, metadata, partial, output, max_tiles, stream
             )
         else:
-            self.fc1(x, xs, w13, s13, grouped, partial, metadata, groups, stream)
-            self.fc2(w2, s2, partial, output, metadata, inverse, live, groups, stream)
+            self.publish(live, rows).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+            self.plan(
+                ids,
+                routing,
+                live,
+                packed,
+                counts,
+                prefixes,
+                metadata,
+                grouped,
+                inverse,
+                stream,
+            )
+            groups = max(1, min(rows * self.topk, self.experts + max(rows * self.topk - self.experts, 0) // 16))
+            if cutlass.const_expr(self.atomic_tokens):
+                self.clear_output(output, rows).launch(
+                    grid=(max(1, (rows * self.hidden + 255) // 256), 1, 1),
+                    block=(256, 1, 1), stream=stream,
+                )
+                self.compute(
+                    x,
+                    xs,
+                    w13,
+                    s13,
+                    w2,
+                    s2,
+                    grouped,
+                    output,
+                    rows,
+                    stream,
+                    metadata,
+                    groups,
+                )
+            else:
+                self.fc1(x, xs, w13, s13, grouped, partial, metadata, groups, stream)
+                self.fc2(w2, s2, partial, output, metadata, inverse, live, groups, stream)
 
     @cute.kernel
     def publish(self, live: cute.Tensor, rows: Int32):
