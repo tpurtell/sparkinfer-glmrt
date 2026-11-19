@@ -401,3 +401,271 @@ def test_compact_pair_remap_preserves_planner_ownership(tmp_path, bits):
             assert new["bits"] == bits[new["tier"]]
             assert new["payload_word_offset"] == expected[4 + p][after["combined_local"]]
             assert (new["tier"], new["tier_local"]) == (old["tier"], old["tier_local"])
+
+
+def test_mul1_coordinator_arm_and_legacy_defaults() -> None:
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    default_args = bench.benchmark_parser().parse_args([
+        "--prefill-family", "glm", "--role", "coordinator", "--output", "out.json"
+    ])
+    assert default_args.codebook == "mcg" and default_args.compare_aot_root is None
+    props = SimpleNamespace(multi_processor_count=188, shared_memory_per_block_optin=101376)
+    mcg_opts = bench.coordinator_compile_options("rtx-tp2", 256, {}, props, "glm")
+    assert mcg_opts["trellis_codebook"] == "mcg"
+    name, parsed = bench.parse_coordinator_arm("mul1_ws:mode=ws,route_block=64,dynamic=1,codebook=mul1")
+    assert name == "mul1_ws" and parsed["codebook"] == "mul1"
+    mul1_opts = bench.coordinator_compile_options("rtx-tp2", 256, parsed, props, "glm")
+    assert mul1_opts["trellis_codebook"] == "mul1"
+    with pytest.raises(bench.argparse.ArgumentTypeError):
+        bench.parse_coordinator_arm("bad_cb:mode=ws,codebook=sqg")
+    with pytest.raises(ValueError, match="codebook"):
+        bench.coordinator_compile_options("rtx-tp2", 256, {}, props, "glm", codebook="sqg")
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+def test_mul1_oracle_decoder_matches_independent_reference_bitwise(bits: int) -> None:
+    bench = _load_benchmark_module()
+    rows, columns = 32, 48
+    payload = torch.randint(
+        -(1 << 31), (1 << 31) - 1, (rows // 16, columns // 16, 8 * bits),
+        dtype=torch.int32, generator=torch.Generator().manual_seed(91 + bits),
+    )
+    actual = bench.decode_mcg_matrix(payload.flatten(), rows, columns, bits, "mul1")
+    mcg_actual = bench.decode_mcg_matrix(payload.flatten(), rows, columns, bits)
+    assert not torch.equal(actual, mcg_actual)
+
+    # Independent bit-plane GPTQModel MUL1 reconstruction (0x83DCD12D, 0x6400, 0x1EEE, 0xC931).
+    raw_i16 = payload.view(torch.int16)
+    num_tiles = (rows // 16) * (columns // 16)
+    words = raw_i16.contiguous().view(torch.uint16).reshape(num_tiles, 16 * bits).to(torch.int32) & 0xFFFF
+    swapped = words.reshape(num_tiles, 8 * bits, 2).flip(-1).reshape(num_tiles, 16 * bits)
+    bit_shifts = torch.arange(15, -1, -1, dtype=torch.int32)
+    bit_plane = ((swapped.unsqueeze(-1) >> bit_shifts) & 1).reshape(num_tiles, 256 * bits)
+    ends = torch.arange(1, 257, dtype=torch.long) * bits - 1
+    shifts = torch.arange(16, dtype=torch.long)
+    idx = (ends[:, None] - shifts[None, :]) % (256 * bits)
+    states = ((bit_plane[:, idx].to(torch.int64) << shifts[None, None, :]).sum(dim=-1) & 0xFFFF).to(torch.int64)
+    prod = (states * 0x83DCD12D) & 0xFFFFFFFF
+    bsum = (prod & 0xFF) + ((prod >> 8) & 0xFF) + ((prod >> 16) & 0xFF) + ((prod >> 24) & 0xFF)
+    h = (0x6400 + bsum).to(torch.uint16).view(torch.float16).to(torch.float64)
+    kinv = float(torch.tensor([0x1EEE], dtype=torch.uint16).view(torch.float16).item())
+    kbias = float(torch.tensor([0xC931], dtype=torch.uint16).view(torch.float16).item())
+    vals = (h * kinv + kbias).to(torch.float16).to(torch.float32)
+    row_idx, col_idx = [], []
+    for t in range(32):
+        r, c = 2 * (t % 4), t // 4
+        for rr, cc in ((r, c), (r + 1, c), (r + 8, c), (r + 9, c),
+                       (r, c + 8), (r + 1, c + 8), (r + 8, c + 8), (r + 9, c + 8)):
+            row_idx.append(rr)
+            col_idx.append(cc)
+    tiles = torch.empty((num_tiles, 16, 16), dtype=torch.float32)
+    tiles[:, torch.tensor(row_idx), torch.tensor(col_idx)] = vals
+    expected = tiles.reshape(rows // 16, columns // 16, 16, 16).permute(0, 2, 1, 3).reshape(rows, columns).contiguous()
+    assert torch.equal(actual, expected)
+
+
+def test_mixed_codebook_oracle_case_qualifies_own_codebooks_and_reports_deltas(monkeypatch) -> None:
+    import contextlib
+    import sys
+    import types
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    noise_module = types.ModuleType("benchmarks.benchmark_exlr8_a16")
+    noise_module.k4_noise_summary = lambda values, control: {"seen": sorted(values)}
+    runtime_module = types.ModuleType("b12x._lib.runtime_control")
+    runtime_module.kernel_resolution_guard = lambda label: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, noise_module.__name__, noise_module)
+    monkeypatch.setitem(sys.modules, runtime_module.__name__, runtime_module)
+    monkeypatch.setitem(bench.COORDINATOR_FAMILIES, "ml4", dict(hidden=128, experts=2, swiglu_limit=None))
+
+    generator = torch.Generator().manual_seed(7)
+    words = 8 * 8 * 8 * 4
+    tiers = [
+        SimpleNamespace(
+            num_experts=2, intermediate_size=128, trellis_bits=4,
+            w13=torch.randint(-(1 << 31), (1 << 31) - 1, (4 * words,), generator=generator, dtype=torch.int32),
+            w2=torch.randint(-(1 << 31), (1 << 31) - 1, (2 * words,), generator=generator, dtype=torch.int32),
+            w13_global_scale=torch.ones(2), w2_global_scale=torch.ones(2),
+        )
+        for _ in range(2)
+    ]
+    descriptors = torch.tensor([[0, 512, -1, -1], [0, 512, -1, -1], [0, 512, -1, -1]], dtype=torch.int32).flatten()
+    rotations = SimpleNamespace(
+        intermediate=torch.ones((4, 384)),
+        gate_suh=torch.ones((4, 128)),
+        up_suh=torch.ones((4, 128)),
+        down_svh=torch.ones((4, 128)),
+    )
+    layer = (*tiers, torch.tensor([0, 1], dtype=torch.int32), descriptors, rotations)
+    decoded = torch.randn((4, 128), generator=generator) * 0.25
+    ids = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]], dtype=torch.int32)
+    weights = torch.full((4, 2), 0.5)
+
+    mcg_ref = bench.coordinator_f32_oracle(layer, decoded, ids, weights, "ml4", "mcg")
+    mul1_ref = bench.coordinator_f32_oracle(layer, decoded, ids, weights, "ml4", "mul1")
+    assert not torch.equal(mcg_ref, mul1_ref)
+
+    def make_state():
+        ws = SimpleNamespace(output=torch.zeros((4, 128)), fc1=torch.zeros(4), activated=torch.zeros(4),
+                             packed_route_indices=torch.zeros(64, dtype=torch.int32),
+                             block_expert_ids=torch.zeros(8, dtype=torch.int32),
+                             packed_route_count=torch.zeros(1, dtype=torch.int32))
+        bind = [SimpleNamespace(launch=SimpleNamespace(moe_block_size=8))]
+        return ws, bind
+
+    states = {"coop": make_state(), "mul1_arm": make_state()}
+    modules = {"coop": SimpleNamespace(pack_topk_routes_by_expert=lambda *a, **k: None),
+               "mul1_arm": SimpleNamespace(pack_topk_routes_by_expert=lambda *a, **k: None)}
+
+    class FakeGraph:
+        def __init__(self, fn): self.fn = fn
+        def replay(self): self.fn()
+
+    monkeypatch.setattr(bench, "_capture", lambda fn, _w: FakeGraph(fn))
+
+    def run(name, rows=None, start=0):
+        count = 4 if rows is None else rows
+        ref = mcg_ref if name == "coop" else mul1_ref
+        out = ref[start:start + count].clone()
+        states[name][0].output[:count].copy_(out)
+        return out
+
+    args = SimpleNamespace(prefill_family="ml4", warmup=1, prefill_exhaustive=False,
+                           live_rows=[], correctness_only=True, rounds=1, replays=1)
+    specs = [("coop", {}), ("mul1_arm", {"codebook": "mul1"})]
+    result = bench.coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, weights,
+                                           layer, 0, 4, torch.int32)
+    assert result["arm_checks"]["coop"]["qualified"]
+    assert result["arm_checks"]["mul1_arm"]["qualified"]
+    assert result["arm_checks"]["mul1_arm"]["control_bitwise"]
+    assert "mul1_arm" in result["codebook_deltas"]
+    assert result["codebook_deltas"]["mul1_arm"]["max_abs"] > 0.0
+    assert -1.0 <= result["codebook_deltas"]["mul1_arm"]["cosine"] <= 1.0
+
+    # Legacy MCG-only invocation omits cross-codebook keys and keeps exact oracle string.
+    mcg_only = bench.coordinator_oracle_case(args, [("coop", {})], {"coop": states["coop"]},
+                                             {"coop": modules["coop"]}, run, decoded, ids, weights,
+                                             layer, 0, 4, torch.int32)
+    assert mcg_only["oracle"] == "decoded-MCG/full-F32/no-TF32"
+    assert "codebook_deltas" not in mcg_only
+
+
+def test_aot_replay_variant_derives_compute_and_dtype_from_manifest(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    monkeypatch.setattr(bench.c, "CDLL", lambda _p: SimpleNamespace(
+        create=lambda *a: 0, destroy=lambda *a: 0, core=lambda *a: 0, sum=lambda *a: 0,
+        routes_create=lambda *a: 0, routes_destroy=lambda *a: 0, routes_launch=lambda *a: 0,
+    ))
+    monkeypatch.setattr(bench, "bind", lambda lib, name, *a: getattr(lib, name))
+    monkeypatch.setattr(bench, "native_call", lambda fn, *a: 0)
+
+    class FakeTensor:
+        def __init__(self, shape, dtype):
+            self.shape = tuple(shape)
+            self.dtype = dtype
+            elem = 4 if dtype in ("fp32", "i32") else 2 if dtype in ("bf16", "f16") else 1
+            n = 1
+            for s in self.shape:
+                n *= s
+            self.nbytes = n * elem
+        def zero_(self): return self
+        def to(self, _d): return self
+
+    fake_torch = SimpleNamespace(
+        float32="fp32", bfloat16="bf16", float16="f16", int32="i32", uint8="u8",
+        empty=lambda shape, dtype, device=None: FakeTensor(shape, dtype),
+        frombuffer=lambda buf, dtype: FakeTensor((len(buf) // 2,), dtype),
+        cuda=SimpleNamespace(
+            get_device_capability=lambda _d=None: (12, 0),
+            get_device_properties=lambda _d=None: SimpleNamespace(multi_processor_count=188),
+        ),
+    )
+
+    lut = b"\x00" * 32
+    routes_dir = tmp_path / "routes"
+    routes_dir.mkdir()
+    routes_manifest = routes_dir / "v41_exl3_routes.json"
+    routes_manifest.write_text("{}\n")
+    (routes_dir / "libv41_exl3_routes.so").write_bytes(b"")
+    (tmp_path / "trellis_lut.bin").write_bytes(lut)
+    (tmp_path / "libcuteafd_exl3.so").write_bytes(b"")
+    meta = {
+        "compute": [12, 0], "hidden": 4096, "intermediate": 2048, "experts": 288, "top_k": 8,
+        "bits": [3, 4], "capacity": 80, "output_dtype": "fp32", "codebook": "mul1",
+        "requires_route_preparation": True, "blocks_per_sm": 1,
+        "objects": [{"label": "v41_exl3_core", "pointer_slots": [], "scalar_slots": []},
+                    {"label": "v41_exl3_sum", "pointer_slots": [], "scalar_slots": []}],
+        "buffers": {
+            name: {"shape": [8], "dtype": dtype, "bytes": 8 * size, "allocation": name, "zero_on_create": False}
+            for name, dtype, size in (
+                ("fc2", "torch.float16", 2), ("output", "torch.float32", 4),
+                ("packed_route_indices", "torch.int32", 4), ("block_expert_ids", "torch.int32", 4),
+                ("packed_route_count", "torch.int32", 4), ("expert_offsets", "torch.int32", 4),
+                ("expert_counts", "torch.int32", 4),
+            )
+        },
+        "trellis_lut": {"file": "trellis_lut.bin", "sha256": bench.hashlib.sha256(lut).hexdigest()},
+        "route_preparation": {"manifest": "routes/v41_exl3_routes.json",
+                              "sha256": bench.hashlib.sha256(routes_manifest.read_bytes()).hexdigest()},
+    }
+    (tmp_path / "v41_exl3.json").write_text(bench.json.dumps(meta))
+    weights = ({"expert_map_ptr": FakeTensor((288,), "i32")}, {})
+    variant = bench._AotReplayVariant(fake_torch, tmp_path, 80, weights, (4096, 2048, 288, 8, [3, 4]))
+    assert variant.meta["compute"] == [12, 0] and variant.buffers["output"].dtype == "fp32"
+
+    # Device capability mismatch fails closed from manifest without CLI flags.
+    fake_torch.cuda.get_device_capability = lambda _d=None: (12, 1)
+    with pytest.raises(RuntimeError, match="AOT compute capability mismatch"):
+        bench._AotReplayVariant(fake_torch, tmp_path, 80, weights, (4096, 2048, 288, 8, [3, 4]))
+
+    default_args = bench.benchmark_parser().parse_args(["--spark-replay", "f.json", "--aot-root", str(tmp_path)])
+    assert default_args.verify_own_codebook is False
+    verify_args = bench.benchmark_parser().parse_args(
+        ["--spark-replay", "f.json", "--aot-root", str(tmp_path), "--verify-own-codebook"]
+    )
+    assert verify_args.verify_own_codebook is True
+
+
+def test_legacy_spark_prefill_rejects_codebook_mul1_across_cli_dispatch_and_entry(tmp_path, monkeypatch, capsys) -> None:
+    from types import SimpleNamespace
+    bench = _load_benchmark_module()
+    out_file = tmp_path / "prefill.json"
+
+    # Guard against any CUDA access: CLI dispatch must reject --codebook mul1 before touching CUDA.
+    def _forbid_cuda(*_a, **_k):
+        raise AssertionError("legacy Spark prefill --codebook mul1 must fail before CUDA initialization")
+
+    monkeypatch.setattr(bench.torch.cuda, "current_device", _forbid_cuda)
+
+    # 1. Non-coordinator Spark prefill family (dsv4f) rejects --codebook mul1 on the actual CLI dispatch path.
+    with pytest.raises(SystemExit) as exc_dsv4f:
+        bench.main(["--prefill-family", "dsv4f", "--codebook", "mul1", "--output", str(out_file)])
+    assert exc_dsv4f.value.code == 2
+    assert "legacy Spark prefill does not support --codebook mul1" in capsys.readouterr().err
+
+    # 2. Dual-role families routed into Spark prefill via --rows / --prefill-arm also reject --codebook mul1.
+    for fam, spark_flag in (("qwen4", ["--rows", "256"]), ("glmf", ["--rows", "256"]), ("glmf", ["--prefill-arm", "coop8:8:cooperative"])):
+        with pytest.raises(SystemExit) as exc_spark:
+            bench.main(["--prefill-family", fam, *spark_flag, "--codebook", "mul1", "--output", str(out_file)])
+        assert exc_spark.value.code == 2
+        assert "legacy Spark prefill does not support --codebook mul1" in capsys.readouterr().err
+
+    # 3. Direct entry into _run_prefill_benchmark also refuses --codebook mul1 explicitly.
+    direct_args = bench.benchmark_parser().parse_args(
+        ["--prefill-family", "qwen4", "--codebook", "mul1", "--output", str(out_file)]
+    )
+    with pytest.raises(ValueError, match="legacy Spark prefill does not support --codebook mul1"):
+        bench._run_prefill_benchmark(direct_args, None, SimpleNamespace(major=12, minor=1))
+
+    # 4. Coordinator preflight dispatch still accepts --codebook mul1 cleanly without CUDA.
+    bench.main([
+        "--prefill-family", "glm", "--role", "coordinator",
+        "--codebook", "mul1", "--preflight-only", "--output", str(out_file),
+    ])
+    preflight = bench.json.loads(capsys.readouterr().out)
+    assert preflight["preflight"] is True
+
+
+
