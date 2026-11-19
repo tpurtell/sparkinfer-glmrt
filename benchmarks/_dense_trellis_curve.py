@@ -2,7 +2,7 @@
 
 The routes JSON names the engine exporter, native_library, manifest, and a
 families mapping of exporter shape names to routes. Each route chooses groups
-(1 or 4), egress (bf16/f32), reduction (none/bf16_partial/f32_add), and
+(1 or 4), egress (bf16/f32), reduction (none/bf16_partial/f32_add/f32_add_then_narrow), and
 references {bf16, fp8}. References are either {program, scalars} (the program
 and launch flags selected by the engine, excluding the live rows scalar), or
 {reason} if an exact-shape standalone shipping reference does not exist.
@@ -51,10 +51,11 @@ def select_shapes(policies, routes, families, requested, bits, codebook):
             egress = route.get("egress", p["output_program"].rsplit("_", 1)[1])
             if groups != 1 and groups != p.get("grouped", {}).get("groups"):
                 raise ValueError(f"{family}/{name} does not export {groups} groups")
-            if reduction not in ("none", "bf16_partial", "f32_add") or (
+            if reduction not in ("none", "bf16_partial", "f32_add", "f32_add_then_narrow") or (
                     reduction != "none" and (groups != 1 or p["sharded_side"] != 2)):
                 raise ValueError(f"invalid TP reduction for {family}/{name}: {reduction}")
-            if egress not in ("bf16", "f32") or (groups != 1 and egress != "bf16"):
+            if (egress not in ("bf16", "f32") or (groups != 1 and egress != "bf16")
+                    or (reduction == "f32_add_then_narrow" and egress != "f32")):
                 raise ValueError(f"invalid egress dtype for {family}/{name}: {egress}")
             refs = route.get("references", {})
             if set(refs) != {"bf16", "fp8"} or any(
@@ -114,7 +115,7 @@ class Registry:
             require_success(self.lib.cuteafd_dsv4_program_info(index, C.byref(info)), "program_info")
             self.programs[info.name.decode()] = (index, info.pointers, info.scalars, info.kinds)
 
-    def bind(self, name, operands, flags, stream):
+    def bind(self, name, operands, flags):
         index, pointers, scalars, kinds = self.programs[name]
         if pointers != len(operands) or scalars != len(flags) + 1 or kinds != b"i" * scalars:
             raise ValueError(f"{name}: incompatible native registry ABI")
@@ -122,22 +123,22 @@ class Registry:
         ptrs = (C.c_void_p * pointers)(*(t.data_ptr() for t in operands))
         args = (C.c_uint64 * scalars)(0, *flags)
 
-        def run(rows):
+        def run(rows, stream):
             args[0] = rows
             require_success(self.launch(index, ptrs, args, stream), name)
 
         return run
 
-    def glue(self, name, operands, count_multiplier, stream, sms=None):
+    def glue(self, name, operands, count_multiplier, sms=None):
         fn = getattr(self.lib, name)
         fn.argtypes = [C.c_void_p] * len(operands) + [C.c_int64] + (
             [C.c_int32] if sms is not None else []) + [C.c_void_p]
         args = [t.data_ptr() for t in operands]
-        tail = [stream] if sms is None else [sms, stream]
-        return lambda rows: require_success(fn(*args, rows * count_multiplier, *tail), name)
+        tail = () if sms is None else (sms,)
+        return lambda rows, stream: require_success(fn(*args, rows * count_multiplier, *tail, stream), name)
 
 
-def bind_reference(torch, registry, route, shape, x, capacity, stream):
+def bind_reference(torch, registry, route, shape, x, capacity):
     if "reason" in route:
         return None
     if shape.groups != 1:
@@ -160,10 +161,10 @@ def bind_reference(torch, registry, route, shape, x, capacity, stream):
         raise ValueError(f"{name}: must provide the selected runtime scalars in ABI order")
     weight = torch.randn((shape.n, shape.k), device=x.device, dtype=torch.bfloat16) * .1
     if abi == ["x", "w", "out"]:
-        bound = registry.bind(name, (x, weight, out), (), stream)
+        bound = registry.bind(name, (x, weight, out), ())
 
-        def run(rows, _storage=weight):
-            bound(rows)
+        def run(rows, stream, _storage=weight):
+            bound(rows, stream)
 
         return run, out, reference_capacity
     if abi != ["x", "weight", "scales", "out", "scratch"] or g.get("scale_block", 128) != 128:
@@ -173,10 +174,10 @@ def bind_reference(torch, registry, route, shape, x, capacity, stream):
     scales = torch.ones((shape.n // 128, shape.k // 128), device=x.device, dtype=torch.float32)
     scratch = torch.empty(p["scratch_bytes_at_capacity"]["scratch"], device=x.device, dtype=torch.uint8)
     # The closure owns the backing allocations through graph replay.
-    bound = registry.bind(name, (x, packed, scales, out, scratch), tuple(flags.values()), stream)
+    bound = registry.bind(name, (x, packed, scales, out, scratch), tuple(flags.values()))
 
-    def run(rows, _storage=(packed, scales, scratch)):
-        bound(rows)
+    def run(rows, stream, _storage=(packed, scales, scratch)):
+        bound(rows, stream)
 
     return run, out, reference_capacity
 
@@ -218,6 +219,18 @@ def _compile_variant(path, options):
         _native.NativeTrellisLinear = original
 
 
+def capture_stages(cuda, calls, rows):
+    events = [cuda.Event(enable_timing=True, external=True) for _ in range(len(calls) + 1)]
+    graph = cuda.CUDAGraph()
+    with cuda.graph(graph):
+        stream = cuda.current_stream().cuda_stream
+        events[0].record()
+        for run, event in zip(calls.values(), events[1:]):
+            run(rows, stream)
+            event.record()
+    return graph, events
+
+
 def _shape_curve(args, shape, registry, exported, sms):
     import torch
     from b12x.integration.cuteafd import exportable_compilation
@@ -253,8 +266,12 @@ def _shape_curve(args, shape, registry, exported, sms):
     final = [torch.empty((cap, n), dtype=final_dtype, **cuda) for _ in range(groups)]
 
     def bind(lib, tensors, flags):
-        ptrs = [t.data_ptr() for t in tensors]
-        return lambda rows: require_success(lib.run(*ptrs, rows, *flags, stream), lib._name)
+        pointers = [t.data_ptr() for t in tensors]
+
+        def run(rows, active_stream):
+            require_success(lib.run(*pointers, rows, *flags, active_stream), lib._name)
+
+        return run
 
     stages = {"ingress": bind(ingress, [x, *suh, *rotation, *scales], (sms * 4,)),
               "trellis": bind(body, [ptrs, *weights, *scales, partial, *raw], (0, sms * 4))}
@@ -265,25 +282,30 @@ def _shape_curve(args, shape, registry, exported, sms):
         if shape.reduction == "bf16_partial":
             local = torch.empty_like(raw[0], dtype=torch.bfloat16)
             peer = torch.randn_like(local) * .1
-            stages["narrow"] = registry.glue("cuteafd_load_narrow_f32_bf16", (raw[0], local), n, stream, sms)
-            stages["partial_add"] = registry.glue("cuteafd_bf16_f32_add_async", (local, peer, summed), n, stream, sms)
+            stages["narrow"] = registry.glue("cuteafd_load_narrow_f32_bf16", (raw[0], local), n, sms)
+            stages["partial_add"] = registry.glue("cuteafd_bf16_f32_add_async", (local, peer, summed), n, sms)
         else:
             peer = torch.randn_like(raw[0]) * .1
-            stages["partial_add"] = registry.glue("cuteafd_cuda_residual_add_f32_async", (raw[0], peer, summed), n, stream)
+            stages["partial_add"] = registry.glue("cuteafd_cuda_residual_add_f32_async", (raw[0], peer, summed), n)
     stages["egress"] = bind(egress, [*egress_source, *svh, *final], (sms * 4,))
+    outputs = [*raw, *final]
+    if shape.reduction == "f32_add_then_narrow":
+        narrowed = torch.empty_like(final[0], dtype=torch.bfloat16)
+        stages["final_narrow"] = registry.glue("cuteafd_load_narrow_f32_bf16", (final[0], narrowed), n, sms)
+        outputs.append(narrowed)
     base_body = bind(baseline, [ptrs, *weights, *scales, partial, *raw], (0, sms * 4)) if baseline else None
     references = {name: bound for name, route in shape.references.items()
-                  if (bound := bind_reference(torch, registry, route, shape, x, cap, stream)) is not None}
+                  if (bound := bind_reference(torch, registry, route, shape, x, cap)) is not None}
 
     def chain(rows, core):
-        for target in (*raw, *final):
+        for target in outputs:
             target.fill_(float("nan"))
         for name, run in stages.items():
-            (core if name == "trellis" else run)(rows)
-        for target in (*raw, *final):
+            (core if name == "trellis" else run)(rows, stream)
+        for target in outputs:
             if not torch.isfinite(target[:rows]).all().item() or not torch.isnan(target[rows:]).all().item():
                 raise RuntimeError(f"{shape.name} M={rows}: missing writes or write into inactive rows")
-        return [t[:rows].clone() for t in (*raw, *final)]
+        return [t[:rows].clone() for t in outputs]
 
     full = chain(cap, stages["trellis"]) if args.check_prefix_rows else None
     records = []
@@ -305,7 +327,7 @@ def _shape_curve(args, shape, registry, exported, sms):
         live_refs = {name: (run, out) for name, (run, out, limit) in references.items() if rows <= limit}
         for name, (run, out) in live_refs.items():
             out.fill_(float("nan"))
-            run(rows)
+            run(rows, stream)
             if not torch.isfinite(out[:rows]).all().item():
                 raise RuntimeError(f"{shape.name} M={rows}: {name} did not overwrite poison")
 
@@ -315,22 +337,29 @@ def _shape_curve(args, shape, registry, exported, sms):
             arms["baseline"] = {"baseline_trellis" if s == "trellis" else f"baseline_{s}":
                                 base_body if s == "trellis" else run for s, run in stages.items()}
         for arm, calls in arms.items():
-            events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(len(calls) + 1)]
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                events[0].record()
-                for run, event in zip(calls.values(), events[1:]):
-                    run(rows)
-                    event.record()
+            graph, events = capture_stages(torch.cuda, calls, rows)
+            targets = outputs if arm in ("candidate", "baseline") else (live_refs[arm][1],)
+            for target in targets:
+                target.fill_(float("nan"))
             graph.replay()
-            graphs[arm] = (graph, events, calls)
+            for target in targets:
+                if not torch.isfinite(target[:rows]).all().item():
+                    raise RuntimeError(f"{shape.name} M={rows}: {arm} graph did not overwrite poisoned output")
+            graphs[arm] = (graph, events, calls, targets)
         torch.cuda.synchronize()
         samples = {name: [] for calls in arms.values() for name in calls}
         samples.update({f"{arm}_total": [] for arm in arms if len(arms[arm]) > 1})
         for sample in range(args.samples):
-            for graph, events, calls in (graphs.values() if sample % 2 == 0 else reversed(graphs.values())):
+            for graph, events, calls, targets in (graphs.values() if sample % 2 == 0 else reversed(graphs.values())):
+                # Outside the timed graph: a last-live-row sentinel catches a
+                # missing replay without writing the full output every sample.
+                for target in targets:
+                    target[rows-1:rows].fill_(float("nan"))
                 graph.replay()
                 events[-1].synchronize()
+                for target in targets:
+                    if not torch.isfinite(target[rows-1:rows]).all().item():
+                        raise RuntimeError(f"{shape.name} M={rows}: timed graph did not overwrite poison")
                 for name, start, end in zip(calls, events, events[1:]):
                     samples[name].append(start.elapsed_time(end) * 1000)
                 if len(calls) > 1:
