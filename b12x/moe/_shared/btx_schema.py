@@ -48,6 +48,8 @@ from .trellis_codebooks import (
     CODEBOOKS,
     MCG,
     MCG_MULTIPLIER,
+    MUL1,
+    MUL1_MULTIPLIER,
     validate_codebook_bits,
 )
 
@@ -213,14 +215,24 @@ class BtxManifest:
         seed = data.get("codebook_seed")
         if codebook == MCG:
             _require(
-                isinstance(seed, int) and seed == MCG_MULTIPLIER,
+                isinstance(seed, int)
+                and not isinstance(seed, bool)
+                and seed == MCG_MULTIPLIER,
                 "BTX mcg checkpoints must declare codebook_seed "
                 f"{MCG_MULTIPLIER:#010x}",
+            )
+        elif codebook == MUL1:
+            _require(
+                isinstance(seed, int)
+                and not isinstance(seed, bool)
+                and seed == MUL1_MULTIPLIER,
+                "BTX mul1 checkpoints must declare codebook_seed "
+                f"{MUL1_MULTIPLIER:#010x}",
             )
         else:
             _require(
                 seed is None,
-                f"BTX codebook_seed is valid only for mcg, not {codebook!r}",
+                f"BTX codebook_seed is valid only for mcg or mul1, not {codebook!r}",
             )
 
         geometry = _parse_geometry(data["geometry"])

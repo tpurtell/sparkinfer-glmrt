@@ -32,6 +32,7 @@ from enum import Enum
 from .trellis_codebooks import (
     CODEBOOKS as _TRELLIS_CODEBOOKS,
     MCG as _TRELLIS_MCG,
+    MUL1 as _TRELLIS_MUL1,
     SQG_E4M3 as _TRELLIS_SQG_E4M3,
     validate_codebook_bits as _validate_trellis_codebook_bits,
 )
@@ -409,9 +410,9 @@ class MoEWeightPreparationPlan:
                     raise ValueError(
                         "coupled-Hadamard trellis execution requires uniform rates"
                     )
-                if self.trellis_codebook != _TRELLIS_MCG:
+                if self.trellis_codebook not in (_TRELLIS_MCG, _TRELLIS_MUL1):
                     raise ValueError(
-                        "per-expert-projection trellis rates require the mcg codebook"
+                        "per-expert-projection trellis rates require the mcg or mul1 codebook"
                     )
                 if pair_kinds is not None:
                     raise ValueError(

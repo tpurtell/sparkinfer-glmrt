@@ -788,4 +788,486 @@ def test_ws_a8_accepts_mul1_and_separates_cache_keys_on_cpu(
         assert captured[0].driver.activation_output_a8
 
 
+def test_resolve_exl3_checkpoint_codebook_markers_on_cpu() -> None:
+    """Verify checkpoint-defined `.mcg` (0xCBAC1FED) and `.mul1` (0x83DCD12D) marker resolution."""
+    import torch
+    from b12x.moe._shared.kernels.w4a16.prepare import (
+        resolve_exl3_checkpoint_codebook,
+    )
+
+    mcg_i32 = torch.tensor(0xCBAC1FED, dtype=torch.uint32).view(torch.int32)
+    mcg_1d = mcg_i32.reshape(1)
+    mul1_i32 = torch.tensor(MUL1_MULTIPLIER, dtype=torch.uint32).view(torch.int32)
+    mul1_1d = mul1_i32.reshape(1)
+    mul1_u32 = torch.tensor(MUL1_MULTIPLIER, dtype=torch.uint32)
+
+    assert resolve_exl3_checkpoint_codebook(mcg=0xCBAC1FED) == "mcg"
+    assert resolve_exl3_checkpoint_codebook(mcg=mcg_i32) == "mcg"
+    assert resolve_exl3_checkpoint_codebook(mcg=mcg_1d, codebook="mcg") == "mcg"
+    assert resolve_exl3_checkpoint_codebook(mul1=MUL1_MULTIPLIER) == "mul1"
+    assert resolve_exl3_checkpoint_codebook(mul1=mul1_i32) == "mul1"
+    assert resolve_exl3_checkpoint_codebook(mul1=mul1_1d) == "mul1"
+    assert resolve_exl3_checkpoint_codebook(mul1=mul1_u32, codebook="mul1") == "mul1"
+    assert resolve_exl3_checkpoint_codebook(codebook="mul1") == "mul1"
+    assert resolve_exl3_checkpoint_codebook() == "mcg"
+
+    with pytest.raises(ValueError, match="multiple EXL3 codebook markers"):
+        resolve_exl3_checkpoint_codebook(mcg=mcg_i32, mul1=mul1_i32)
+    with pytest.raises(ValueError, match="unexpected EXL3 MUL1 marker"):
+        resolve_exl3_checkpoint_codebook(mul1=0xCBAC1FED)
+    with pytest.raises(ValueError, match="unexpected EXL3 MCG marker"):
+        resolve_exl3_checkpoint_codebook(mcg=MUL1_MULTIPLIER)
+    with pytest.raises(ValueError, match="disagrees"):
+        resolve_exl3_checkpoint_codebook(mul1=mul1_i32, codebook="mcg")
+    with pytest.raises(ValueError, match="disagrees"):
+        resolve_exl3_checkpoint_codebook(mcg=mcg_i32, codebook="mul1")
+    with pytest.raises(ValueError, match="requires the checkpoint MCG or MUL1 marker"):
+        resolve_exl3_checkpoint_codebook(codebook="mul1", require_marker=True)
+    with pytest.raises(TypeError, match="scalar tensor or int"):
+        resolve_exl3_checkpoint_codebook(mul1=True)
+    with pytest.raises(ValueError, match="scalar or 1-element"):
+        resolve_exl3_checkpoint_codebook(
+            mul1=torch.tensor([MUL1_MULTIPLIER, MUL1_MULTIPLIER], dtype=torch.uint32)
+        )
+    with pytest.raises(ValueError, match="int32/uint32"):
+        resolve_exl3_checkpoint_codebook(
+            mul1=torch.tensor(1.0, dtype=torch.float32)
+        )
+
+
+def test_exl3_uniform_and_projection_mixed_planning_accepts_mul1_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Exl3TrellisSource, Exl3TrellisWeights, TrellisConfig, and TPMoEScratchPlan for MUL1."""
+    import torch
+    from b12x.moe import fused_moe
+    import b12x.moe.fused_moe._impl as fused_moe_impl
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 48)
+
+    for bits in (2, 3, 4, 5, 6):
+        src = fused_moe.Exl3TrellisSource(
+            bits=bits, tile_config=(64, 128, 64, 128), codebook="mul1"
+        )
+        assert src.codebook is TrellisCodebook.MUL1
+        assert src.bits == bits
+
+    with pytest.raises(ValueError, match="K2, K3, K4, K5, or K6"):
+        fused_moe.Exl3TrellisSource(bits=1, codebook="mul1")
+    with pytest.raises(ValueError, match="K3, K4, K5, or K6"):
+        fused_moe.Exl3TrellisSource(bits=2)
+    with pytest.raises(ValueError, match="'mcg' or 'mul1'"):
+        fused_moe.Exl3TrellisSource(bits=3, codebook="sqg_e4m3")
+
+    dummy_t = torch.zeros((1,), dtype=torch.int16)
+    dummy_f = torch.ones((1,), dtype=torch.float16)
+    w_mul1 = fused_moe.Exl3TrellisWeights(
+        w13=dummy_t,
+        w2=dummy_t,
+        gate_suh=dummy_f,
+        up_suh=dummy_f,
+        intermediate_rotations=dummy_f,
+        down_svh=dummy_f,
+        mul1=MUL1_MULTIPLIER,
+    )
+    assert w_mul1.mul1 == MUL1_MULTIPLIER
+    assert w_mul1.mcg is None
+
+    with pytest.raises(ValueError, match="either mcg or mul1"):
+        fused_moe.Exl3TrellisWeights(
+            w13=dummy_t,
+            w2=dummy_t,
+            gate_suh=dummy_f,
+            up_suh=dummy_f,
+            intermediate_rotations=dummy_f,
+            down_svh=dummy_f,
+        )
+    with pytest.raises(ValueError, match="cannot declare both"):
+        fused_moe.Exl3TrellisWeights(
+            w13=dummy_t,
+            w2=dummy_t,
+            gate_suh=dummy_f,
+            up_suh=dummy_f,
+            intermediate_rotations=dummy_f,
+            down_svh=dummy_f,
+            mcg=0xCBAC1FED,
+            mul1=MUL1_MULTIPLIER,
+        )
+
+    act = fused_moe.ActivationSpec(
+        mode=fused_moe.ActivationMode.A16,
+        nonlinearity="silu",
+        io_dtype=torch.bfloat16,
+    )
+    geom = fused_moe.MoEGeometry(
+        num_experts=8, hidden_size=256, intermediate_size=256
+    )
+
+    uniform_plan = fused_moe.plan_weights(
+        source=fused_moe.Exl3TrellisSource(
+            bits=4, tile_config=(64, 128, 64, 128), codebook="mul1"
+        ),
+        activation=act,
+        geometry=geom,
+    )
+    assert uniform_plan._impl.trellis_codebook == "mul1"
+    assert uniform_plan._impl.trellis_bits == 4
+
+    v2_proj_cfg = TrellisConfig.from_dict(
+        {
+            "version": 2,
+            "codebook": "mul1",
+            "rate": {"granularity": "per_expert_projection"},
+            "scale": {
+                "input_scales": {"vectors": "per_layer", "gains": "none"},
+                "intermediate_scales": {"vectors": "per_expert", "gains": "none"},
+                "output_scales": {"vectors": "per_layer", "gains": "none"},
+            },
+            "transform": {
+                "projection": {"kind": "scaled_hadamard", "block_size": 128},
+                "expert": {"kind": "none"},
+            },
+        }
+    )
+    v2_proj_plan = fused_moe.plan_weights(
+        source=v2_proj_cfg, activation=act, geometry=geom
+    )
+    assert v2_proj_plan._impl.trellis_codebook == "mul1"
+    assert v2_proj_plan._impl.trellis_tile_config == (128, 128, 128, 128)
+    assert fused_moe_impl._uses_projection_mixed_trellis(v2_proj_plan._impl)
+
+    trellis_decode_cfg = MoeDecodeConfig(
+        backend="w4a16",
+        route_planner="internal",
+        max_active_clusters=None,
+        w4a16_route_mode="packed",
+    )
+    scratch_v2 = fused_moe_impl.plan_tp_moe_scratch(
+        fused_moe_impl.TPMoEScratchCaps(
+            decode_config=trellis_decode_cfg,
+            max_tokens=16,
+            num_topk=4,
+            route_num_experts=8,
+            device="cpu",
+            weight_plan=v2_proj_plan._impl,
+            quant_mode="w4a16",
+        )
+    )
+    assert scratch_v2._core_workspace_plan.implementation == "trellis_mixed3"
+    assert scratch_v2._core_workspace_plan.projection_mixed_trellis
+    assert scratch_v2._core_workspace_plan.trellis_codebook == "mul1"
+
+    direct_exl3_plan = fused_moe_impl.plan_b12x_fp4_moe_weights(
+        quant_modes="w4a16",
+        source_format="exl3_trellis_mcg",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=16,
+        hidden_size=512,
+        intermediate_size=256,
+        w13_layout="trellis_t256_proj",
+        w4a16_layout="trellis_native",
+        trellis_bits=3,
+        trellis_codebook="mul1",
+        trellis_rate_granularity="per_expert_projection",
+    )
+    scratch_exl3 = fused_moe_impl.plan_tp_moe_scratch(
+        fused_moe_impl.TPMoEScratchCaps(
+            decode_config=trellis_decode_cfg,
+            max_tokens=16,
+            num_topk=4,
+            route_num_experts=16,
+            device="cpu",
+            weight_plan=direct_exl3_plan,
+            quant_mode="w4a16",
+        )
+    )
+    assert scratch_exl3._core_workspace_plan.implementation == "trellis_mixed"
+    assert scratch_exl3._core_workspace_plan.projection_mixed_trellis
+    assert scratch_exl3._core_workspace_plan.trellis_codebook == "mul1"
+
+
+def test_btx_compat_lifts_accept_mul1_and_preserve_sqg_default_on_cpu() -> None:
+    """Verify btx_compat lifts preserve sqg_e4m3 default and populate codebook_seed for mul1/mcg."""
+    import torch
+    from b12x.moe._shared.btx_schema import matrix_atom_bytes
+    from b12x.moe._shared.kernels.w4a16.btx_compat import (
+        lift_qsrt_atoms_v1_extent,
+        lift_qsrt_atoms_v2_extent,
+    )
+
+    hidden, global_i, experts = 256, 3072, 3
+    mbytes = matrix_atom_bytes(hidden, 3, 3)
+    v1_bundle = 3 * mbytes + 3 * 64
+    v1_payload = torch.zeros((8, experts, v1_bundle), dtype=torch.uint8)
+    side = torch.ones((hidden,), dtype=torch.float16)
+    expert_ids = torch.arange(experts, dtype=torch.int32)
+    format_codes = torch.tensor([0x10, 0x01, 0x00], dtype=torch.uint8)
+
+    default_v1 = lift_qsrt_atoms_v1_extent(
+        v1_payload,
+        first_atom_slot=0,
+        layer_index=0,
+        expert_ids=expert_ids,
+        format_codes=format_codes,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        gate_suh=side,
+        up_suh=side,
+        down_svh=side,
+    )
+    assert default_v1.manifest.codebook == "sqg_e4m3"
+    assert default_v1.manifest.codebook_seed is None
+
+    mul1_v1 = lift_qsrt_atoms_v1_extent(
+        v1_payload,
+        first_atom_slot=0,
+        layer_index=0,
+        expert_ids=expert_ids,
+        format_codes=format_codes,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        gate_suh=side,
+        up_suh=side,
+        down_svh=side,
+        codebook="mul1",
+    )
+    assert mul1_v1.manifest.codebook == "mul1"
+    assert mul1_v1.manifest.codebook_seed == MUL1_MULTIPLIER
+
+    mcg_v1 = lift_qsrt_atoms_v1_extent(
+        v1_payload,
+        first_atom_slot=0,
+        layer_index=0,
+        expert_ids=expert_ids,
+        format_codes=format_codes,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        gate_suh=side,
+        up_suh=side,
+        down_svh=side,
+        codebook="mcg",
+    )
+    assert mcg_v1.manifest.codebook == "mcg"
+    assert mcg_v1.manifest.codebook_seed == 0xCBAC1FED
+
+    p33_bytes = 3 * matrix_atom_bytes(hidden, 3, 3) + 3 * 64
+    p43_bytes = 3 * matrix_atom_bytes(hidden, 4, 3) + 3 * 64
+    # At layer 0, first_slot 0: expert 0 has base_pair=0 (P43), experts 1,2 have P33.
+    v2_row_bytes = 2 * p33_bytes + 1 * p43_bytes
+    v2_payload = torch.zeros((8, v2_row_bytes), dtype=torch.uint8)
+    mul1_v2 = lift_qsrt_atoms_v2_extent(
+        v2_payload,
+        profile="k3x22_k4x2",
+        first_atom_slot=0,
+        layer_index=0,
+        hidden_size=hidden,
+        global_intermediate_size=global_i,
+        num_experts=experts,
+        gate_suh=side,
+        up_suh=side,
+        down_svh=side,
+        codebook="mul1",
+    )
+    assert mul1_v2.manifest.codebook == "mul1"
+    assert mul1_v2.manifest.codebook_seed == MUL1_MULTIPLIER
+    assert mul1_v2.manifest.rates.pair_kinds == frozenset({"P33", "P43"})
+
+
+def test_dense_trellis256_prepare_and_dense_lut_contract_reject_mul1() -> None:
+    """Dense trellis256 preparation and dense kernel runner keep {MCG, SQG_E4M3, SQG_FP16} only."""
+    import inspect
+    from types import SimpleNamespace
+
+    pytest.importorskip("torch")
+    import torch
+
+    from b12x.moe._shared.kernels.w4a16.prepare import (
+        _TRELLIS256_DENSE_CODEBOOKS,
+        _trellis256_marker_codebook,
+        prepare_trellis256_dense_weight,
+        prepare_trellis256_pair_dense_weight,
+    )
+
+    assert set(_TRELLIS256_DENSE_CODEBOOKS) == {"mcg", "sqg_e4m3", "sqg_fp16"}
+    assert _trellis256_marker_codebook(mcg=0xCBAC1FED, mul1_e4m3=None, codebook=None) == "mcg"
+    assert _trellis256_marker_codebook(mcg=None, mul1_e4m3=None, codebook="sqg_e4m3") == "sqg_e4m3"
+    assert _trellis256_marker_codebook(mcg=None, mul1_e4m3=None, codebook="sqg_fp16") == "sqg_fp16"
+
+    for bad_mcg in (
+        MUL1_MULTIPLIER,
+        torch.tensor(MUL1_MULTIPLIER, dtype=torch.uint32),
+        torch.tensor(MUL1_MULTIPLIER - (1 << 32), dtype=torch.int32),
+    ):
+        with pytest.raises(ValueError, match="expected MCG 0xcbac1fed"):
+            _trellis256_marker_codebook(mcg=bad_mcg, mul1_e4m3=None, codebook=None)
+
+    for bad_codebook in ("mul1", "MUL1", MUL1_MULTIPLIER):
+        with pytest.raises(ValueError, match="unsupported trellis codebook"):
+            _trellis256_marker_codebook(mcg=None, mul1_e4m3=None, codebook=bad_codebook)  # type: ignore[arg-type]
+
+    pytest.importorskip("cutlass")
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    assert w4a16_kernel._TRELLIS256_DENSE_CODEBOOKS == {"mcg", "sqg_e4m3", "sqg_fp16"}
+    dense_src = inspect.getsource(w4a16_kernel._run_trellis256_dense_current_device)
+    assert 'if trellis_codebook != "mcg" and execution_lut is None:' in dense_src
+    assert 'dummy_i32 if trellis_codebook == "mcg" else execution_lut,' in dense_src
+    assert "MUL1" not in dense_src
+
+    with pytest.raises(ValueError, match="dense_route_fast_path trellis_t256 codebook"):
+        w4a16_kernel.W4A16GemmKernel(
+            size_m=8,
+            size_n=128,
+            size_k=128,
+            num_experts=1,
+            top_k=1,
+            mul_topk_weights=False,
+            tile_n=128,
+            tile_k=64,
+            moe_block_size=8,
+            max_m_blocks=1,
+            element_dtype="fp16",
+            weight_layout="trellis_t256",
+            scale_format="e4m3_k32",
+            w13_layout="packed",
+            trellis_bits=4,
+            trellis_codebook="mul1",
+            dense_route_fast_path=True,
+        )
+
+    fake_dense = SimpleNamespace(
+        weight_layout="trellis_t256",
+        num_experts=1,
+        trellis_codebook="mul1",
+    )
+    with pytest.raises(NotImplementedError, match="run_trellis256_dense has no decoder for codebook 'mul1'"):
+        w4a16_kernel._run_trellis256_dense_current_device(
+            torch.empty((1, 128)),
+            fake_dense,
+            launch=None,  # type: ignore[arg-type]
+            execution_lut=None,
+            grid_cap=1,
+            hadamard_128=lambda *_: None,
+        )
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda", 0)
+        trellis = torch.zeros((16, 16, 64), dtype=torch.int16, device=device)
+        suh = torch.ones((256,), dtype=torch.float16, device=device)
+        svh = torch.ones((256,), dtype=torch.float16, device=device)
+        for kwargs in (
+            {"codebook": "mul1"},
+            {"mcg": torch.tensor(MUL1_MULTIPLIER, dtype=torch.uint32, device=device)},
+            {"mcg": MUL1_MULTIPLIER},
+        ):
+            with pytest.raises(ValueError, match="unsupported trellis codebook|expected MCG 0xcbac1fed"):
+                prepare_trellis256_dense_weight(trellis, suh, svh, **kwargs)  # type: ignore[arg-type]
+        pair_payload = torch.zeros((16, 16, 48), dtype=torch.int16, device=device).reshape(-1)
+        for kwargs in (
+            {"codebook": "mul1"},
+            {"mcg": MUL1_MULTIPLIER, "codebook": None},
+            {"mcg": torch.tensor(MUL1_MULTIPLIER, dtype=torch.uint32, device=device), "codebook": None},
+        ):
+            with pytest.raises(ValueError, match="unsupported trellis codebook|expected MCG 0xcbac1fed"):
+                prepare_trellis256_pair_dense_weight(
+                    pair_payload, suh, svh, pair_kind="P33", rate_axis="n", **kwargs
+                )
+
+
+def test_typed_v2_trellis_config_uniform_k4_propagates_bits_into_weight_and_execution_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify typed v2 TrellisConfig(uniform, mul1) rate 0x44 propagates K4 into WeightPlan & compile payload."""
+    from types import SimpleNamespace
+    import torch
+    from b12x.moe import fused_moe
+    import b12x.moe.fused_moe._impl as fused_moe_impl
+    import b12x.moe.fused_moe._preparation as fused_moe_prep
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+
+    monkeypatch.setattr(fused_moe_impl, "get_num_sm", lambda _device: 48)
+    v2_cfg = TrellisConfig.from_dict(
+        {
+            "version": 2,
+            "codebook": "mul1",
+            "rate": {"granularity": "uniform"},
+            "scale": {
+                "input_scales": {"vectors": "per_expert", "gains": "none"},
+                "intermediate_scales": {"vectors": "per_expert", "gains": "none"},
+                "output_scales": {"vectors": "per_expert", "gains": "none"},
+            },
+            "transform": {
+                "projection": {"kind": "scaled_hadamard", "block_size": 128},
+                "expert": {"kind": "none"},
+            },
+        }
+    )
+    w_plan = fused_moe.plan_weights(
+        source=v2_cfg,
+        activation=fused_moe.ActivationSpec(
+            mode=fused_moe.ActivationMode.A16,
+            nonlinearity="silu",
+            io_dtype=torch.bfloat16,
+        ),
+        geometry=fused_moe.MoEGeometry(
+            num_experts=4, hidden_size=256, intermediate_size=256
+        ),
+    )
+
+    dummy = torch.zeros((1,), dtype=torch.int32)
+    fake_prepared_k4 = SimpleNamespace(
+        w13=dummy,
+        w13_scale=dummy,
+        w13_global_scale=torch.ones((4,), dtype=torch.float32),
+        w2=dummy,
+        w2_scale=dummy,
+        w2_global_scale=torch.ones((4,), dtype=torch.float32),
+        trellis=SimpleNamespace(bits=4, codebook="mul1"),
+    )
+    monkeypatch.setattr(
+        "b12x.moe.fused_moe.trellis.prepare_trellis_weights",
+        lambda *_a, **_k: fake_prepared_k4,
+    )
+
+    weights = fused_moe.TrellisWeights(
+        atoms=torch.zeros((8, 128), dtype=torch.uint8),
+        rate=torch.tensor([0x44], dtype=torch.uint8),
+        input_scales=fused_moe.ScaleFactors(vectors=torch.ones((4, 2, 256), dtype=torch.float16)),
+        intermediate_scales=fused_moe.ScaleFactors(vectors=torch.ones((4, 3, 256), dtype=torch.float16)),
+        output_scales=fused_moe.ScaleFactors(vectors=torch.ones((4, 256), dtype=torch.float16)),
+    )
+    experts = fused_moe.prepare_weights(plan=w_plan, weights=weights)
+    assert experts.plan._impl.trellis_bits == 4
+    assert experts._impl.plan.trellis_bits == 4
+
+    payload = fused_moe_prep._weight_payload(experts)
+    assert payload["trellis_bits"] == 4
+    assert payload["trellis_codebook"] == "mul1"
+
+    scratch = fused_moe_impl.plan_tp_moe_scratch(
+        fused_moe_impl.TPMoEScratchCaps(
+            decode_config=MoeDecodeConfig(
+                backend="w4a16",
+                route_planner="internal",
+                max_active_clusters=None,
+                w4a16_route_mode="packed",
+            ),
+            max_tokens=16,
+            num_topk=2,
+            route_num_experts=4,
+            device="cpu",
+            weight_plan=experts.plan._impl,
+            quant_mode="w4a16",
+        ),
+        prewarm_launches=False,
+    )
+    assert scratch._core_workspace_plan.trellis_bits == 4
+    assert scratch._core_workspace_plan.trellis_codebook == "mul1"
+
+
+
+
+
 

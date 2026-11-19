@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import torch
@@ -264,7 +264,7 @@ def plan_weights(
             w4a16_layout="trellis_native",
             trellis_bits=source.bits,
             trellis_tile_config=source.tile_config,
-            trellis_codebook="mcg",
+            trellis_codebook=source.codebook.value,
             trellis_rate_granularity="uniform",
         )
     elif isinstance(source, TrellisConfig):
@@ -291,7 +291,8 @@ def plan_weights(
             trellis_bits=3,
             trellis_tile_config=(
                 (128, 128, 128, 128)
-                if source.codebook.value == "mcg"
+                if source.codebook.value in ("mcg", "mul1")
+                and source.rate.granularity.value == "per_expert_projection"
                 else (64, 256, 64, 256)
             ),
             coupled_hadamard=expert.kind == "coupled_hadamard",
@@ -342,6 +343,7 @@ def prepare_weights(
             intermediate_rotations=weights.intermediate_rotations,
             down_svh=weights.down_svh,
             trellis_mcg=weights.mcg,
+            trellis_mul1=weights.mul1,
         )
     elif isinstance(plan.source, TrellisConfig):
         if not isinstance(weights, TrellisWeights):
@@ -351,6 +353,8 @@ def prepare_weights(
             config=plan.source,
             weights=weights,
         )
+        if prepared.plan != plan._impl:
+            plan = replace(plan, _impl=prepared.plan)
     else:
         if not isinstance(weights, PackedWeights):
             raise TypeError("packed preparation requires PackedWeights")

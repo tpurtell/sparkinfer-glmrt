@@ -203,6 +203,7 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
 _TRELLIS256_BITS = (2, 3, 4, 5, 6)
 _TRELLIS256_CODEBOOKS = {MCG, MUL1, SQG_E4M3, SQG_FP16}
+_TRELLIS256_DENSE_CODEBOOKS = {MCG, SQG_E4M3, SQG_FP16}
 _SQG_XOR_CHEB_T12_LUT_ENTRIES = 1 << 12
 _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES = _SQG_XOR_CHEB_T12_LUT_ENTRIES
 _SCALE_FORMATS = {
@@ -1282,6 +1283,15 @@ class W4A16GemmKernel:
             raise ValueError(
                 "dense_route_fast_path requires E=1, top_k=1, no top-k weights, "
                 "and no other route fast path"
+            )
+        if (
+            self.dense_route_fast_path
+            and self.weight_layout_trellis256
+            and self.trellis_codebook not in _TRELLIS256_DENSE_CODEBOOKS
+        ):
+            raise ValueError(
+                "dense_route_fast_path trellis_t256 codebook must be in "
+                f"{sorted(_TRELLIS256_DENSE_CODEBOOKS)}, got {self.trellis_codebook!r}"
             )
         self.dual_a = bool(dual_a)
         if self.dual_a and not self.weight_layout_trellis256_proj:
@@ -13530,7 +13540,7 @@ def _run_trellis256_dense_current_device(
     trellis_codebook = str(
         getattr(prepared_dense, "trellis_codebook", "")
     ).lower()
-    if trellis_codebook not in _TRELLIS256_CODEBOOKS:
+    if trellis_codebook not in _TRELLIS256_DENSE_CODEBOOKS:
         raise NotImplementedError(
             "run_trellis256_dense has no decoder for codebook "
             f"{trellis_codebook!r}"
@@ -13637,7 +13647,7 @@ def _run_trellis256_dense_current_device(
     tile_n = int(launch.kernel.tile_n)
     n_tiles = size_n // tile_n
     grid_x = min(int(grid_cap), max(route_blocks * n_tiles, 1))
-    if trellis_codebook not in (MCG, MUL1) and execution_lut is None:
+    if trellis_codebook != "mcg" and execution_lut is None:
         raise ValueError("prepared Trellis decoder is missing its execution LUT")
     stream = current_cuda_stream() if stream is None else stream
     dummy_i32 = prepared_dense.workspace[:1]
@@ -13669,8 +13679,8 @@ def _run_trellis256_dense_current_device(
         prepared_dense.global_scale,
         launch.c_tmp,
         prepared_dense.workspace,
-        # MCG and MUL1 kernels never dereference the LUT ABI slot.
-        dummy_i32 if trellis_codebook in (MCG, MUL1) else execution_lut,
+        # MCG kernels never dereference the LUT ABI slot.
+        dummy_i32 if trellis_codebook == "mcg" else execution_lut,
         m,
         grid_x,
         stream,
