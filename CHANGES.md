@@ -1,5 +1,15 @@
 # Changes
 
+- SM120 dense trellis decode: prefetch one packed K128 block per warp in
+  folded K6, preserving the ordered MMA and split reduction. On RTX PRO
+  6000, the stock-normalized paired chain improved 1.88% across K6/K8
+  and both codebooks at M1-8 and M16. K6 MUL1 improved 17.7% for GLM Flash
+  TP2 down and 18.3% for Step-5 TP2 O in that band. All 264 decode and
+  280 prefill cases were bit-exact, including poisoned prefixes. Prefill
+  kernel instructions and launch resources were unchanged. Expected
+  changed placement group: `programs` (SM120 dense trellis).
+  See tpurtell/cuteafd#2540.
+
 - SM120 native trellis body: use specialized 128x96 and x64 suffix waves
   when they fit the runtime CTA budget, retaining the normal 128x128
   fallback. The sealed Neon R3 entry cuts paired projection-chain time
