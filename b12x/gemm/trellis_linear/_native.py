@@ -1855,7 +1855,13 @@ class NativeTrellisLinear:
     def multiply_k6_folded(self, inputs: cute.Tensor, payload: cute.Tensor,
                         scales: cute.Tensor, partial: cute.Tensor, output: cute.Tensor,
                         rows: Int32, rotation_id: Int32):
-        """Keep original split partials, then fold them in-CTA in split order."""
+        """Keep original split partials, then fold them in-CTA in split order.
+
+        Each warp owns one K split. One K128 block's payload and activation
+        words are prefetched before any of that block decodes, so the eight
+        K16 decodes overlap a single payload latency instead of serializing
+        eight dependent loads.
+        """
         tid, _, _ = cute.arch.thread_idx()
         task, _, _ = cute.arch.block_idx()
         step, _, _ = cute.arch.grid_dim()
@@ -1863,42 +1869,72 @@ class NativeTrellisLinear:
         storage = cutlass_utils.SmemAllocator().allocate(self._fold_storage())
         fold = shared_ptr_to_u32(storage.fold.data_ptr())
         x = inputs[rotation_id]
+        payload_ptr = payload.iterator.toint()
+        scales_ptr = scales.iterator.toint()
+        # The pair-ring geometry depends only on the lane. Hoisting it keeps the
+        # per-block prefetch a pure address add.
+        i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, 6)
+        i1 = i0 + Int32(1)
+        i1 -= Int32(48) * (i1 >= Int32(48)).to(Int32)
+        i0_off = i0.to(Int64) * Int64(4)
+        i1_off = i1.to(Int64) * Int64(4)
         while task < ((rows + Int32(15)) // Int32(16)) * Int32(self.n // 16):
             nb = task % Int32(self.n // 16)
             group = task // Int32(self.n // 16)
             policy = weight_stream_policy((group + Int32(1) == (rows + Int32(15)) // Int32(16)).to(Int32))
             row0 = group * Int32(16) + lane // Int32(4)
             row1 = row0 + Int32(8)
+            # Dead rows clamp to the last live row; their fragment registers
+            # feed only the accumulators the stores skip.
+            r0c = min(row0, rows - Int32(1))
+            r1c = min(row1, rows - Int32(1))
+            x0_row = x + (r0c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
+            x1_row = x + (r1c.to(Int64) * Int64(self.k) + ((lane & Int32(3)) * Int32(2)).to(Int64)) * Int64(2)
             total = cute.make_rmem_tensor((2, 4), Float32)
             total.fill(Float32(0.0))
-            for block in cutlass.range(8):
+            for block in cutlass.range(8, unroll=1):
                 kb = split * Int32(8) + block
                 if kb < Int32(self.k // 128):
+                    # One K128 block's payload and activation words are
+                    # independent: issue the block's sixteen payload words and
+                    # both activation fragments before decoding any of them so
+                    # the decodes pipeline over one payload latency instead of
+                    # paying that latency once per K16.
+                    tile_kb = (nb // Int32(8)) * Int32(self.k // 16 * 8) + (kb * Int32(8)) * Int32(8) + (nb % Int32(8))
+                    if cutlass.const_expr(self.input_units):
+                        tile_kb = kb * Int32(self.n // 16 * 8) + (nb // Int32(8)) * Int32(64) + (nb % Int32(8))
+                    w_kb = payload_ptr + tile_kb.to(Int64) * Int64(192)
+                    x0_kb = x0_row + kb.to(Int64) * Int64(256)
+                    x1_kb = x1_row + kb.to(Int64) * Int64(256)
+                    a0_buf = cute.make_rmem_tensor((8,), Uint32)
+                    a1_buf = cute.make_rmem_tensor((8,), Uint32)
+                    a2_buf = cute.make_rmem_tensor((8,), Uint32)
+                    a3_buf = cute.make_rmem_tensor((8,), Uint32)
+                    w0_buf = cute.make_rmem_tensor((8,), Uint32)
+                    w1_buf = cute.make_rmem_tensor((8,), Uint32)
+                    for k16 in cutlass.range_constexpr(8):
+                        w_addr = w_kb + Int64(k16 * 1536)
+                        w0_buf[k16] = _load_word(w_addr + i0_off, policy)
+                        w1_buf[k16] = _load_word(w_addr + i1_off, policy)
+                        a0_buf[k16] = ld_global_nc_u32(x0_kb + Int64(k16 * 32))
+                        a2_buf[k16] = ld_global_nc_u32(x0_kb + Int64(k16 * 32 + 16))
+                        a1_buf[k16] = ld_global_nc_u32(x1_kb + Int64(k16 * 32))
+                        a3_buf[k16] = ld_global_nc_u32(x1_kb + Int64(k16 * 32 + 16))
                     acc = cute.make_rmem_tensor((2, 4), Float32)
                     acc.fill(Float32(0.0))
                     for k16 in cutlass.range_constexpr(8):
-                        k = kb * Int32(128) + Int32(k16 * 16) + (lane & Int32(3)) * Int32(2)
-                        a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                        if row0 < rows:
-                            addr = x + (row0.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
-                            a0, a2 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
-                        if row1 < rows:
-                            addr = x + (row1.to(Int64) * Int64(self.k) + k.to(Int64)) * Int64(2)
-                            a1, a3 = ld_global_nc_u32(addr), ld_global_nc_u32(addr + Int64(16))
-                        for n16 in cutlass.range_constexpr(1):
-                            tile = (nb // Int32(8)) * Int32(self.k // 16 * 8) + (kb * Int32(8) + Int32(k16)) * Int32(8) + (nb % Int32(8)) + Int32(n16)
-                            if cutlass.const_expr(self.input_units):
-                                tile = kb * Int32(self.n // 16 * 8) + (nb // Int32(8)) * Int32(64) + Int32(k16 * 8) + (nb % Int32(8)) + Int32(n16)
-                            b0, b1, b2, b3 = decode_k6_pair(payload.iterator.toint(), tile, lane, self.e4m3, self.mul1, policy)
-                            d0, d1, d2, d3 = self.mma(
-                                acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3],
-                                a0, a1, a2, a3, b0, b1)
-                            acc[2*n16, 0], acc[2*n16, 1], acc[2*n16, 2], acc[2*n16, 3] = d0, d1, d2, d3
-                            d0, d1, d2, d3 = self.mma(
-                                acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3],
-                                a0, a1, a2, a3, b2, b3)
-                            acc[2*n16+1, 0], acc[2*n16+1, 1], acc[2*n16+1, 2], acc[2*n16+1, 3] = d0, d1, d2, d3
-                    scale = _side_value(scales.iterator.toint(), kb)
+                        b0, b1, b2, b3 = _decode_k6_pair_words(
+                            w0_buf[k16], w1_buf[k16], lane, shift, delta,
+                            self.e4m3, self.mul1)
+                        d0, d1, d2, d3 = self.mma(
+                            acc[0, 0], acc[0, 1], acc[0, 2], acc[0, 3],
+                            a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16], b0, b1)
+                        acc[0, 0], acc[0, 1], acc[0, 2], acc[0, 3] = d0, d1, d2, d3
+                        d0, d1, d2, d3 = self.mma(
+                            acc[1, 0], acc[1, 1], acc[1, 2], acc[1, 3],
+                            a0_buf[k16], a1_buf[k16], a2_buf[k16], a3_buf[k16], b2, b3)
+                        acc[1, 0], acc[1, 1], acc[1, 2], acc[1, 3] = d0, d1, d2, d3
+                    scale = _side_value(scales_ptr, kb)
                     for n in cutlass.range_constexpr(2):
                         for v in cutlass.range_constexpr(4):
                             total[n, v] = total[n, v] + acc[n, v] * scale
@@ -6672,16 +6708,14 @@ def _decode_k6_pair_shfl(
 
 
 @cute.jit
-def decode_k6_pair(address: Int64, tile: Int32, lane: Int32,
-                   e4m3: cutlass.Constexpr, mul1: cutlass.Constexpr, policy):
-    # Even lanes borrow the next lane first word; odd lanes reuse word two.
-    # The last even lane is 30, so no active lane reads past the warp.
-    base = address + tile.to(Int64) * Int64(192)
-    i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, 6)
-    i1 = i0 + Int32(1)
-    i1 -= Int32(48) * (i1 >= Int32(48)).to(Int32)
-    z0 = _load_word(base + i0.to(Int64) * Int64(4), policy)
-    z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
+def _decode_k6_pair_words(z0: Uint32, z1: Uint32, lane: Int32, shift: Int32,
+                          delta: Int32, e4m3: cutlass.Constexpr,
+                          mul1: cutlass.Constexpr):
+    """``decode_k6_pair`` from the two ring words a caller already issued.
+
+    ``z0``/``z1`` are the words a ``decode_k6_pair`` call would load for this
+    lane; callers that prefetch a whole K128 block pass them from registers.
+    """
     next_z0 = cute.arch.shuffle_sync(z0, lane ^ Int32(1))
     z2 = next_z0
     if (lane & Int32(1)) != Int32(0):
@@ -6695,6 +6729,20 @@ def decode_k6_pair(address: Int64, tile: Int32, lane: Int32,
         b0, b1 = _e4m3_round_half2(b0), _e4m3_round_half2(b1)
         b2, b3 = _e4m3_round_half2(b2), _e4m3_round_half2(b3)
     return b0, b1, b2, b3
+
+
+@cute.jit
+def decode_k6_pair(address: Int64, tile: Int32, lane: Int32,
+                   e4m3: cutlass.Constexpr, mul1: cutlass.Constexpr, policy):
+    # Even lanes borrow the next lane first word; odd lanes reuse word two.
+    # The last even lane is 30, so no active lane reads past the warp.
+    base = address + tile.to(Int64) * Int64(192)
+    i0, i2, shift, delta = trellis256_lane_geom_bits(lane, 0, 8, 6)
+    i1 = i0 + Int32(1)
+    i1 -= Int32(48) * (i1 >= Int32(48)).to(Int32)
+    z0 = _load_word(base + i0.to(Int64) * Int64(4), policy)
+    z1 = _load_word(base + i1.to(Int64) * Int64(4), policy)
+    return _decode_k6_pair_words(z0, z1, lane, shift, delta, e4m3, mul1)
 
 
 @dsl_user_op
