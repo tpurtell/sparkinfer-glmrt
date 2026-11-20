@@ -90,7 +90,7 @@ from b12x.moe._shared.execution import (
     _SOURCE_FORMATS as _EXECUTION_SOURCE_FORMATS,
     _TRELLIS_SOURCE_FORMATS as _EXECUTION_TRELLIS_SOURCE_FORMATS,
 )
-from b12x.moe._shared.trellis_codebooks import MCG, SQG_E4M3
+from b12x.moe._shared.trellis_codebooks import MCG, MUL1, SQG_E4M3
 from b12x.preparation import DeviceIdentity
 from b12x._lib.runtime_control import (
     raise_if_kernel_resolution_frozen,
@@ -3058,6 +3058,17 @@ def _build_tp_moe_fp4_binding_from_views(
             )
     output_cast_target = None
     if plan.full_rotation:
+        prepared_for_cb = experts.representation_for("w4a16")
+        prepared_cb = getattr(prepared_for_cb, "trellis_codebook", None)
+        if (
+            prepared_cb is not None
+            and plan.trellis_codebook is not None
+            and prepared_cb != plan.trellis_codebook
+        ):
+            raise ValueError(
+                "prepared full-rotation Trellis codebook does not match the plan: "
+                f"prepared={prepared_cb!r}, planned={plan.trellis_codebook!r}"
+            )
         if topk_weights.dtype != torch.float32:
             raise TypeError("full-rotation Trellis topk_weights must be float32")
         if topk_ids.dtype not in (torch.int32, torch.int64):
@@ -3376,8 +3387,10 @@ def _plan_core_workspace(
                     "per-expert-pair btx extents require n=256 and trellis_bits=3"
                 )
         if projection_mixed_trellis:
-            if not full_rotation or trellis_codebook != "mcg":
-                raise ValueError("projection-mixed Trellis requires native MCG weights")
+            if not full_rotation or trellis_codebook not in (MCG, MUL1):
+                raise ValueError(
+                    "projection-mixed Trellis requires native MCG or MUL1 weights"
+                )
             if activation != "silu":
                 raise NotImplementedError(
                     "projection-mixed Trellis execution currently requires silu"
@@ -3513,7 +3526,7 @@ def _plan_core_workspace(
                 projection_mixed_trellis=True,
                 trellis_bits=int(trellis_bits),
                 trellis_tile_config=trellis_tile_config,
-                trellis_codebook="mcg",
+                trellis_codebook=trellis_codebook,
                 coupled_hadamard=False,
                 route_block_size_m=block_size_m,
                 tensor_specs=tensor_specs,
@@ -6502,6 +6515,7 @@ def prepare_b12x_fp4_moe_weights(
     intermediate_rotations: torch.Tensor | None = None,
     down_svh: torch.Tensor | None = None,
     trellis_mcg: torch.Tensor | int | None = None,
+    trellis_mul1: torch.Tensor | int | None = None,
     immutable_input_scales: bool = False,
 ) -> B12XFP4ExpertWeights:
     """Transfer source tensors into the planner-selected runtime owner.
@@ -6521,6 +6535,7 @@ def prepare_b12x_fp4_moe_weights(
     if plan.source_format == "b12x_trellis":
         from b12x.moe._shared.kernels.w4a16.prepare import (
             prepare_trellis256_moe_weights,
+            resolve_exl3_checkpoint_codebook,
         )
 
         if w1_fp4 is None or w2_fp4 is None:
@@ -6538,10 +6553,17 @@ def prepare_b12x_fp4_moe_weights(
             raise ValueError(
                 "b12x_trellis preparation is missing: " + ", ".join(missing)
             )
-        if plan.trellis_codebook != "mcg" or trellis_mcg != 0xCBAC1FED:
+        if plan.trellis_codebook not in (MCG, MUL1):
             raise ValueError(
-                "b12x_trellis MCG preparation requires trellis_mcg=0xCBAC1FED"
+                "b12x_trellis direct tensor preparation requires codebook "
+                "'mcg' or 'mul1'"
             )
+        resolved_codebook = resolve_exl3_checkpoint_codebook(
+            mcg=trellis_mcg,
+            mul1=trellis_mul1,
+            codebook=plan.trellis_codebook,
+            require_marker=True,
+        )
         tile_config = plan.trellis_tile_config or (64, 256, 64, 256)
         value = prepare_trellis256_moe_weights(
             w13=w1_fp4,
@@ -6559,7 +6581,7 @@ def prepare_b12x_fp4_moe_weights(
             w13_layout="trellis_t256_proj",
             trellis_bits=plan.trellis_bits,
             dummy_scale=dummy_scale,
-            codebook=plan.trellis_codebook,
+            codebook=resolved_codebook,
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,
@@ -6673,6 +6695,11 @@ def prepare_b12x_fp4_moe_weights(
             representation=representation,
         )
     if plan.source_format == "exl3_trellis_mcg":
+        from b12x.moe._shared.kernels.w4a16.prepare import (
+            prepare_trellis256_moe_weights,
+            resolve_exl3_checkpoint_codebook,
+        )
+
         if plan.trellis_rate_granularity == "per_expert_projection":
             raise ValueError(
                 "projection-mixed EXL3 preparation requires projection_tiers"
@@ -6681,18 +6708,15 @@ def prepare_b12x_fp4_moe_weights(
             raise ValueError("EXL3 Trellis weights support only w4a16")
         if w1_fp4 is None or w2_fp4 is None:
             raise ValueError("EXL3 Trellis preparation requires both weight payloads")
-        if trellis_mcg is None:
+        resolved_codebook = resolve_exl3_checkpoint_codebook(
+            mcg=trellis_mcg,
+            mul1=trellis_mul1,
+            codebook=plan.trellis_codebook,
+            require_marker=True,
+        )
+        if resolved_codebook not in (MCG, MUL1):
             raise ValueError(
-                "EXL3 Trellis preparation requires the checkpoint MCG marker"
-            )
-        marker = (
-            int(trellis_mcg.item())
-            if isinstance(trellis_mcg, torch.Tensor)
-            else int(trellis_mcg)
-        ) & 0xFFFFFFFF
-        if marker != 0xCBAC1FED:
-            raise ValueError(
-                f"unexpected EXL3 MCG marker {marker:#010x}; expected 0xcbac1fed"
+                "EXL3 Trellis preparation requires codebook 'mcg' or 'mul1'"
             )
         if not all(
             isinstance(value, torch.Tensor)
@@ -6731,9 +6755,6 @@ def prepare_b12x_fp4_moe_weights(
             raise ValueError(
                 "gate_suh and up_suh must both be per-expert or both broadcast"
             )
-        from b12x.moe._shared.kernels.w4a16.prepare import (
-            prepare_trellis256_moe_weights,
-        )
 
         tile_config = plan.trellis_tile_config or (64, 256, 64, 256)
         value = prepare_trellis256_moe_weights(
@@ -6751,7 +6772,7 @@ def prepare_b12x_fp4_moe_weights(
             w13_layout="trellis_t256_proj",
             trellis_bits=plan.trellis_bits,
             dummy_scale=dummy_scale,
-            codebook=MCG,
+            codebook=resolved_codebook,
             gate_suh=gate_suh,
             up_suh=up_suh,
             intermediate_rotations=intermediate_rotations,
@@ -7012,6 +7033,10 @@ def prepare_b12x_trellis_v2_weights(
         hidden_size=plan.hidden_size,
         intermediate_size=plan.intermediate_size,
     )
+    effective_plan = plan
+    trellis_meta = getattr(value, "trellis", None)
+    if trellis_meta is not None and int(trellis_meta.bits) != int(plan.trellis_bits or 3):
+        effective_plan = replace(plan, trellis_bits=int(trellis_meta.bits))
     representation = _PreparedWeightRepresentation(
         quant_mode="w4a16",
         layout=PreparedWeightLayout.TRELLIS_NATIVE,
@@ -7019,7 +7044,7 @@ def prepare_b12x_trellis_v2_weights(
     )
     unit_input = torch.ones((), dtype=torch.float32, device=value.w13.device)
     return B12XFP4ExpertWeights(
-        plan=plan,
+        plan=effective_plan,
         a1_gscale=unit_input,
         w1_fp4=value.w13,
         w1_blockscale=value.w13_scale,
@@ -7040,8 +7065,10 @@ def prepare_b12x_projection_native_trellis_weights(
     up_suh: torch.Tensor,
     intermediate_rotations: torch.Tensor,
     down_svh: torch.Tensor,
+    mcg: torch.Tensor | int | None = None,
+    mul1: torch.Tensor | int | None = None,
 ) -> B12XFP4ExpertWeights:
-    """Prepare projection-major MCG tensors into the standard expert owner."""
+    """Prepare projection-major MCG/MUL1 tensors into the standard expert owner."""
 
     from b12x.moe.fused_moe.trellis import (
         ProjectionTrellisTierWeights,
@@ -7058,6 +7085,10 @@ def prepare_b12x_projection_native_trellis_weights(
     if plan.trellis_rate_granularity != "per_expert_projection":
         raise ValueError(
             "projection-native Trellis requires per_expert_projection rates"
+        )
+    if plan.trellis_codebook not in (MCG, MUL1):
+        raise ValueError(
+            "projection-native Trellis requires codebook 'mcg' or 'mul1'"
         )
     if not isinstance(native_tiers, tuple) or len(native_tiers) != 2 or any(
         not isinstance(tier, ProjectionTrellisTierWeights) for tier in native_tiers
@@ -7084,6 +7115,9 @@ def prepare_b12x_projection_native_trellis_weights(
         num_experts=plan.num_experts,
         hidden_size=plan.hidden_size,
         intermediate_size=plan.intermediate_size,
+        codebook=plan.trellis_codebook,
+        mcg=mcg,
+        mul1=mul1,
     )
     expected_tiers = tuple(
         int(plan.trellis_bits or 3) + offset for offset in range(2)
@@ -8653,7 +8687,7 @@ def _plan_projection_mixed_trellis_launches(
                     token_count=token_count,
                     direct_topk_routes=direct_topk_routes,
                 ),
-                trellis_codebook="mcg",
+                trellis_codebook=core_plan.trellis_codebook or MCG,
                 swiglu_limit=core_plan.swiglu_limit,
                 tier0_bits=tier_bits[0],
                 tier1_bits=tier_bits[1],
@@ -8770,7 +8804,7 @@ def _uses_projection_mixed_trellis(
 ) -> bool:
     return (
         weight_plan.source_format in _TRELLIS_SOURCE_FORMATS
-        and weight_plan.trellis_codebook == "mcg"
+        and weight_plan.trellis_codebook in (MCG, MUL1)
         and weight_plan.trellis_rate_granularity == "per_expert_projection"
     )
 
@@ -8920,11 +8954,17 @@ def _bind_projection_mixed_trellis_from_views(
     prepared = experts.representation_for("w4a16")
     if not isinstance(prepared, PreparedProjectionTrellisWeights):
         raise TypeError(
-            "projection-mixed scratch requires prepared b12x_trellis MCG weights"
+            "projection-mixed scratch requires prepared projection-mixed Trellis weights"
         )
     if prepared.w13.device != a.device:
         raise ValueError(
             f"prepared weights must be on {a.device}, got {prepared.w13.device}"
+        )
+    expected_codebook = core_plan.trellis_codebook or MCG
+    if prepared.trellis_codebook != expected_codebook:
+        raise ValueError(
+            "prepared projection-mixed Trellis codebook does not match the plan: "
+            f"prepared={prepared.trellis_codebook!r}, planned={expected_codebook!r}"
         )
     expected_tier_count = 2 if core_plan.implementation == "trellis_mixed" else 3
     expected_tier_bits = tuple(
@@ -9536,6 +9576,7 @@ def _prewarm_w4a16_planned_launches(
                         w13_layout=w13_layout,
                         collect_activation_amax=False,
                         trellis_bits=workspace.trellis_bits,
+                        trellis_codebook=workspace.trellis_codebook or SQG_E4M3,
                         fc1_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                         fc2_trellis_pair_kind=_fc_trellis_pair_kind(workspace),
                         force_tile_config=workspace.trellis_tile_config,
@@ -9791,6 +9832,8 @@ def materialize_tp_moe_arena_workspaces(
                 if isinstance(existing, TPW4A16Workspace) and (
                     not set(core_token_counts).issubset(existing.planned_token_counts)
                     or existing.coupled_hadamard != core_plan.coupled_hadamard
+                    or existing.trellis_bits != core_plan.trellis_bits
+                    or existing.trellis_codebook != core_plan.trellis_codebook
                     or existing.planned_apply_router_weight_on_input
                     != bool(apply_router_weight_on_input)
                     or existing.planned_swiglu_limit != plan.swiglu_limit
@@ -10100,6 +10143,15 @@ def build_tp_moe_fp4_binding(
             )
             scale_format = _w4a16_scale_format_for_source(source_format)
         if workspace.full_rotation:
+            if workspace.trellis_bits != int(experts.plan.trellis_bits or 3) or (
+                workspace.trellis_codebook
+                != _derive_trellis_codebook(
+                    experts.plan.source_format, experts.plan.trellis_codebook
+                )
+            ):
+                raise ValueError(
+                    "full-rotation Trellis workspace bits/codebook do not match prepared experts"
+                )
             if workspace.full_rotation_output is None:
                 raise RuntimeError("Trellis workspace is missing its output")
             if output is None:

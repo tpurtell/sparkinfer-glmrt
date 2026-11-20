@@ -22,6 +22,7 @@ from b12x._lib.intrinsics import get_ptr_as_int64, shared_ptr_to_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.trellis_codebooks import (
+    MCG,
     normalize_codebook,
     validate_codebook_bits,
 )
@@ -913,7 +914,7 @@ def compile_mixed_trellis4(
     tier1_bits: int = 3,
     tier2_bits: int = 4,
     tier3_bits: int = 5,
-    trellis_codebook: str = "mcg",
+    trellis_codebook: str | int = MCG,
     swiglu_limit: float | None = None,
     activation: str = "silu",
     moe_block_size: int = 8,

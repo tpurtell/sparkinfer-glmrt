@@ -575,14 +575,22 @@ class _AotReplayVariant:
         self.capacity = capacity
         meta = json.loads((directory / 'v41_exl3.json').read_text())
         self.meta = meta
-        if geometry is None:
+        is_default_kimi = geometry is None
+        if is_default_kimi:
             geometry = KIMI_HIDDEN, KIMI_INTERMEDIATE, KIMI_EXPERTS, KIMI_TOPK, [2, 3]
             check(meta['activation'] == 'situ' and meta.get('route_block', 8) == 8
                   and not meta.get('warp_specialized'), f'unexpected decode recipe: {directory}')
         hidden, intermediate, experts, self.top_k, bits = geometry
+        expected_compute = [12, 1] if is_default_kimi else meta.get('compute')
+        expected_dtype = 'bf16' if is_default_kimi else meta.get('output_dtype')
+        check(expected_compute in ([12, 0], [12, 1]) and expected_dtype in ('bf16', 'fp32')
+              and meta.get('codebook', 'mcg') in ('mcg', 'mul1'),
+              f'unexpected AOT target/dtype/codebook: {directory}')
+        check(list(torch.cuda.get_device_capability('cuda')) == expected_compute,
+              f'AOT compute capability mismatch: {directory}')
         check((meta['compute'], meta['hidden'], meta['intermediate'], meta['experts'], meta['top_k'],
                meta['bits'], meta['capacity'], meta['output_dtype'], meta['requires_route_preparation']) ==
-              ([12, 1], hidden, intermediate, experts, self.top_k, bits, capacity, 'bf16', True),
+              (expected_compute, hidden, intermediate, experts, self.top_k, bits, capacity, expected_dtype, True),
               f'unexpected AOT recipe: {directory}')
         check([o['label'] for o in meta['objects']] == ['v41_exl3_core', 'v41_exl3_sum'],
               f'unexpected launch sequence: {directory}')
@@ -1159,7 +1167,7 @@ def compact_prefill_fixture(path, rank, family, width, experts=None, bits=None):
 
 def _make_compact_prefill_layer(fixture, width, seed, device, mix, *,
                                 hidden=None, experts=None, bits=None, activation=None,
-                                family="qwen4"):
+                                family="qwen4", codebook="mcg"):
     if hidden is None or experts is None or bits is None or activation is None:
         hidden, experts, _, bits, activation = PREFILL_FAMILIES[family]
     # Serving exports reserve E slots per tier, independently of projection counts.
@@ -1188,7 +1196,7 @@ def _make_compact_prefill_layer(fixture, width, seed, device, mix, *,
             hidden_size=hidden, intermediate_size=width, num_experts=1,
             activation=activation, fc1_tile_n=128, fc2_tile_n=128, device=device,
             seed=seed + tier, params_dtype=torch.float16, w13_layout="trellis_t256_proj",
-            trellis_bits=bit, codebook="mcg", tile_config=(64, 128, 64, 128))
+            trellis_bits=bit, codebook=codebook, tile_config=(64, 128, 64, 128))
         def packed(size):
             return torch.randint(-(1 << 31), 1 << 31, (max(size, 4),),
                                  generator=generator, device=device, dtype=torch.int32)
@@ -1267,6 +1275,8 @@ def prefill_compile_options(family, width, block, mode, props, *, compact=False,
 
 
 def _run_prefill_benchmark(args, device, props):
+    if getattr(args, "codebook", "mcg") != "mcg":
+        raise ValueError("legacy Spark prefill does not support --codebook mul1")
     from benchmarks.benchmark_exlr8_a16 import (
         materialize_k4_arm, load_k4_arm, k4_noise_summary, real_route_ids, make_wire,
     )
@@ -1577,6 +1587,9 @@ def parse_coordinator_arm(text):
                 # its host/driver), compiled in its own namespace.
                 if not re.fullmatch(r"[0-9a-f]{7,40}", value):
                     raise ValueError("revision must be a 7-40 digit lowercase commit SHA")
+            elif key == "codebook":
+                if value not in ("mcg", "mul1"):
+                    raise ValueError("invalid codebook")
             elif key in ("route_block", "ctas", "stages", "wire", "dynamic", "prerotate"):
                 value = int(value)
                 legal = {"route_block": (8, 16, 32, 64), "ctas": (1, 2, 3, 4),
@@ -1592,7 +1605,7 @@ def parse_coordinator_arm(text):
     return name, options
 
 
-def coordinator_compile_options(profile, capacity, arm, props, family="glm", compact=False, bits=None):
+def coordinator_compile_options(profile, capacity, arm, props, family="glm", compact=False, bits=None, codebook="mcg"):
     """Mirror the family's cooperative coordinator export, with explicit experimental overrides."""
     spec = COORDINATOR_FAMILIES.get(family)
     if spec is None or profile not in spec["profiles"] or capacity not in spec["capacities"]:
@@ -1642,13 +1655,16 @@ def coordinator_compile_options(profile, capacity, arm, props, family="glm", com
             raise ValueError("cooperative FC1/FC2 tiles must have equal CTA thread counts")
     if arm.get("prerotate") and arm.get("wire"):
         raise ValueError("hoisted prerotation reads BF16 rows; wire input rotates in tile")
+    resolved_codebook = arm.get("codebook", codebook)
+    if resolved_codebook not in ("mcg", "mul1"):
+        raise ValueError("invalid codebook")
     slots = route_pack_capacity(capacity * topk, block, experts, topk=topk)[1]
     extra = {} if "prerotate" not in arm else dict(ws_prerotate=bool(arm["prerotate"]))
     return dict(size_m=capacity, hidden_size=hidden, intermediate_size=width,
         tier0_num_experts=experts, tier1_num_experts=experts, tier0_bits=tier0_bits, tier1_bits=tier1_bits,
         route_num_experts=experts, top_k=topk, max_m_blocks=(slots + block - 1) // block,
         sms=int(props.multi_processor_count), max_shared_mem=int(props.shared_memory_per_block_optin),
-        force_tile_config=tile, trellis_codebook="mcg", activation=spec["activation"],
+        force_tile_config=tile, trellis_codebook=resolved_codebook, activation=spec["activation"],
         swiglu_limit=spec["swiglu_limit"],
         moe_block_size=block, rotation_input_dtype="bf16", full_rotation_output_dtype="bf16" if spark else "fp32",
         direct_topk_routes=False, token_major_rotation=token, fused_input_rotation=fused,
@@ -1785,14 +1801,15 @@ def coordinator_preflight(args):
              if "realistic" in routes or args.routes is not None else [])
     # CPU-only placeholders validate argument plumbing, never describe a timed device.
     props = SimpleNamespace(multi_processor_count=1, shared_memory_per_block_optin=101376)
+    default_codebook = getattr(args, "codebook", "mcg")
     for capacity in capacities:
         for _, arm in specs:
             coordinator_compile_options(args.profile, capacity, arm, props, family,
-                                        compact is not None, getattr(args, "bits", None))
+                                        compact is not None, getattr(args, "bits", None), default_codebook)
     return capacities, specs, routes, waves, compact
 
 
-def _make_coordinator_layer(width, k5_experts, seed, device, family="glm", bits=None):
+def _make_coordinator_layer(width, k5_experts, seed, device, family="glm", bits=None, codebook="mcg"):
     """Synthetic projection-major tier payloads with the export's full expert tier slots."""
     spec = COORDINATOR_FAMILIES[family]
     hidden, experts = spec["hidden"], spec["experts"]
@@ -1803,7 +1820,7 @@ def _make_coordinator_layer(width, k5_experts, seed, device, family="glm", bits=
             hidden_size=hidden, intermediate_size=width, num_experts=max(count, 1),
             activation=spec["activation"], fc1_tile_n=128, fc2_tile_n=128, device=device,
             seed=seed + tier, params_dtype=torch.float16, w13_layout="trellis_t256_proj",
-            trellis_bits=bits, codebook="mcg", tile_config=(64, 128, 64, 128))
+            trellis_bits=bits, codebook=codebook, tile_config=(64, 128, 64, 128))
         w13 = prepared.w13 if count else prepared.w13[:prepared.w13.numel() // 2]
         scales = torch.ones(experts, dtype=torch.float32, device=device)
         scales[:max(count, 1)].copy_(prepared.w13_global_scale)
@@ -1850,7 +1867,10 @@ def _power_limit_w(props):
     try:
         import pynvml
         pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+        uuid = str(props.uuid)
+        if not uuid.startswith("GPU-"):
+            uuid = "GPU-" + uuid
+        handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
         return pynvml.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0
     except Exception:
         return None
@@ -1886,12 +1906,16 @@ def muse_partial_binding(binding, workspace, program):
 
 
 
-def decode_mcg_matrix(payload, rows, columns, bits):
-    """Independent native MCG tile decoder; no GEMM/materialization kernel oracle."""
+def decode_mcg_matrix(payload, rows, columns, bits, codebook="mcg"):
+    """Independent native Trellis tile decoder; no GEMM/materialization kernel oracle."""
     import numpy as np
+    if codebook not in ("mcg", "mul1"):
+        raise ValueError(f"unsupported codebook {codebook!r}")
     words = payload.detach().cpu().contiguous().numpy().view(np.uint32).reshape(
         rows // 16, columns // 16, 8 * bits)
     output = np.empty((rows // 16, columns // 16, 16, 16), dtype=np.float32)
+    kinv = float(np.uint16(0x1EEE).view(np.float16))
+    kbias = float(np.uint16(0xC931).view(np.float16))
     for lane in range(32):
         for weight in range(8):
             end = (lane * 8 + weight + 257) * bits
@@ -1899,15 +1923,25 @@ def decode_mcg_matrix(payload, rows, columns, bits):
             merged = (words[..., first % (8 * bits)].astype(np.uint64) << np.uint64(32))
             merged |= words[..., last % (8 * bits)].astype(np.uint64)
             window = (merged >> np.uint64((last + 1) * 32 - end)) & np.uint64(65535)
-            value = ((window * np.uint64(0xCBAC1FED)) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
-            value = (value & np.uint32(0x8FFF8FFF)) ^ np.uint32(0x3B603B60)
-            low = (value & np.uint32(65535)).astype(np.uint16).view(np.float16)
-            high = (value >> np.uint32(16)).astype(np.uint16).view(np.float16)
-            decoded = (low + high).astype(np.float16).astype(np.float32)
+            if codebook == "mcg":
+                value = ((window * np.uint64(0xCBAC1FED)) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+                value = (value & np.uint32(0x8FFF8FFF)) ^ np.uint32(0x3B603B60)
+                low = (value & np.uint32(65535)).astype(np.uint16).view(np.float16)
+                high = (value >> np.uint32(16)).astype(np.uint16).view(np.float16)
+                decoded = (low + high).astype(np.float16).astype(np.float32)
+            else:
+                prod = ((window * np.uint64(0x83DCD12D)) & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+                bsum = ((prod & np.uint32(0xFF)) + ((prod >> np.uint32(8)) & np.uint32(0xFF))
+                        + ((prod >> np.uint32(16)) & np.uint32(0xFF)) + ((prod >> np.uint32(24)) & np.uint32(0xFF)))
+                h = (np.uint32(0x6400) + bsum).astype(np.uint16).view(np.float16).astype(np.float64)
+                decoded = (h * kinv + kbias).astype(np.float16).astype(np.float32)
             row = (lane % 4) * 2 + (weight % 4 // 2) * 8 + weight % 2
             column = 2 * (lane // 8 + (4 if weight >= 4 else 0)) + ((lane >> 2) & 1)
             output[..., row, column] = decoded
     return torch.from_numpy(output.transpose(0, 2, 1, 3).reshape(rows, columns).copy())
+
+
+decode_trellis_matrix = decode_mcg_matrix
 
 
 def oracle_error(values, reference):
@@ -1920,10 +1954,10 @@ def oracle_error_no_worse(error, control):
     return all(error[key] <= control[key] for key in ("max_abs", "rms"))
 
 
-def coordinator_f32_oracle(layer, source, ids, weights, family):
+def coordinator_f32_oracle(layer, source, ids, weights, family, codebook="mcg"):
     """Full-F32 expert math from decoded checkpoint-layout weights, one expert at a time.
 
-    Native MCG labels are FP16 by definition; rotations, GEMMs, activation,
+    Native MCG/MUL1 labels are FP16 by definition; rotations, GEMMs, activation,
     router weighting and ordered accumulation introduce no further low-precision rounding.
     Decoded matrices are transient, so the oracle never retains an entire dense MoE.
     """
@@ -1966,7 +2000,10 @@ def coordinator_f32_oracle(layer, source, ids, weights, family):
             else:
                 payload = payloads[tier][1][local * words:(local + 1) * words]
                 scale = t.w2_global_scale[local]
-            decoded.append(decode_mcg_matrix(payload, k, n, t.trellis_bits).to(source.device) * scale)
+            mat = (decode_mcg_matrix(payload, k, n, t.trellis_bits)
+                   if codebook == "mcg"
+                   else decode_mcg_matrix(payload, k, n, t.trellis_bits, codebook))
+            decoded.append(mat.to(source.device) * scale)
         gate_svh, up_svh, down_suh = rotations.intermediate[combined].float().split(width)
         x = source[token].float()
         gate = had(had(x * rotations.gate_suh[combined].float()) @ decoded[0]) * gate_svh
@@ -1991,18 +2028,28 @@ def coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, wei
     from benchmarks.benchmark_exlr8_a16 import k4_noise_summary
     from b12x._lib.runtime_control import kernel_resolution_guard
     control = specs[0][0]
+    default_cb = getattr(args, "codebook", "mcg")
+    arm_cb = {name: (arm.get("codebook", default_cb) if isinstance(arm, dict) else default_cb)
+              for name, arm in specs}
+    codebooks = sorted(set(arm_cb.values()))
+    legacy_mcg = codebooks == ["mcg"]
+    cb_controls = {cb: next(name for name, _ in specs if arm_cb[name] == cb) for cb in codebooks}
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = False
-        oracle = coordinator_f32_oracle(layer, decoded, ids, weights, args.prefill_family)
+        if legacy_mcg:
+            oracles = {"mcg": coordinator_f32_oracle(layer, decoded, ids, weights, args.prefill_family)}
+        else:
+            oracles = {cb: coordinator_f32_oracle(layer, decoded, ids, weights, args.prefill_family, cb)
+                       for cb in codebooks}
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
     full = {name: run(name).clone() for name, _ in specs}
     same = lambda a, b: torch.equal(a.contiguous().view(bit_dtype), b.contiguous().view(bit_dtype))
-    errors = {name: oracle_error(value, oracle) for name, value in full.items()}
-    per_arm = {name: dict(control_bitwise=same(full[name], full[control]),
+    errors = {name: oracle_error(value, oracles[arm_cb[name]]) for name, value in full.items()}
+    per_arm = {name: dict(control_bitwise=same(full[name], full[cb_controls[arm_cb[name]]]),
                          oracle_error=errors[name], oracle_regions={},
-                         oracle_no_worse=oracle_error_no_worse(errors[name], errors[control]),
+                         oracle_no_worse=oracle_error_no_worse(errors[name], errors[cb_controls[arm_cb[name]]]),
                          finite=bool(torch.isfinite(full[name]).all()), deterministic=True,
                          row_invariant=True, graph_eager=True) for name, _ in specs}
     gates = ("finite", "deterministic", "row_invariant", "graph_eager", "oracle_no_worse")
@@ -2025,18 +2072,20 @@ def coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, wei
             per_arm[name]["graph_eager"] &= same(workspace.output[:expected.shape[0]], expected)
 
     def check_region(rows, start=0):
-        reference = oracle[start:start + rows]
-        control_error = oracle_error(full[control][start:start + rows], reference)
+        references = {cb: oracles[cb][start:start + rows] for cb in codebooks}
+        control_errors = {cb: oracle_error(full[cb_controls[cb]][start:start + rows], references[cb])
+                          for cb in codebooks}
         for name, _ in specs:
+            cb = arm_cb[name]
             check = per_arm[name]
             eager = run(name, rows, start).clone()
             check["finite"] &= bool(torch.isfinite(eager).all())
             check["row_invariant"] &= same(eager, full[name][start:start + rows])
             for _ in range(3):
                 check["deterministic"] &= same(run(name, rows, start), eager)
-            error = oracle_error(eager, reference)
+            error = oracle_error(eager, references[cb])
             check["oracle_regions"][f"{start}:{rows}"] = error
-            check["oracle_no_worse"] &= oracle_error_no_worse(error, control_error)
+            check["oracle_no_worse"] &= oracle_error_no_worse(error, control_errors[cb])
             graph = graph_for(name, rows, start)
             check_graph(name, graph, eager)
             del graph
@@ -2089,12 +2138,23 @@ def coordinator_oracle_case(args, specs, states, modules, run, decoded, ids, wei
         samples_by_rows.append(dict(rows=live, samples_us=samples, noise=noise))
         del graphs
     first = samples_by_rows[0]
+    oracle_label = ("decoded-MCG/full-F32/no-TF32" if legacy_mcg
+                    else f"decoded-{'+'.join(cb.upper() for cb in codebooks)}/full-F32/no-TF32")
+    extra = {}
+    if len(codebooks) > 1:
+        def _numeric_delta(a, b):
+            af, bf = a.float().flatten(), b.float().flatten()
+            denom = float(af.norm() * bf.norm())
+            return dict(**oracle_error(a, b), cosine=float(torch.dot(af, bf) / denom) if denom > 0 else 1.0)
+        base_out = full[cb_controls["mcg"]]
+        extra["codebook_deltas"] = {name: _numeric_delta(full[name], base_out)
+                                    for name, _ in specs if arm_cb[name] != "mcg"}
     return dict(arm_checks=per_arm, bitwise={name: check["control_bitwise"] for name, check in per_arm.items()},
-                oracle="decoded-MCG/full-F32/no-TF32", qualification_scope="per-arm; global qualified checks control only",
+                oracle=oracle_label, qualification_scope="per-arm; global qualified checks control only",
                 samples_us=first["samples_us"], noise=first["noise"], live_rows=samples_by_rows[1:],
                 median_us={name: statistics.median(v) for name, v in first["samples_us"].items() if v},
                 output_sha256={name: hashlib.sha256(value.view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
-                               for name, value in full.items()})
+                               for name, value in full.items()}, **extra)
 
 
 def _run_coordinator_benchmark(args, device, props):
@@ -2103,6 +2163,10 @@ def _run_coordinator_benchmark(args, device, props):
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis as mix
     capacities, specs, distributions, waves, compact = coordinator_preflight(args)
     oracle_name = specs[0][0]
+    default_cb = getattr(args, "codebook", "mcg")
+    arm_cb = {name: arm.get("codebook", default_cb) for name, arm in specs}
+    codebooks = sorted(set(arm_cb.values()))
+    legacy_mcg = codebooks == ["mcg"]
     modules, revisions = coordinator_arm_modules(specs, mix, args.arm_source_dir)
     spec = COORDINATOR_FAMILIES[args.prefill_family]
     hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
@@ -2117,13 +2181,17 @@ def _run_coordinator_benchmark(args, device, props):
         partial_program = compile_expert_partial_aot(width=hidden, topk=topk, format="bf16")
     output_dtype = torch.bfloat16 if args.role == "spark" or partial_program else torch.float32
     bit_dtype = torch.int16 if output_dtype == torch.bfloat16 else torch.int32
-    layers = [(_make_compact_prefill_layer(compact, width, args.seed + 2*i, device, mix,
-                                           hidden=hidden, experts=experts, bits=args.bits or spec["bits"],
-                                           activation=spec["activation"], family=args.prefill_family)
-               if compact else
-               _make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device,
-                                       args.prefill_family, args.bits))
-              for i in range(args.layers)]
+    layers_by_cb = {
+        cb: [(_make_compact_prefill_layer(compact, width, args.seed + 2*i, device, mix,
+                                          hidden=hidden, experts=experts, bits=args.bits or spec["bits"],
+                                          activation=spec["activation"], family=args.prefill_family, codebook=cb)
+              if compact else
+              _make_coordinator_layer(width, args.k5_experts, args.seed + 2*i, device,
+                                      args.prefill_family, args.bits, codebook=cb))
+             for i in range(args.layers)]
+        for cb in codebooks
+    }
+    layers = layers_by_cb[codebooks[0]]
     counts = (tuple(tuple(c[p] for c in compact["counts"]) for p in (0, 1)) if compact
               else (experts - args.k5_experts, args.k5_experts))
     bind_counts = (dict(gate_experts=counts[0], up_experts=counts[1]) if compact
@@ -2131,19 +2199,39 @@ def _run_coordinator_benchmark(args, device, props):
     records, failures = [], []
     for capacity in capacities:
         states = {}
+        aux_oracles = {}
         for name, arm in specs:
+            cb = arm_cb[name]
             options = coordinator_compile_options(args.profile, capacity, arm, props, args.prefill_family,
-                                                  compact is not None, args.bits)
+                                                  compact is not None, args.bits, default_cb)
             print(json.dumps(dict(compiling=name, capacity=capacity, options=options,
                                   revision=revisions[name])), flush=True)
             arm_mix = modules[name]
             launch = arm_mix.compile_mixed_trellis(**options)
             workspace = arm_mix.make_mixed_trellis_buffers(launch, device=device, sms=props.multi_processor_count)
-            bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers]
+            bindings = [arm_mix.bind_mixed_trellis(*layer, launch, **bind_counts) for layer in layers_by_cb[cb]]
             if partial_program is not None:
                 bindings = [muse_partial_binding(binding, workspace, partial_program) for binding in bindings]
             arm_mix.warmup_mixed_trellis_route_pack(launch, workspace, expert_map=bindings[0].global_to_combined)
             states[name] = workspace, bindings
+        oracle_for_cb = {}
+        for cb in codebooks:
+            cb_arms = [(n, a) for n, a in specs if arm_cb[n] == cb]
+            if args.no_coop or cb_arms[0][1].get("mode", "cooperative") == "cooperative":
+                oracle_for_cb[cb] = cb_arms[0][0]
+            else:
+                aux_name = f"__coop_{cb}"
+                aux_opts = coordinator_compile_options(args.profile, capacity, {"codebook": cb}, props,
+                                                       args.prefill_family, compact is not None, args.bits, cb)
+                aux_launch = mix.compile_mixed_trellis(**aux_opts)
+                aux_ws = mix.make_mixed_trellis_buffers(aux_launch, device=device, sms=props.multi_processor_count)
+                aux_bind = [mix.bind_mixed_trellis(*layer, aux_launch, **bind_counts) for layer in layers_by_cb[cb]]
+                if partial_program is not None:
+                    aux_bind = [muse_partial_binding(b, aux_ws, partial_program) for b in aux_bind]
+                mix.warmup_mixed_trellis_route_pack(aux_launch, aux_ws, expert_map=aux_bind[0].global_to_combined)
+                aux_oracles[aux_name] = aux_ws, aux_bind
+                modules[aux_name] = mix
+                oracle_for_cb[cb] = aux_name
         generator = torch.Generator().manual_seed(args.seed + capacity)
         raw = (torch.randn((capacity, hidden), generator=generator) * 0.02).to(device=device, dtype=torch.bfloat16)
         # The BF16 oracle consumes exactly the decoded wire values, not the pre-quantized input.
@@ -2160,7 +2248,7 @@ def _run_coordinator_benchmark(args, device, props):
                        torch.rand((capacity, experts), generator=generator).topk(topk, dim=1).indices).to(device=device, dtype=torch.int32)
                 for layer in range(args.layers):
                     def run(name, rows=None, start=0):
-                        workspace, bindings = states[name]
+                        workspace, bindings = states[name] if name in states else aux_oracles[name]
                         source = wire if bindings[layer].launch.input_format == "e4m3_k32" else decoded
                         count = capacity if rows is None else rows
                         result = modules[name].run_bound_mixed_trellis(
@@ -2181,21 +2269,30 @@ def _run_coordinator_benchmark(args, device, props):
                                                  wave_index=wave_index, control=case["arm_checks"][oracle_name]))
                         print(json.dumps(record), flush=True)
                         continue
-                    expected = run(oracle_name).clone()
-                    if expected.dtype != output_dtype or not bool(torch.isfinite(expected).all()) or not bool(expected.any()):
-                        raise RuntimeError("oracle must use the role's sum dtype and be finite and nonzero")
+                    expected_by_cb = {cb: run(oracle_for_cb[cb]).clone() for cb in codebooks}
+                    expected = expected_by_cb[arm_cb[oracle_name]]
+                    for out_cb in expected_by_cb.values():
+                        if out_cb.dtype != output_dtype or not bool(torch.isfinite(out_cb).all()) or not bool(out_cb.any()):
+                            raise RuntimeError("oracle must use the role's sum dtype and be finite and nonzero")
+                    full_outputs = {}
                     # Live rows below the compiled capacity time the same export at
                     # the planner's partial units; each is checked against the oracle
                     # at that row count and against the capacity batch's prefix.
                     live_records = []
                     for live in [capacity, *sorted({r for r in args.live_rows if r < capacity}, reverse=True)]:
-                        reference = expected if live == capacity else run(oracle_name, live).clone()
+                        references = {cb: (expected_by_cb[cb] if live == capacity else run(oracle_for_cb[cb], live).clone())
+                                      for cb in codebooks}
                         graphs, checks = {}, {}
                         if live != capacity:
-                            checks["oracle_prefix"] = torch.equal(reference.view(bit_dtype),
-                                                                  expected[:live].view(bit_dtype))
+                            checks["oracle_prefix"] = all(
+                                torch.equal(references[cb].view(bit_dtype), expected_by_cb[cb][:live].view(bit_dtype))
+                                for cb in codebooks)
                         for name, _ in specs:
+                            cb = arm_cb[name]
+                            reference = references[cb]
                             actual = run(name, live)
+                            if live == capacity:
+                                full_outputs[name] = actual.clone()
                             checks[name] = torch.equal(actual.view(bit_dtype), reference.view(bit_dtype))
                             workspace, bindings = states[name]
                             # Freeze routing outside the graph: time the real bound core + top-k sum
@@ -2233,57 +2330,32 @@ def _run_coordinator_benchmark(args, device, props):
                     for entry in live_records[1:]:
                         for key, value in entry["bitwise"].items():
                             checks[f"rows{entry['rows']}:{key}"] = value
-                    # Timing runs before the prefix probe: the probe launches
-                    # uncontrolled short-row kernels on these workspaces, which
-                    # repack routes and reset claim state behind the frozen graph,
-                    # so a probe run first makes the timed replay measure a
-                    # perturbed kernel (measured 2026-10-25: the shipped glm
-                    # TP2 m256 wire cell read 1604us with the probe after the
-                    # samples and 3416us with it before).
                     prefix_detail = None
                     if all(checks.values()) and args.prefill_exhaustive:
                         for rows in range(1, capacity + 1):
-                            oracle = run(oracle_name, rows).clone()
-                            if not torch.equal(oracle.view(bit_dtype), expected[:rows].view(bit_dtype)):
-                                raise RuntimeError(f"oracle prefix differs at {rows}/{capacity}")
-                            for name, _ in specs[1:]:
-                                if not torch.equal(run(name, rows).view(bit_dtype), oracle.view(bit_dtype)):
-                                    raise RuntimeError(f"{name} differs at {rows}/{capacity}")
+                            oracles_short = {cb: run(oracle_for_cb[cb], rows).clone() for cb in codebooks}
+                            for cb in codebooks:
+                                if not torch.equal(oracles_short[cb].view(bit_dtype), expected_by_cb[cb][:rows].view(bit_dtype)):
+                                    raise RuntimeError(f"oracle prefix differs at {rows}/{capacity}")
+                            for name, _ in specs:
+                                if name != oracle_for_cb[arm_cb[name]]:
+                                    if not torch.equal(run(name, rows).view(bit_dtype), oracles_short[arm_cb[name]].view(bit_dtype)):
+                                        raise RuntimeError(f"{name} differs at {rows}/{capacity}")
                     if all(checks.values()):
-                        # Prefix row-invariance with poisoned tails: a short prefill
-                        # must reproduce the capacity batch's first rows bit for bit
-                        # while every row behind it is poisoned, so a launch that
-                        # reads past its live row count shows. Measured on the
-                        # coordinator prefill path (both the cooperative and the
-                        # warp-specialized kernels, rows 1..128 of an m256 launch):
-                        # the live rows match the batch prefix exactly and no poison
-                        # mode - input, wire, top-k weight or expert id - leaks into
-                        # them. Wire rows are uint8: E4M3 0x7F is NaN and its UE8M0
-                        # scale byte a wild exponent, so a wire-input arm reads NaN
-                        # there too. Two criteria, both gated:
-                        #   prefix_rows - at that row count every arm is bit
-                        #     identical to the cooperative kernel, so an arm can only
-                        #     pass by computing those rows correctly;
-                        #   prefix_gap  - an arm's distance from the capacity batch's
-                        #     own prefix never exceeds the cooperative kernel's, which
-                        #     is the row invariance a verifier relies on (lossless
-                        #     speculation: a width-N verify must match width-1 decode
-                        #     row for row).
                         tail_poison = float("nan") if wire.dtype.is_floating_point else 0x7F
                         tails = (wire[1:].clone(), decoded[1:].clone(), weights[1:].clone(), ids[1:].clone())
                         prefix_detail = {}
                         probe_rows = sorted({1, 32, 33, 63, 64, 65, capacity // 2} - {capacity})
+                        all_probe_names = [*[n for n, _ in specs], *sorted(set(oracle_for_cb.values()) - {n for n, _ in specs})]
                         for rows in probe_rows:
-                            # Clean slate first: the previous, shorter row count
-                            # poisoned rows this one must read.
                             wire[1:], decoded[1:], weights[1:], ids[1:] = tails
                             wire[rows:].fill_(tail_poison)
                             decoded[rows:].fill_(float("nan"))
                             weights[rows:].fill_(float("nan"))
                             ids[rows:].fill_(experts - 1)
                             short = {}
-                            for name, _ in specs:
-                                workspace, _bindings = states[name]
+                            for name in all_probe_names:
+                                workspace, _bindings = states[name] if name in states else aux_oracles[name]
                                 graph = _capture(lambda name=name: run(name, rows), 1)
                                 for _ in range(3):
                                     workspace.fc1.fill_(float("nan"))
@@ -2291,37 +2363,52 @@ def _run_coordinator_benchmark(args, device, props):
                                     coordinator_output(workspace, args.prefill_family).fill_(float("nan"))
                                     graph.replay()
                                 short[name] = coordinator_output(workspace, args.prefill_family)[:rows].clone()
-                            oracle = short[oracle_name].view(bit_dtype)
-                            prefix = expected[:rows].float()
-                            detail, coop_gap = {}, None
+                            detail, coop_gaps = {}, {}
+                            for cb in codebooks:
+                                oname = oracle_for_cb[cb]
+                                vals = short[oname][:rows].float()
+                                pfx = expected_by_cb[cb][:rows].float()
+                                g = (vals - pfx).abs()
+                                rg = g.flatten(1).amax(dim=1) if g.numel() else g
+                                coop_gaps[cb] = float(rg.max()) if rg.numel() else 0.0
+                                checks["prefix_coop_gap"] = (checks.get("prefix_coop_gap", True)
+                                                             and bool(torch.isfinite(vals).all()))
                             for name, _ in specs:
+                                cb = arm_cb[name]
+                                oracle_short = short[oracle_for_cb[cb]].view(bit_dtype)
+                                prefix = expected_by_cb[cb][:rows].float()
                                 values = short[name][:rows].float()
                                 gap = (values - prefix).abs()
                                 row_gap = gap.flatten(1).amax(dim=1) if gap.numel() else gap
                                 worst = int(row_gap.argmax()) if row_gap.numel() else 0
                                 entry = dict(
                                     finite=bool(torch.isfinite(values).all()),
-                                    bitwise_vs_coop=torch.equal(short[name].view(bit_dtype), oracle),
+                                    bitwise_vs_coop=torch.equal(short[name].view(bit_dtype), oracle_short),
                                     differ_rows=int((row_gap > 0).sum()),
                                     max_abs_gap=float(row_gap.max()) if row_gap.numel() else 0.0,
                                     max_rel_gap=float((gap / prefix.abs().clamp(min=1e-6)).max())
                                     if gap.numel() else 0.0,
                                     worst_row=worst)
                                 detail[name] = entry
-                                if name == oracle_name:
-                                    coop_gap = entry["max_abs_gap"]
-                                    checks["prefix_coop_gap"] = (checks.get("prefix_coop_gap", True)
-                                                                 and entry["finite"])
                             exact = all(entry["bitwise_vs_coop"] for name, entry in detail.items()
-                                        if name != oracle_name)
+                                        if name != oracle_for_cb[arm_cb[name]])
                             checks["prefix_rows"] = checks.get("prefix_rows", True) and exact
-                            # An arm must never be further from the batch prefix than
-                            # the cooperative kernel it replaces.
                             checks["prefix_gap"] = checks.get("prefix_gap", True) and all(
-                                entry["finite"] and entry["max_abs_gap"] <= coop_gap * (1 + 1e-9) + 1e-12
-                                for name, entry in detail.items() if name != oracle_name)
+                                entry["finite"] and entry["max_abs_gap"] <= coop_gaps[arm_cb[name]] * (1 + 1e-9) + 1e-12
+                                for name, entry in detail.items() if name != oracle_for_cb[arm_cb[name]])
                             prefix_detail[str(rows)] = detail
                         wire[1:], decoded[1:], weights[1:], ids[1:] = tails
+                    extra_record = {}
+                    if len(codebooks) > 1 and "mcg" in expected_by_cb:
+                        def _cb_delta(a, b):
+                            af, bf = a.float().flatten(), b.float().flatten()
+                            denom = float(af.norm() * bf.norm())
+                            return dict(**oracle_error(a, b),
+                                        cosine=float(torch.dot(af, bf) / denom) if denom > 0 else 1.0)
+                        extra_record["codebook_deltas"] = {
+                            name: _cb_delta(full_outputs[name], expected_by_cb["mcg"])
+                            for name, _ in specs if arm_cb[name] != "mcg"
+                        }
                     record = dict(capacity=capacity, distribution=distribution, weight_layer=layer,
                         wave_index=wave_index, route_layer=wave.get("layer") if wave else None,
                         content=wave.get("content") if wave else None, bitwise=checks,
@@ -2331,13 +2418,14 @@ def _run_coordinator_benchmark(args, device, props):
                         live_rows=[dict(rows=e["rows"], bitwise=e["bitwise"], noise=e["noise"],
                                         samples_us=e["samples_us"]) for e in live_records[1:]],
                         samples_us=samples, median_us={name: statistics.median(v) for name, v in samples.items() if v},
-                        output_sha256=hashlib.sha256(expected.view(torch.uint8).cpu().numpy().tobytes()).hexdigest())
+                        output_sha256=hashlib.sha256(expected.view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
+                        **extra_record)
                     records.append(record)
                     if not all(checks.values()):
                         failures.append({k: record[k] for k in ("capacity", "distribution", "wave_index", "bitwise")})
                     print(json.dumps(record), flush=True)
-                    del graphs, expected, actual
-        del states, workspace, bindings, launch
+                    del graphs, expected, expected_by_cb, full_outputs, actual
+        del states, aux_oracles, workspace, bindings, launch
         torch.cuda.empty_cache()
     result = dict(schema=1, kind="glm_exl3_prefill" if args.prefill_family == "glm" else f"{args.prefill_family}_exl3_prefill",
         role=args.role, profile=args.profile,
@@ -2384,21 +2472,28 @@ def _run_row_address_curve(args, device, props):
 
     if (props.major, props.minor) != (12, 1):
         raise ValueError("row-address curve requires SM121")
-    if args.prefill_family != "glm" or args.profile != "spark-tp4-width512" or args.routes is None:
-        raise ValueError("row-address curve requires GLM spark-tp4-width512 and --routes")
+    if args.prefill_family not in ("glm", "glmf") or args.profile != "spark-tp4-width512" or args.routes is None:
+        raise ValueError("row-address curve requires GLM/GLMF spark-tp4-width512 and --routes")
     rows_list = [int(v) for v in (args.rows or "2048,2752,4096,5504").split(",")]
     if not 0 < min(rows_list) <= max(rows_list) <= args.capacity <= 8192:
         raise ValueError("row-address curve rows must fit --capacity <= 8192")
+    family = args.prefill_family
+    spec = COORDINATOR_FAMILIES[family]
+    hidden, experts, topk = spec["hidden"], spec["experts"], spec["top_k"]
+    upgraded = experts // 4
+    codebook = getattr(args, "codebook", "mcg")
     torch.cuda.set_per_process_memory_fraction(min(0.9, (args.memory_cap_gib << 30) / props.total_memory))
-    layer = _make_coordinator_layer(512, 64, args.seed, device, "glm")
-    arm = dict(mode="ws", wire=1, dynamic=1, stages=3, prerotate=0)
-    options = coordinator_compile_options(args.profile, 4096, arm, props, "glm")
+    layer = _make_coordinator_layer(512, upgraded, args.seed, device, family, codebook=codebook)
+    arm = dict(mode="ws", wire=1, dynamic=1, stages=3, prerotate=0,
+               **({"codebook": codebook} if codebook != "mcg" else {}))
+    options = coordinator_compile_options(args.profile, 4096, arm, props, family, codebook=codebook)
     options["size_m"] = args.capacity
-    options["max_m_blocks"] = route_pack_capacity(args.capacity * 8, 64, 256, topk=8)[2]
+    options["max_m_blocks"] = route_pack_capacity(args.capacity * topk, 64, experts, topk=topk)[2]
     launches = {name: mix.compile_mixed_trellis(**options, row_addresses=indirect)
                for name, indirect in (("ordinary", False), ("addressed", True))}
     bindings = {name: mix.bind_mixed_trellis(*layer, launch,
-                gate_experts=(192, 64), up_experts=(192, 64)) for name, launch in launches.items()}
+                gate_experts=(experts - upgraded, upgraded), up_experts=(experts - upgraded, upgraded))
+                for name, launch in launches.items()}
     ordinary = mix.make_mixed_trellis_buffers(launches["ordinary"], device=device,
                                              sms=props.multi_processor_count)
     mix.warmup_mixed_trellis_route_pack(launches["ordinary"], ordinary,
@@ -2408,9 +2503,9 @@ def _run_row_address_curve(args, device, props):
         raise ValueError("no recorded route wave at --route-layer")
     wave = waves[0]
     generator = torch.Generator().manual_seed(args.seed)
-    raw = (torch.randn(args.capacity, 6144, generator=generator) * 0.02).to(device).bfloat16()
+    raw = (torch.randn(args.capacity, hidden, generator=generator) * 0.02).to(device).bfloat16()
     wire = make_wire(raw)
-    weights = torch.rand(args.capacity, 8, generator=generator).to(device)
+    weights = torch.rand(args.capacity, topk, generator=generator).to(device)
     weights /= weights.sum(-1, keepdim=True)
     report = dict(gpu=props.name, uuid=str(props.uuid), sms=props.multi_processor_count,
         source_sha256=PREFILL_SOURCE_SHA256, capacity=args.capacity,
@@ -2420,13 +2515,13 @@ def _run_row_address_curve(args, device, props):
         points=[])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for rows in rows_list:
-        ids = real_route_ids(rows, wave, generator, 256, 8).to(device=device, dtype=torch.int32)
+        ids = real_route_ids(rows, wave, generator, experts, topk).to(device=device, dtype=torch.int32)
         addressed = mix.make_mixed_trellis_segment_buffers(launches["addressed"], rows=rows,
             device=device, sms=props.multi_processor_count)
-        result = torch.empty(rows, 6144, dtype=torch.bfloat16, device=device)
+        result = torch.empty(rows, hidden, dtype=torch.bfloat16, device=device)
         permutation = torch.randperm(rows, device=device)
         x_table = wire.data_ptr() + permutation.long() * wire.shape[1]
-        y_table = result.data_ptr() + permutation.long() * 6144 * 2
+        y_table = result.data_ptr() + permutation.long() * hidden * 2
         addressed = replace(addressed, output=y_table)
         reordered_ids, reordered_weights = ids[permutation], weights[:rows][permutation]
         calls = {
@@ -2449,7 +2544,7 @@ def _run_row_address_curve(args, device, props):
         # Resolve and pack each arm, then freeze its packed routes for core-only timing.
         for name, workspace in (("ordinary", ordinary), ("addressed", addressed)):
             calls[name]()
-            slots = route_pack_capacity(rows * 8, 64, 256, topk=8, bucket_tokens=False)[1]
+            slots = route_pack_capacity(rows * topk, 64, experts, topk=topk, bucket_tokens=False)[1]
             packed = workspace.packed_route_indices[:slots], workspace.block_expert_ids, workspace.packed_route_count
             with patch.object(mix, "pack_topk_routes_by_expert", return_value=packed):
                 with kernel_resolution_guard("row-address curve frozen launch"):
@@ -2464,11 +2559,11 @@ def _run_row_address_curve(args, device, props):
             graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(expected.view(torch.uint8), result.view(torch.uint8))
-        point = dict(rows=rows, routed_rows=rows * 8, byte_identical=True,
-            median_us=median, us_per_routed_row={name: us / (rows * 8) for name, us in median.items()},
+        point = dict(rows=rows, routed_rows=rows * topk, byte_identical=True,
+            median_us=median, us_per_routed_row={name: us / (rows * topk) for name, us in median.items()},
             addressed_over_ordinary=median["addressed"] / median["ordinary"], samples_us=samples,
             scratch_bytes=exl3_ws_segment_scratch_bytes(rows=rows, maximum=args.capacity,
-                hidden=6144, intermediate=512, topk=8, experts=256, block=64,
+                hidden=hidden, intermediate=512, topk=topk, experts=experts, block=64,
                 max_m_blocks=launches["addressed"].max_m_blocks, sms=props.multi_processor_count),
             nvml=thermal.result())
         report["points"].append(point)
@@ -2512,11 +2607,15 @@ def benchmark_parser():
         help="Comma-separated decode row counts for --kimi (default: 1,2,4,6,8,12,16,24,32,36)",
     )
     parser.add_argument("--spark-replay", type=Path, help="planned Spark replay fixture JSON")
-    parser.add_argument("--aot-root", type=Path, help="sealed Spark rank packages root")
+    parser.add_argument("--aot-root", type=Path, help="sealed EXL3 rank packages root")
+    parser.add_argument("--compare-aot-root", type=Path,
+                        help="paired sealed EXL3 package root for warmed matched codebook comparison")
     parser.add_argument("--replay-native-library", type=Path,
                         help="explicit override for libcuteafd_native.so in --spark-replay")
     parser.add_argument("--replay-shape", action="append", help="replay fixture shape ID (repeatable)")
     parser.add_argument("--replay-reference", type=Path, help="require byte-identical outputs against a prior Spark replay JSON")
+    parser.add_argument("--verify-own-codebook", action="store_true",
+                        help="run independent own-codebook bitwise JIT reference during unpaired EXL3 replay")
     parser.add_argument("--profile-replay", action="store_true", help="capture one NVTX-marked sample per cell under Nsight Compute")
     parser.add_argument("--kimi-aot", type=Path, help="sealed EXL3 TP6 rank package containing m1/m80")
     parser.add_argument("--route-case", action="append", help="recorded Kimi wave ID (repeatable)")
@@ -2531,6 +2630,8 @@ def benchmark_parser():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261022)
     parser.add_argument("--prefill-family", choices=(*PREFILL_FAMILIES, *COORDINATOR_FAMILIES))
+    parser.add_argument("--codebook", choices=("mcg", "mul1"), default="mcg",
+                        help="EXL3 routed-expert codebook (default: mcg)")
     parser.add_argument("--bits", type=int, nargs=2, choices=(2, 3, 4, 5, 6),
                         metavar=("LOW", "HIGH"), help="prefill tier pair; defaults to the family's measured pair")
     parser.add_argument("--role", choices=("spark", "coordinator"), default="spark")
@@ -2569,15 +2670,19 @@ def benchmark_parser():
     return parser
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = benchmark_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.spark_replay:
+        if args.codebook != "mcg":
+            parser.error("--spark-replay derives codebook from sealed v41_exl3.json manifests; --codebook mul1 is not supported")
         from spark_expert_replay import replay_spark_shapes
 
         replay_spark_shapes(args, _AotReplayVariant, PREFILL_SOURCE_SHA256)
         return
     if args.kimi and (args.routes or args.kimi_aot or args.capacity is not None or args.route_case):
+        if args.codebook != "mcg":
+            parser.error("recorded Kimi decode derives codebook from sealed AOT; --codebook mul1 is not supported")
         if not args.routes or not args.kimi_aot or args.kimi_variant:
             parser.error("recorded Kimi decode needs --routes and --kimi-aot and uses sealed AOT only")
         args.capacity = 80 if args.capacity is None else args.capacity
@@ -2611,7 +2716,8 @@ def main() -> None:
         and args.role != "coordinator"
         and (args.prefill_arm or args.intermediate or args.rows or args.prefill_source_dir or (args.prefill_exhaustive and not args.profile.startswith("spark-")))
     )
-    if (args.prefill_family in COORDINATOR_FAMILIES and not is_spark_prefill) or args.role == "coordinator" or args.preflight_only:
+    is_coordinator = (args.prefill_family in COORDINATOR_FAMILIES and not is_spark_prefill) or args.role == "coordinator" or args.preflight_only
+    if is_coordinator:
         try:
             capacities, specs, distributions, waves, compact = coordinator_preflight(args)
         except ValueError as exc:
@@ -2623,6 +2729,10 @@ def main() -> None:
             return
     elif args.coordinator_arm:
         parser.error("--coordinator-arm requires GLM coordinator mode")
+    elif args.codebook != "mcg":
+        if args.prefill_family:
+            parser.error("legacy Spark prefill does not support --codebook mul1")
+        parser.error("--codebook mul1 is only supported by coordinator and --row-address-curve modes")
     device = torch.device("cuda", torch.cuda.current_device())
     props = torch.cuda.get_device_properties(device)
     if args.prefill_family in COORDINATOR_FAMILIES and not is_spark_prefill:

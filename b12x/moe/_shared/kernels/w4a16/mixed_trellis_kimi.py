@@ -50,6 +50,7 @@ from b12x._lib.intrinsics import (
     ld_shared_v4_u32,
     ldmatrix_m8n8x2_b16,
     pack_f32x2_to_f16x2,
+    packed_dequant_trellis_mul1_to_half2x4,
     packed_dequant_trellis_to_half2x4,
     shared_ptr_to_u32,
     st_global_v2_u32,
@@ -63,6 +64,7 @@ from b12x.moe._shared.kernels.activations import (
     SITU_DEFAULT_BETA,
     SITU_DEFAULT_LINEAR_BETA,
 )
+from b12x.moe._shared.trellis_codebooks import MCG, MUL1
 
 from .kernel import (
     _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES,
@@ -160,7 +162,7 @@ class W4A16MixedTrellisKimiTP6(W4A16MixedTrellisKernel):
             or self.driver.fc2.moe_block_size != 8
             or self.driver.fc2.schedule_route_block_factor != 1
             or self.tier0.trellis_bits != 2
-            or self.tier0.trellis_codebook != "mcg"
+            or self.tier0.trellis_codebook not in (MCG, MUL1)
             or self.tier0.fc1.tile_n != 256
             or self.tier0.fc2.tile_n != 256
             or self.tier0.fc1.tile_k != 64
@@ -596,9 +598,14 @@ class W4A16MixedTrellisKimiTP6(W4A16MixedTrellisKernel):
                     aw = cute.arch.shuffle_sync(bw, prev_lane)
                     win_a = _prmt_b32_reg(bw, aw, sel_a)
                     win_b = _prmt_b32_reg(bw, aw, sel_b)
-                    o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
-                        win_a, win_b, 2
-                    )
+                    if cutlass.const_expr(self.tier0.trellis_codebook == MUL1):
+                        o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+                            win_a, win_b, 2
+                        )
+                    else:
+                        o0, o1, o2, o3 = packed_dequant_trellis_to_half2x4(
+                            win_a, win_b, 2
+                        )
 
                     d0, d1, d2, d3 = f16_mma_rhs_fragments_as_mma_a_m16n8k16_f32(
                         acc0[jj * 4 + 0][0],

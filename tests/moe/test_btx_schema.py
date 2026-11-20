@@ -63,6 +63,8 @@ def _uniform_manifest_dict(
     }
     if codebook == "mcg":
         data["codebook_seed"] = 0xCBAC1FED
+    elif codebook == "mul1":
+        data["codebook_seed"] = 0x83DCD12D
     return data
 
 
@@ -100,6 +102,46 @@ def test_mcg_manifest_requires_seed() -> None:
     wrong["codebook_seed"] = 1
     with pytest.raises(ValueError, match="codebook_seed"):
         BtxManifest.from_dict(wrong)
+
+
+def test_mul1_manifest_requires_seed_and_validates_rates() -> None:
+    for bits in (2, 3, 4, 5, 6):
+        manifest = BtxManifest.from_dict(
+            _uniform_manifest_dict(codebook="mul1", bits=bits)
+        )
+        assert manifest.codebook == "mul1"
+        assert manifest.codebook_seed == 0x83DCD12D
+        assert manifest.rates.bits == bits
+
+    per_expert = _uniform_manifest_dict(codebook="mul1", bits=3)
+    per_expert["rates"] = {
+        "structure": "per_expert_pair",
+        "pair_kinds": ["P33", "P24", "P43"],
+    }
+    manifest_pe = BtxManifest.from_dict(per_expert)
+    assert manifest_pe.codebook == "mul1"
+    assert manifest_pe.codebook_seed == 0x83DCD12D
+
+    data = _uniform_manifest_dict(codebook="mul1", bits=4)
+    missing = copy.deepcopy(data)
+    del missing["codebook_seed"]
+    with pytest.raises(ValueError, match="codebook_seed"):
+        BtxManifest.from_dict(missing)
+
+    wrong_mcg = copy.deepcopy(data)
+    wrong_mcg["codebook_seed"] = 0xCBAC1FED
+    with pytest.raises(ValueError, match="0x83dcd12d"):
+        BtxManifest.from_dict(wrong_mcg)
+
+    bool_seed = copy.deepcopy(data)
+    bool_seed["codebook_seed"] = True
+    with pytest.raises(ValueError, match="codebook_seed"):
+        BtxManifest.from_dict(bool_seed)
+
+    bad_k1 = copy.deepcopy(data)
+    bad_k1["rates"]["bits"] = 1
+    with pytest.raises(ValueError, match="2..6"):
+        BtxManifest.from_dict(bad_k1)
 
 
 def test_sqg_manifest_forbids_seed() -> None:
@@ -298,3 +340,48 @@ def test_synth_rejects_unknown_rate_codes() -> None:
     config = _small_config(bits=None, rate_tables={1: (bad, good)})
     with pytest.raises(ValueError, match="unknown rate code"):
         synth_layer_payloads(config, 1)
+
+
+def test_write_btx_checkpoint_mul1_round_trips_and_fails_closed(tmp_path) -> None:
+    from b12x.moe._shared.kernels.w4a16.btx import read_btx_layer
+
+    uniform_cfg = _small_config(codebook="mul1", bits=4, seed=13)
+    manifest = write_btx_checkpoint(tmp_path / "mul1-uniform", uniform_cfg)
+    assert manifest.codebook == "mul1"
+    assert manifest.codebook_seed == 0x83DCD12D
+    layer = read_btx_layer(
+        tmp_path / "mul1-uniform",
+        manifest,
+        1,
+        first_slot=0,
+        slot_count=uniform_cfg.atom_slots,
+        verify_sha=True,
+    )
+    assert layer.manifest.codebook == "mul1"
+
+    tampered_dict = json.loads(
+        (tmp_path / "mul1-uniform" / BTX_MANIFEST_FILENAME).read_text()
+    )
+    tampered_dict["codebook"] = "mcg"
+    tampered_dict["codebook_seed"] = 0xCBAC1FED
+    tampered = BtxManifest.from_dict(tampered_dict)
+    with pytest.raises(ValueError, match="metadata 'codebook'"):
+        read_btx_layer(
+            tmp_path / "mul1-uniform", tampered, 1, first_slot=0, slot_count=4
+        )
+
+    pairs = 512 // ATOM_CHANNELS // 8
+    fc1 = torch.full((pairs, 4), rate_code(3, 3), dtype=torch.uint8)
+    fc1[0, 2] = rate_code(2, 4)
+    fc2 = torch.full((pairs, 4), rate_code(3, 3), dtype=torch.uint8)
+    pe_cfg = _small_config(
+        codebook="mul1",
+        bits=None,
+        rate_tables={1: (fc1, fc2)},
+        extent_alignment_slots=8,
+        seed=17,
+    )
+    pe_manifest = write_btx_checkpoint(tmp_path / "mul1-pe", pe_cfg)
+    assert pe_manifest.codebook == "mul1"
+    assert pe_manifest.codebook_seed == 0x83DCD12D
+    assert pe_manifest.rates.pair_kinds == frozenset({"P33", "P24"})

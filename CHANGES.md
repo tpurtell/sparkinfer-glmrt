@@ -1,5 +1,23 @@
 # Changes
 
+- EXL3 routed experts on SM120 and SM121: add opt-in `mul1` (`0x83DCD12D`)
+  trellis codebook dequantization (`bfe`/`shf` + `mul.lo.u32` + `dp4a.u32.u32` +
+  `fma.rn.f16x2`), BTX synthesis/compatibility, preparation, and paired replay
+  verification across `W4A16FusedMoeKernel`, `mixed_trellis`, `mixed_trellis_k4`,
+  `mixed_trellis4`, `mixed_trellis_ws`, `mixed_trellis_ws_a8`, and
+  `mixed_trellis_kimi` (`K2..K6`, compact uneven-world shards, `partial_bf16`,
+  and `m8192` segmented row-address views). Preserve default `mcg`
+  (`0xCBAC1FED`) compiled program/cubin and LUT payload bytes, packed weight
+  layouts, scratch ABIs, and runtime numeric output digests (package/manifest
+  `sparkinfer_revision` provenance remains unfalsified). Warmed interleaved
+  runtime-export replay measures `0.9504x` decode (`156` cells) and `0.9647x`
+  prefill (`108` cells) geomean `MUL1/MCG` on SM120 (`264/264` cells `<= MCG`),
+  and `0.9904x` decode (`169` cells), `0.9983x` prefill (`117` cells), and
+  `0.9894x` `m8192` row-address (`8` cells) geomean `MUL1/MCG` on SM121, with
+  zero own-codebook bit differences and exact prefix and eager/graph invariance.
+  Expected changed default groups: none (opt-in `exl3-*-mul1` groups only). See
+  tpurtell/cuteafd#2540.
+
 - SM120 dense trellis decode: prefetch one packed K128 block per warp in
   folded K6, preserving the ordered MMA and split reduction. On RTX PRO
   6000, the stock-normalized paired chain improved 1.88% across K6/K8
