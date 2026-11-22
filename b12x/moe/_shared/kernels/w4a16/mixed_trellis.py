@@ -2707,24 +2707,38 @@ def compile_mixed_trellis(
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 descriptor_bits=descriptor_bits,
             )
+        _stock_sm121_k4_geoms = (
+            # Stock qualified Spark decode shard geometries (preserve stock K4
+            # shared_memory_bytes manifest field).
+            (4608, 384, 384, 8, True, 5),    # Inkling2
+            (4096, 384, 352, 8, True, 6),    # Step5
+            (6144, 256, 256, 8, False, 5),   # GLM TP8
+            (6144, 384, 256, 8, True, 5),    # GLM TP6
+            (6144, 512, 256, 8, False, 5),   # GLM TP4
+            (6144, 1024, 128, 4, False, 5),  # ML4
+            (4096, 768, 256, 8, True, 5),    # Muse
+        )
+        _extended_sm121_k4_geoms = (
+            # Additional SM121 K4 decode shard geometries (preserve cooperative
+            # parent shared_memory_bytes manifest field for paired AOT replay).
+            (1536, 1536, 512, 16, False, 5),  # Hy4-flash TP1
+            (1536, 768, 512, 16, False, 5),   # Hy4-flash TP2
+            (1536, 384, 512, 16, False, 5),   # Hy4-flash TP4
+            (1536, 256, 512, 16, False, 5),   # Hy4-flash TP6
+            (2560, 256, 512, 10, True, 5),    # Qwen4 TP4 (compact)
+            (2560, 256, 512, 10, False, 5),   # Qwen4 TP4 (contiguous)
+        )
+        _geom_key = (
+            hidden_size, intermediate_size, route_num_experts,
+            top_k, compact_weights, tier1_bits,
+        )
+        _is_extended_sm121_k4 = _geom_key in _extended_sm121_k4_geoms
         use_sm121_k4_decode = (
             _k4_decode_override
             if _k4_decode_override is not None
             else (
                 int(tier0_bits) == 4
-                and (
-                    hidden_size, intermediate_size, route_num_experts,
-                    top_k, compact_weights, tier1_bits,
-                ) in (
-                    # Qualified Spark decode shard geometries only.
-                    (4608, 384, 384, 8, True, 5),    # Inkling2
-                    (4096, 384, 352, 8, True, 6),    # Step5
-                    (6144, 256, 256, 8, False, 5),   # GLM TP8
-                    (6144, 384, 256, 8, True, 5),    # GLM TP6
-                    (6144, 512, 256, 8, False, 5),   # GLM TP4
-                    (6144, 1024, 128, 4, False, 5),  # ML4
-                    (4096, 768, 256, 8, True, 5),    # Muse
-                )
+                and (_geom_key in _stock_sm121_k4_geoms or _is_extended_sm121_k4)
                 and trellis_codebook in (MCG, MUL1)
                 and rotation_input_dtype == "bf16"
                 and full_rotation_output_dtype == "bf16"
@@ -2768,6 +2782,9 @@ def compile_mixed_trellis(
                 tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
                 descriptor_bits=descriptor_bits,
                 compact_weights=compact_weights,
+                preserve_parent_shared_words=(
+                    _is_extended_sm121_k4 and _k4_decode_override is None
+                ),
             )
         use_sm120_k4_decode = (
             _k4_decode_override is not False
