@@ -15,6 +15,7 @@ from b12x.moe._shared.kernels.w4a16.prepare import (
     _coupled_rotation_signs,
     _finalize_prepared_trellis_weights,
     prepare_trellis256_moe_weights,
+    resolve_exl3_checkpoint_codebook,
 )
 
 from .config import (
@@ -351,7 +352,7 @@ def _symmetric_bits(config: TrellisConfig, rates: torch.Tensor) -> torch.Tensor:
         raise ValueError(
             "fused MoE trellis rates must encode symmetric K values (0xKK)"
         )
-    if config.codebook is TrellisCodebook.MCG:
+    if config.codebook in (TrellisCodebook.MCG, TrellisCodebook.MUL1):
         allowed = (3, 4, 5)
     elif config.codebook is TrellisCodebook.SQG_E4M3:
         allowed = (3,)
@@ -512,7 +513,10 @@ def _uniform_prepared(
         activation=activation,
         fc1_tile_n=256,
         fc2_tile_n=256,
-        params_dtype=params_dtype,
+        # Full-rotation Trellis keeps its rotation tables and internal
+        # scratch in FP16 even when the public activation/output contract
+        # is BF16, matching b12x_trellis and exl3_trellis_mcg preparation.
+        params_dtype=torch.float16,
         w13_layout="trellis_t256_proj",
         trellis_bits=bit,
         codebook=config.codebook.value,
@@ -575,8 +579,10 @@ def _projection_prepared(
     down_svh: torch.Tensor,
     activation: str,
 ) -> PreparedProjectionTrellisWeights:
-    if config.codebook is not TrellisCodebook.MCG:
-        raise ValueError("projection-tiered trellis execution requires codebook 'mcg'")
+    if config.codebook not in (TrellisCodebook.MCG, TrellisCodebook.MUL1):
+        raise ValueError(
+            "projection-tiered trellis execution requires codebook 'mcg' or 'mul1'"
+        )
     if config.transform.expert.kind != "none":
         raise ValueError("projection-tiered trellis execution has no expert transform")
     if weights.expert_transform_draws is not None:
@@ -655,6 +661,7 @@ def _projection_prepared(
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        codebook=config.codebook.value,
     )
 
 
@@ -670,9 +677,23 @@ def prepare_projection_native_trellis_weights(
     num_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    codebook: str | int | None = None,
+    mcg: torch.Tensor | int | None = None,
+    mul1: torch.Tensor | int | None = None,
 ) -> PreparedProjectionTrellisWeights:
-    """Wrap two or three projection-native MCG tiers without conversion."""
+    """Wrap two or three projection-native MCG/MUL1 tiers without conversion."""
 
+    normalized_codebook = resolve_exl3_checkpoint_codebook(
+        mcg=mcg,
+        mul1=mul1,
+        codebook=codebook,
+        default="mcg",
+    )
+    if normalized_codebook not in ("mcg", "mul1"):
+        raise ValueError(
+            "projection-mixed Trellis requires codebook 'mcg' or 'mul1', "
+            f"got {normalized_codebook!r}"
+        )
     if len(native_tiers) not in (2, 3):
         raise ValueError("projection-mixed Trellis requires two or three tiers")
     tier_bits = _projection_tier_bits(native_tiers)
@@ -700,7 +721,10 @@ def prepare_projection_native_trellis_weights(
     prepared_tiers: list[PreparedW4A16MoeWeights] = []
     for native in native_tiers:
         prepared = _finalize_prepared_trellis_weights(
-            context=f"MCG K{native.bits} projection-tier preparation",
+            context=(
+                f"{normalized_codebook.upper()} K{native.bits} "
+                "projection-tier preparation"
+            ),
             device=device,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -717,7 +741,7 @@ def prepare_projection_native_trellis_weights(
             required_fc1_tile_n=128,
             dummy_scale=dummy_scale,
             workspace=shared_workspace,
-            codebook="mcg",
+            codebook=normalized_codebook,
             trellis_bits=native.bits,
             fc1_pair_kind=None,
             fc2_pair_kind=None,
@@ -815,6 +839,7 @@ def prepare_projection_native_trellis_weights(
         intermediate_size=intermediate_size,
         num_experts=num_experts,
         params_dtype=params_dtype,
+        trellis_codebook=normalized_codebook,
     )
 
 
@@ -890,7 +915,9 @@ def prepare_trellis_weights(
         device=device,
     )
 
-    if config.codebook is not TrellisCodebook.MCG:
+    if config.codebook not in (TrellisCodebook.MCG, TrellisCodebook.MUL1) or (
+        config.rate.granularity is not RateGranularity.PER_EXPERT_PROJECTION
+    ):
         return _uniform_prepared(
             config,
             weights,

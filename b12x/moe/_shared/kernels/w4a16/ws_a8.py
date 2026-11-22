@@ -1,7 +1,8 @@
 """INT8 tensor-core helpers for the warp-specialized mixed-Trellis A8 prototype.
 
-EXL3 MCG decode yields FP16 values on a fixed grid bounded by |w| <= 3.9492, so
-``round(32 w)`` fits int8 exactly-scaled (relative weight MSE 5e-5, against 7e-4
+EXL3 MCG and MUL1 decode yield FP16 values on fixed grids bounded by |w| <= 3.9492
+(MCG) and |w| <= 3.4531 (MUL1), so ``round(32 w)`` fits int8 without clipping
+(relative weight MSE 5e-5 for MCG and 8e-5 for MUL1, against 7e-4
 for an E4M3 requantization). Activations are quantized per (row, 128-wide K
 block) after the H128 rotation, where they are close to Gaussian.
 

@@ -32,7 +32,13 @@ from b12x.moe._shared.btx_schema import (
     rate_code,
 )
 from b12x.moe._shared.kernels.w4a16.btx import BtxLayer
-from b12x.moe._shared.trellis_codebooks import SQG_E4M3
+from b12x.moe._shared.trellis_codebooks import (
+    MCG,
+    MCG_MULTIPLIER,
+    MUL1,
+    MUL1_MULTIPLIER,
+    SQG_E4M3,
+)
 
 # The frozen containers spread each expert's high-rate pairs across ranks
 # with this multiplier; the lift materializes the result as tables.
@@ -51,6 +57,7 @@ def _lift_manifest(
     rates: dict,
     coupled: bool,
     per_expert_input_rotations: bool = False,
+    codebook: str = SQG_E4M3,
 ) -> BtxManifest:
     hadamard: dict = {
         "coupled": coupled,
@@ -61,34 +68,37 @@ def _lift_manifest(
         hadamard["post_block"] = 128
     atom_slots = global_intermediate_size // 32
     barriers = [atom_slots // 2] if coupled else []
-    return BtxManifest.from_dict(
-        {
-            "kind": BTX_MANIFEST_KIND,
-            "schema": BTX_SCHEMA,
-            "codebook": SQG_E4M3,
-            "geometry": {
-                "num_experts": int(num_experts),
-                "hidden_size": int(hidden_size),
-                "intermediate_size": int(global_intermediate_size),
-                "atom_channels": 32,
-                "atom_slots": atom_slots,
-                "moe_layer_indices": [int(layer_index)],
-            },
-            "rates": rates,
-            "hadamard": hadamard,
-            "layout": {
-                "atom_row_alignment": 1,
-                "extent_alignment_slots": 4,
-                "extent_barriers": barriers,
-            },
-            "layers": {
-                str(int(layer_index)): {
-                    "file": "lifted-in-memory",
-                    "sha256": "0" * 64,
-                }
-            },
-        }
-    )
+    manifest_data: dict = {
+        "kind": BTX_MANIFEST_KIND,
+        "schema": BTX_SCHEMA,
+        "codebook": codebook,
+        "geometry": {
+            "num_experts": int(num_experts),
+            "hidden_size": int(hidden_size),
+            "intermediate_size": int(global_intermediate_size),
+            "atom_channels": 32,
+            "atom_slots": atom_slots,
+            "moe_layer_indices": [int(layer_index)],
+        },
+        "rates": rates,
+        "hadamard": hadamard,
+        "layout": {
+            "atom_row_alignment": 1,
+            "extent_alignment_slots": 4,
+            "extent_barriers": barriers,
+        },
+        "layers": {
+            str(int(layer_index)): {
+                "file": "lifted-in-memory",
+                "sha256": "0" * 64,
+            }
+        },
+    }
+    if codebook == MCG:
+        manifest_data["codebook_seed"] = MCG_MULTIPLIER
+    elif codebook == MUL1:
+        manifest_data["codebook_seed"] = MUL1_MULTIPLIER
+    return BtxManifest.from_dict(manifest_data)
 
 
 def _strip_spans(
@@ -181,6 +191,7 @@ def lift_qsrt_atoms_v1_extent(
     gate_suh: torch.Tensor,
     up_suh: torch.Tensor,
     down_svh: torch.Tensor,
+    codebook: str = SQG_E4M3,
 ) -> BtxLayer:
     """Lift one fixed-payload atoms-v1 pair extent.
 
@@ -233,6 +244,7 @@ def lift_qsrt_atoms_v1_extent(
             "pair_kinds": sorted(kinds),
         },
         coupled=False,
+        codebook=codebook,
     )
     manifest.validate_extent(first_atom_slot, ATOMS_PER_PAIR)
 
@@ -271,6 +283,7 @@ def lift_qsrt_atoms_v2_extent(
     up_suh: torch.Tensor,
     down_svh: torch.Tensor,
     rotation_draws: torch.Tensor | None = None,
+    codebook: str = SQG_E4M3,
 ) -> BtxLayer:
     """Lift one atoms-v2 rank extent for a supported profile.
 
@@ -308,6 +321,7 @@ def lift_qsrt_atoms_v2_extent(
                 up_suh=up_suh,
                 down_svh=down_svh,
             ),
+            codebook=codebook,
         )
         manifest.validate_extent(first_atom_slot, atom_count)
         bundles = atom_payload[:, :payload].reshape(
@@ -369,6 +383,7 @@ def lift_qsrt_atoms_v2_extent(
                 "pair_kinds": sorted({"P33", "P43"}),
             },
             coupled=False,
+            codebook=codebook,
         )
         manifest.validate_extent(first_atom_slot, ATOMS_PER_PAIR)
 
@@ -433,6 +448,7 @@ def lift_qsrt_atoms_v3_extent(
     layer_scale_magnitudes: torch.Tensor,
     expert_scale_magnitudes: torch.Tensor,
     rotation_draws: torch.Tensor,
+    codebook: str = SQG_E4M3,
 ) -> BtxLayer:
     """Lift one compact sign-and-scalar uniform-K3 atoms-v3 extent.
 
@@ -509,6 +525,7 @@ def lift_qsrt_atoms_v3_extent(
         layer_index=layer_index,
         rates={"structure": "uniform", "bits": 3},
         coupled=True,
+        codebook=codebook,
     )
     manifest.validate_extent(first_atom_slot, atom_count)
 

@@ -22,6 +22,7 @@ from b12x._lib.compiler import (
 from b12x._lib.compile_plan import attach_programs
 from b12x._lib.program_cache import register_program_cache
 from b12x._lib.intrinsics import (
+    _f16x2_to_bf16x2,
     atomic_add_global_i32,
     bf16_mma_m16n8k16_f32,
     bf16_mma_rhs_fragments_as_mma_a_m16n8k16_f32,
@@ -67,6 +68,7 @@ from b12x._lib.intrinsics import (
     packed_dequant_e4m3x4_to_half2x2,
     packed_dequant_e8m0x4_to_bfloat2x2,
     packed_dequant_e8m0x4_to_half2x2,
+    packed_dequant_trellis_mul1_to_half2x4,
     packed_dequant_trellis_to_bfloat2x4,
     packed_dequant_trellis_to_half2x4,
     packed_dequant_trellis_stream_to_bfloat2x4,
@@ -109,6 +111,7 @@ from b12x.moe._shared.kernels.trellis_ring import (
 )
 from b12x.moe._shared.trellis_codebooks import (
     MCG,
+    MUL1,
     SQG_E4M3,
     SQG_FP16,
     validate_codebook_bits,
@@ -199,7 +202,8 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
 # Native QSRT t256 tiles contain 256 tail-biting codes at one compile-time
 # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
 _TRELLIS256_BITS = (2, 3, 4, 5, 6)
-_TRELLIS256_CODEBOOKS = {MCG, SQG_E4M3, SQG_FP16}
+_TRELLIS256_CODEBOOKS = {MCG, MUL1, SQG_E4M3, SQG_FP16}
+_TRELLIS256_DENSE_CODEBOOKS = {MCG, SQG_E4M3, SQG_FP16}
 _SQG_XOR_CHEB_T12_LUT_ENTRIES = 1 << 12
 _SQG_XOR_CHEB_T12_SMEM_REGION_BYTES = _SQG_XOR_CHEB_T12_LUT_ENTRIES
 _SCALE_FORMATS = {
@@ -1279,6 +1283,15 @@ class W4A16GemmKernel:
             raise ValueError(
                 "dense_route_fast_path requires E=1, top_k=1, no top-k weights, "
                 "and no other route fast path"
+            )
+        if (
+            self.dense_route_fast_path
+            and self.weight_layout_trellis256
+            and self.trellis_codebook not in _TRELLIS256_DENSE_CODEBOOKS
+        ):
+            raise ValueError(
+                "dense_route_fast_path trellis_t256 codebook must be in "
+                f"{sorted(_TRELLIS256_DENSE_CODEBOOKS)}, got {self.trellis_codebook!r}"
             )
         self.dual_a = bool(dual_a)
         if self.dual_a and not self.weight_layout_trellis256_proj:
@@ -4485,6 +4498,13 @@ class W4A16GemmKernel:
                 o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
                     win_a, win_b, int(bits)
                 )
+        elif cutlass.const_expr(self.trellis_codebook == MUL1):
+            o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+                win_a, win_b, int(bits)
+            )
+            if cutlass.const_expr(not self.is_fp16):
+                o0, o1 = _f16x2_to_bf16x2(o0), _f16x2_to_bf16x2(o1)
+                o2, o3 = _f16x2_to_bf16x2(o2), _f16x2_to_bf16x2(o3)
         elif cutlass.const_expr(self.trellis_codebook == SQG_FP16):
             if cutlass.const_expr(self.is_fp16):
                 o0, o1, o2, o3 = packed_decode_sqg_fp16_d3l_to_half2x4(
@@ -6897,9 +6917,9 @@ class W4A16FusedMoeKernel:
         self.activation_output_a8 = bool(activation_output_a8)
         if self.activation_output_a8 and (
             not self.full_rotation or coupled_hadamard or self.collect_activation_amax
-            or element_dtype != "fp16" or self.trellis_codebook != MCG
+            or element_dtype != "fp16" or self.trellis_codebook not in (MCG, MUL1)
         ):
-            raise ValueError("A8 activation output requires MCG FP16 H128 full rotation")
+            raise ValueError("A8 activation output requires MCG or MUL1 FP16 H128 full rotation")
         # FC1 rotates the staged token input itself (no rotation phase, no
         # materialized per-route copies). Requires BF16 input, per-expert SUH
         # and packed routes; the caller binds the SUH tables per FC1 tile.
@@ -12469,14 +12489,14 @@ def _w4a16_fused_moe_launch_flat(
         packed_route_indices.data_ptr() if expert_map is None else expert_map.data_ptr()
     )
     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
-    if weight_layout == "trellis_t256" and trellis_codebook != "mcg":
+    if weight_layout == "trellis_t256" and trellis_codebook not in (MCG, MUL1):
         trellis_rank_lut = _trellis256_execution_lut(
             a_input.device, trellis_codebook
         )
         fc1_trellis_lut_addr = trellis_rank_lut.data_ptr()
         fc2_trellis_lut_addr = trellis_rank_lut.data_ptr()
     else:
-        # Non-trellis and MCG kernels never dereference this ABI slot.
+        # Non-trellis and MCG/MUL1 kernels never dereference this ABI slot.
         fc1_trellis_lut_addr = w13_scale_i32.data_ptr()
         fc2_trellis_lut_addr = w13_scale_i32.data_ptr()
     fused.compiled(
@@ -13520,7 +13540,7 @@ def _run_trellis256_dense_current_device(
     trellis_codebook = str(
         getattr(prepared_dense, "trellis_codebook", "")
     ).lower()
-    if trellis_codebook not in _TRELLIS256_CODEBOOKS:
+    if trellis_codebook not in _TRELLIS256_DENSE_CODEBOOKS:
         raise NotImplementedError(
             "run_trellis256_dense has no decoder for codebook "
             f"{trellis_codebook!r}"

@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 class TrellisCodebook(str, Enum):
     MCG = "mcg"
+    MUL1 = "mul1"
     SQG_E4M3 = "sqg_e4m3"
     SQG_FP16 = "sqg_fp16"
 

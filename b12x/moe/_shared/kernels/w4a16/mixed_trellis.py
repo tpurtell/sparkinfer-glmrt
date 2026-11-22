@@ -37,6 +37,8 @@ from b12x._lib.intrinsics import (
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils import current_cuda_stream, make_ptr
 from b12x.moe._shared.trellis_codebooks import (
+    MCG,
+    MUL1,
     normalize_codebook,
     validate_codebook_bits,
 )
@@ -246,7 +248,7 @@ class MixedTrellisTier(Protocol):
     """Prepared Trellis tier fields consumed by the mixed launch."""
 
     num_experts: int
-    trellis_codebook: str
+    trellis_codebook: str | int
     intermediate_rotations: torch.Tensor
     gate_suh: torch.Tensor
     up_suh: torch.Tensor
@@ -2503,7 +2505,7 @@ def compile_mixed_trellis(
     force_tile_config: tuple[int, int, int, int],
     tier0_bits: int = 3,
     tier1_bits: int = 4,
-    trellis_codebook: str = "mcg",
+    trellis_codebook: str | int = MCG,
     swiglu_limit: float | None = None,
     activation: str = "silu",
     moe_block_size: int = 8,
@@ -2570,8 +2572,8 @@ def compile_mixed_trellis(
         (tier0_bits, tier1_bits),
     )
     tier0_bits, tier1_bits = bits
-    if activations == "a8" and trellis_codebook != "mcg":
-        raise ValueError("EXL3 A8 INT8 weight conversion requires the MCG codebook")
+    if activations == "a8" and trellis_codebook not in (MCG, MUL1):
+        raise ValueError("EXL3 A8 INT8 weight conversion requires the MCG codebook or MUL1")
     # 192-wide and unequal FC1/FC2 N tiles exist only in the warp-specialized
     # kernel; its cooperative sub-kernels (decode helpers, activation) keep 128.
     ws_tile_n = None
@@ -2671,7 +2673,7 @@ def compile_mixed_trellis(
                 and str(activation).strip().lower() == "situ"
                 and swiglu_limit is None
                 and (tier0_bits, tier1_bits) == (2, 3)
-                and trellis_codebook == "mcg"
+                and trellis_codebook in (MCG, MUL1)
                 and rotation_input_dtype == "bf16"
                 and full_rotation_output_dtype == "bf16"
                 and int(size_m) in (1, 80)
@@ -2723,7 +2725,7 @@ def compile_mixed_trellis(
                     (6144, 1024, 128, 4, False, 5),  # ML4
                     (4096, 768, 256, 8, True, 5),    # Muse
                 )
-                and trellis_codebook == "mcg"
+                and trellis_codebook in (MCG, MUL1)
                 and rotation_input_dtype == "bf16"
                 and full_rotation_output_dtype == "bf16"
                 and int(size_m) <= 80
@@ -2998,7 +3000,7 @@ def compile_mixed_trellis3(
     tier0_bits: int = 3,
     tier1_bits: int = 4,
     tier2_bits: int = 5,
-    trellis_codebook: str = "mcg",
+    trellis_codebook: str | int = MCG,
     swiglu_limit: float | None = None,
     activation: str = "silu",
     moe_block_size: int = 8,
@@ -3964,7 +3966,12 @@ def bind_mixed_trellis(
                 f"mixed Trellis tier{tier_id} has {actual_experts} experts, "
                 f"expected the launch-plan count {expected_experts}"
             )
-        tier_codebook = str(tier.trellis_codebook).lower()
+        tier_codebook = (
+            normalize_codebook(tier.trellis_codebook)
+            if isinstance(tier.trellis_codebook, int)
+            and not isinstance(tier.trellis_codebook, bool)
+            else str(tier.trellis_codebook).strip().lower()
+        )
         if tier_codebook != launch.trellis_codebook:
             raise ValueError(
                 f"mixed Trellis tier{tier_id} uses codebook {tier_codebook!r}, "
@@ -4378,7 +4385,12 @@ def bind_mixed_trellis3(
                 f"mixed Trellis tier{tier_id} has {actual_experts} experts, "
                 f"expected the launch-plan count {expected_experts}"
             )
-        tier_codebook = str(tier.trellis_codebook).lower()
+        tier_codebook = (
+            normalize_codebook(tier.trellis_codebook)
+            if isinstance(tier.trellis_codebook, int)
+            and not isinstance(tier.trellis_codebook, bool)
+            else str(tier.trellis_codebook).strip().lower()
+        )
         if tier_codebook != launch.trellis_codebook:
             raise ValueError(
                 f"mixed Trellis tier{tier_id} uses codebook {tier_codebook!r}, "

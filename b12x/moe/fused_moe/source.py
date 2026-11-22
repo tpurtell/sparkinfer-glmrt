@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TypeAlias
 
-from .config import TrellisConfig
+from .config import TrellisCodebook, TrellisConfig
 
 
 class PackedSourceFormat(str, Enum):
@@ -39,14 +39,32 @@ class PackedSource:
 
 @dataclass(frozen=True, kw_only=True)
 class Exl3TrellisSource:
-    """Uniform EXL3 MCG projection tiles with independent Hadamard vectors."""
+    """Uniform EXL3 MCG/MUL1 projection tiles with independent Hadamard vectors."""
 
     bits: int
     tile_config: tuple[int, int, int, int] = (64, 256, 64, 256)
+    codebook: TrellisCodebook | str = TrellisCodebook.MCG
 
     def __post_init__(self) -> None:
-        if type(self.bits) is not int or self.bits not in (3, 4, 5, 6):
-            raise ValueError("uniform EXL3 MCG rate must be K3, K4, K5, or K6")
+        if isinstance(self.codebook, str):
+            try:
+                resolved = TrellisCodebook(self.codebook)
+            except ValueError as exc:
+                raise ValueError(
+                    "uniform EXL3 codebook must be 'mcg' or 'mul1'"
+                ) from exc
+        elif isinstance(self.codebook, TrellisCodebook):
+            resolved = self.codebook
+        else:
+            raise TypeError("EXL3 codebook must be TrellisCodebook or str")
+        if resolved not in (TrellisCodebook.MCG, TrellisCodebook.MUL1):
+            raise ValueError("uniform EXL3 codebook must be 'mcg' or 'mul1'")
+        object.__setattr__(self, "codebook", resolved)
+        if resolved is TrellisCodebook.MCG:
+            if type(self.bits) is not int or self.bits not in (3, 4, 5, 6):
+                raise ValueError("uniform EXL3 MCG rate must be K3, K4, K5, or K6")
+        elif type(self.bits) is not int or self.bits not in (2, 3, 4, 5, 6):
+            raise ValueError("uniform EXL3 MUL1 rate must be K2, K3, K4, K5, or K6")
         if (
             len(self.tile_config) != 4
             or any(type(value) is not int or value <= 0 for value in self.tile_config)
