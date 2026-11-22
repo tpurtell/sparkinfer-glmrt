@@ -1,5 +1,22 @@
 # Changes
 
+- SM120 EXL3 routed decode (Neon R2 of the routed MUL1 duel): a persistent
+  K4 mixed-Trellis decode (`W4A16MixedTrellisSM120K4Decode`) for SM120
+  coordinator buckets up to capacity 80 (K4 tier0 with K5/K6 tier1, bf16
+  rotation input, route block 8), replacing the three cooperative grid
+  barriers with per-block readiness and a 4-stage K ring, plus a PDL
+  `W4A16TopKSumKernel` path on SM120 full-rotation sums and an exact MCG
+  dequant fast path. Manifest recipes, ABIs and outputs are unchanged. On
+  RTX PRO 6000 (gpu1) sealed paired replay against a stock self-pair, geomean
+  stock-normalized time over rows 1-8 is 0.849 (repeat session 0.850) across
+  Hy4-flash TP1/TP2 MUL1 and GLM 5.3 TP2 MCG+MUL1; floor ratio Hy4-flash TP2
+  1.854 -> 1.576, GLM TP2 MCG 1.485 -> 1.210. The Qwen4 TP1 guard moved
+  0.73-0.75. Every cell is bit-exact, including poisoned prefixes and
+  eager == graph; zero suspected regressions; the 256-4096 prefill guard is
+  within 0.9%. Expected changed placement groups: SM120 EXL3 coordinator
+  routed-expert programs (K4/K5 and K4/K6 decode buckets, all SM120 EXL3
+  top-k sums). See tpurtell/cuteafd#2540.
+
 - EXL3 routed experts on SM120 and SM121: add opt-in `mul1` (`0x83DCD12D`)
   trellis codebook dequantization (`bfe`/`shf` + `mul.lo.u32` + `dp4a.u32.u32` +
   `fma.rn.f16x2`), BTX synthesis/compatibility, preparation, and paired replay

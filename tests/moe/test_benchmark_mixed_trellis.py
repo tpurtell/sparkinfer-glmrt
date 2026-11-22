@@ -681,12 +681,24 @@ def test_legacy_spark_prefill_rejects_codebook_mul1_across_cli_dispatch_and_entr
     assert spec["profiles"]["spark-tp2-width768"] == 768
     assert spec["profiles"]["spark-tp4-width384"] == 384
     assert spec["profiles"]["spark-tp6-width256"] == 256
+    # Hy4-flash records no realistic route fixture (routes=None), so its
+    # coordinator preflight uses uniform random routes only; the default
+    # random,realistic pair must keep failing closed rather than invent one.
+    with pytest.raises(SystemExit) as exc_hy4_realistic:
+        bench.main([
+            "--prefill-family", "hy4f", "--role", "coordinator",
+            "--codebook", "mul1", "--preflight-only", "--output", str(out_file),
+        ])
+    assert exc_hy4_realistic.value.code == 2
+    assert "no realistic route fixture for coordinator family 'hy4f'" in capsys.readouterr().err
     bench.main([
-        "--prefill-family", "hy4f", "--role", "coordinator",
+        "--prefill-family", "hy4f", "--role", "coordinator", "--route-distributions", "random",
         "--codebook", "mul1", "--preflight-only", "--output", str(out_file),
     ])
     hy4_preflight = bench.json.loads(capsys.readouterr().out)
     assert hy4_preflight["preflight"] is True
+    assert hy4_preflight["distributions"] == ["random"]
+    assert hy4_preflight["histogram_waves"] == 0
 
 
 

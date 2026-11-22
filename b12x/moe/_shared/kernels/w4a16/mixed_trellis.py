@@ -2769,6 +2769,53 @@ def compile_mixed_trellis(
                 descriptor_bits=descriptor_bits,
                 compact_weights=compact_weights,
             )
+        use_sm120_k4_decode = (
+            _k4_decode_override is not False
+            and int(tier0_bits) == 4
+            and int(tier1_bits) in (5, 6)
+            and trellis_codebook in (MCG, MUL1)
+            and rotation_input_dtype == "bf16"
+            and full_rotation_output_dtype in ("fp32", "bf16")
+            and int(size_m) <= 80
+            and int(moe_block_size) == 8
+            and not grouped_m8_fc2
+            and not direct_topk_routes
+            and not broadcast_suh
+            and paired_boundary is None
+            and not token_major_rotation
+            and not fused_input_rotation
+            and activations == "a16"
+            and input_format == "bf16"
+            and not row_addresses
+            and str(activation).strip().lower()
+            in ("silu", "silu_post_clamp", "situ")
+            and int(fc1_tile_k) == 64
+            and int(fc2_tile_k) == 64
+            and int(fc1_tile_n) in (128, 256)
+            and int(fc2_tile_n) in (128, 256)
+            and int(hidden_size) % 128 == 0
+            and int(intermediate_size) % 128 == 0
+            and schedule
+            in (
+                None,
+                MixedTrellisDecodeSchedule(),
+                MixedTrellisDecodeSchedule(l2_evict_first_b=True),
+            )
+            and not _w4a16_small_m_splitk_enabled()
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(torch.cuda.current_device())
+            == (12, 0)
+        )
+        if use_sm120_k4_decode:
+            from .mixed_trellis_k4 import W4A16MixedTrellisSM120K4Decode
+
+            return W4A16MixedTrellisSM120K4Decode(
+                driver=make_kernel(total_experts, tier0_bits, **common),
+                tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
+                tier1=make_kernel(int(tier1_num_experts), int(tier1_bits), **common),
+                descriptor_bits=descriptor_bits,
+                compact_weights=compact_weights,
+            )
         return W4A16MixedTrellisKernel(
             driver=make_kernel(total_experts, tier0_bits, **common),
             tier0=make_kernel(int(tier0_num_experts), int(tier0_bits), **common),
