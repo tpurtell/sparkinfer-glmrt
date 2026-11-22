@@ -1074,6 +1074,68 @@ def prepare_layer(stage: Path, manifest, layer: int, device: torch.device):
     return prepared
 
 
+def move_weights_to_carveout(prepared_layers, device: torch.device):
+    """Rehome every non-empty tier's w13/w2 into one ``[carveout | tail]`` backing.
+
+    Runs after preparation and before binding, so kernels see only the new
+    device pointers; every other tensor stays where preparation put it. The
+    bytes are copied device to device and the old payloads released.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import _carveout
+
+    planes = []
+    for layer in sorted(prepared_layers):
+        for tier_index, tier in enumerate(prepared_layers[layer].tiers):
+            for name in ("w13", "w2"):
+                tensor = getattr(tier, name)
+                if tensor.numel() * tensor.element_size() >= (1 << 20):
+                    planes.append((layer, tier_index, name, tensor))
+    align = 256
+    offsets, cursor = [], 0
+    for *_, tensor in planes:
+        cursor = -(-cursor // align) * align
+        offsets.append(cursor)
+        cursor += tensor.numel() * tensor.element_size()
+    key = _carveout.read_key(os.environ.get("SPARK_ATTIC_KEY_FILE", _carveout.DEFAULT_KEY_FILE))
+    torch.cuda.synchronize(device)
+    backing = _carveout.map_backing(
+        cursor, key=key, sock_path=os.environ.get("SPARK_ATTIC_SOCK", _carveout.DEFAULT_SOCKET))
+    try:
+        moved = {}
+        for (layer, tier_index, name, tensor), offset in zip(planes, offsets):
+            nbytes = tensor.numel() * tensor.element_size()
+            view = _carveout.tensor_view(torch, backing, offset, nbytes)
+            target = view.view(tensor.dtype).view(tensor.shape)
+            target.copy_(tensor)
+            moved.setdefault((layer, tier_index), {})[name] = target
+        torch.cuda.synchronize(device)
+        for (layer, tier_index), updates in moved.items():
+            for name, target in updates.items():
+                source = getattr(prepared_layers[layer].tiers[tier_index], name)
+                if not torch.equal(target, source):
+                    raise ValueError(f"carveout copy of l{layer}/tier{tier_index}/{name} differs")
+            prepared = prepared_layers[layer]
+            tiers = list(prepared.tiers)
+            tiers[tier_index] = replace(tiers[tier_index], **updates)
+            prepared_layers[layer] = replace(prepared, tiers=tuple(tiers),
+                                             **({"w13": None, "w2": None}
+                                                if hasattr(prepared, "w13") else {}))
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+    except BaseException:
+        torch.cuda.synchronize(device)
+        backing.close()
+        raise
+    backing.planes = [{"layer": layer, "tier": tier_index, "name": name, "offset": offset,
+                       "bytes": tensor.numel() * tensor.element_size(),
+                       "seam": "carveout" if offset + tensor.numel() * tensor.element_size()
+                       <= backing.carveout_bytes else ("tail" if offset >= backing.carveout_bytes
+                                                       else "straddles")}
+                      for (layer, tier_index, name, tensor), offset in zip(planes, offsets)]
+    return backing
+
+
 def compile_capacity(mt, capacity: int, entry, device: torch.device):
     props = torch.cuda.get_device_properties(device)
     if int(props.multi_processor_count) != SMS:
@@ -1380,9 +1442,25 @@ class ArmRuntime:
         self.prepared = {}
         for layer in self.manifest["layers"]:
             layer = int(layer)
-            prepared = prepare_layer(Path(args.stage), self.stage_manifest,
-                                     layer, self.torch_device)
-            self.prepared[layer] = prepared
+            self.prepared[layer] = prepare_layer(Path(args.stage), self.stage_manifest,
+                                                 layer, self.torch_device)
+        self.weight_backing = {"backing": "device"}
+        self.carveout = None
+        if getattr(args, "weight_backing", "device") == "carveout":
+            self.carveout = move_weights_to_carveout(self.prepared, self.torch_device)
+            # Unmap only after the device drained; atexit also covers SystemExit
+            # from a failed exactness gate and errors after this point.
+            import atexit
+            def _release(backing=self.carveout, device=self.torch_device):
+                try:
+                    torch.cuda.synchronize(device)
+                finally:
+                    error = backing.close()
+                    if error:
+                        print(f"carveout release: {error}", file=sys.stderr)
+            atexit.register(_release)
+            self.weight_backing = {**self.carveout.record(), "planes": self.carveout.planes}
+        for layer, prepared in self.prepared.items():
             for entry in self.capacities:
                 capacity = int(entry["capacity"])
                 launch = self.launches[capacity]
@@ -1626,6 +1704,7 @@ class ArmRuntime:
             "stage_manifest_sha256": sha256_file(Path(self.args.stage) / "manifest.json"),
             "digests_file": (str(Path(self.args.digests).resolve())
                              if self.args.digests else None),
+            "weight_backing": self.weight_backing,
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "device": {"name": self.props.name,
@@ -2140,7 +2219,8 @@ def cmd_run(args):
     runtime = _arm_args(args, {
         "source": args.source, "stage": args.stage, "fixtures": args.fixtures,
         "capacities": args.capacities, "device": args.device,
-        "digests": args.digests, "tag": args.tag})
+        "digests": args.digests, "tag": args.tag,
+        "weight_backing": args.weight_backing})
     ready = runtime.ready_payload()
     if ready["exactness_ok"] is False or ready["digest_mismatches"]:
         raise SystemExit(
@@ -2178,7 +2258,8 @@ def cmd_serve(args):
     runtime = _arm_args(args, {
         "source": args.source, "stage": args.stage, "fixtures": args.fixtures,
         "capacities": args.capacities, "device": args.device,
-        "digests": args.digests, "tag": args.tag})
+        "digests": args.digests, "tag": args.tag,
+        "weight_backing": args.weight_backing})
 
     def emit(payload):
         sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -2234,6 +2315,9 @@ def _common_arm_parser(parser):
                         help="frozen oracle digests to verify against")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--tag", default="arm")
+    parser.add_argument("--weight-backing", choices=("device", "carveout"), default="device",
+                        help="expert w13/w2 storage: ordinary device memory, or the GB10 display "
+                             "carveout from spark-attic's atticd (ordinary-memory tail past it)")
 
 
 def build_parser():
