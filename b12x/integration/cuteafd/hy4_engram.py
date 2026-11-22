@@ -139,7 +139,9 @@ class _Hy4EngramGateAddKernel:
         self,
         residual: cute.Pointer,
         keys: cute.Pointer,
+        key_bias: cute.Pointer,
         value: cute.Pointer,
+        value_bias: cute.Pointer,
         norm_key: cute.Pointer,
         norm_query: cute.Pointer,
         pre_gamma: cute.Pointer,
@@ -153,7 +155,9 @@ class _Hy4EngramGateAddKernel:
         self.kernel(
             cute.make_tensor(residual, cute.make_layout((m, 4, h), stride=(4 * h, h, 1))),
             cute.make_tensor(keys, cute.make_layout((m, 4, h), stride=(4 * h, h, 1))),
+            cute.make_tensor(key_bias, cute.make_layout((4, h), stride=(h, 1))),
             cute.make_tensor(value, cute.make_layout((m, h), stride=(h, 1))),
+            cute.make_tensor(value_bias, cute.make_layout((h,))),
             cute.make_tensor(norm_key, cute.make_layout((4, h), stride=(h, 1))),
             cute.make_tensor(norm_query, cute.make_layout((4, h), stride=(h, 1))),
             cute.make_tensor(pre_gamma, cute.make_layout((h,))),
@@ -166,7 +170,9 @@ class _Hy4EngramGateAddKernel:
         self,
         residual: cute.Tensor,
         keys: cute.Tensor,
+        key_bias: cute.Tensor,
         value: cute.Tensor,
+        value_bias: cute.Tensor,
         norm_key: cute.Tensor,
         norm_query: cute.Tensor,
         pre_gamma: cute.Tensor,
@@ -188,10 +194,10 @@ class _Hy4EngramGateAddKernel:
 
         for j in cutlass.range_constexpr(self.per_thread):
             hh = Int64(j * _GATE_THREADS) + Int64(tidx)
-            v = Float32(value[row, hh])
+            v = Float32(value[row, hh]) + Float32(value_bias[hh])
             acc[0] = acc[0] + v * v
             for s in cutlass.range_constexpr(4):
-                kv = Float32(keys[row, s, hh])
+                kv = Float32(keys[row, s, hh]) + Float32(key_bias[s, hh])
                 qv = Float32(residual[row, s, hh])
                 acc[1 + s] = acc[1 + s] + kv * kv
                 acc[5 + s] = acc[5 + s] + qv * qv
@@ -217,7 +223,8 @@ class _Hy4EngramGateAddKernel:
         for j in cutlass.range_constexpr(self.per_thread):
             hh = Int64(j * _GATE_THREADS) + Int64(tidx)
             for s in cutlass.range_constexpr(4):
-                kn = Float32(keys[row, s, hh]) * acc[1 + s] * Float32(norm_key[s, hh])
+                kv = Float32(keys[row, s, hh]) + Float32(key_bias[s, hh])
+                kn = kv * acc[1 + s] * Float32(norm_key[s, hh])
                 qn = Float32(residual[row, s, hh]) * acc[5 + s] * Float32(norm_query[s, hh])
                 dot[s] = dot[s] + kn * qn
 
@@ -245,7 +252,8 @@ class _Hy4EngramGateAddKernel:
         if not is_masked:
             for j in cutlass.range_constexpr(self.per_thread):
                 hh = Int64(j * _GATE_THREADS) + Int64(tidx)
-                vn = Float32(pre_gamma[hh]) * (Float32(value[row, hh]) * inv_v)
+                v = Float32(value[row, hh]) + Float32(value_bias[hh])
+                vn = Float32(pre_gamma[hh]) * (v * inv_v)
                 for s in cutlass.range_constexpr(4):
                     delta = (gate[s] + Float32(hc_scales[s, hh])) * vn
                     residual[row, s, hh] = (Float32(residual[row, s, hh]) + delta).to(BFloat16)
@@ -273,7 +281,9 @@ def compile_hy4_engram_gate_add_aot(g: Hy4EngramGeometry = HY4_FLASH_ENGRAM):
     operands = (
         Operand("residual", torch.bfloat16, f"[rows,4,{h}]", "inout"),
         Operand("keys", torch.bfloat16, f"[rows,4,{h}]"),
+        Operand("key_bias", torch.bfloat16, f"[4,{h}]"),
         Operand("value", torch.bfloat16, f"[rows,{h}]"),
+        Operand("value_bias", torch.bfloat16, f"[{h}]"),
         Operand("norm_key", torch.bfloat16, f"[4,{h}]"),
         Operand("norm_query", torch.bfloat16, f"[4,{h}]"),
         Operand("pre_gamma", torch.bfloat16, f"[{h}]"),
@@ -285,7 +295,7 @@ def compile_hy4_engram_gate_add_aot(g: Hy4EngramGeometry = HY4_FLASH_ENGRAM):
         name="hy4_engram_gate_add",
         operands=operands,
         scalars=(Scalar("rows"),),
-        key=(g, "gate_add"),
+        key=(g, "gate_add_bias"),
         geometry=vars(g),
         doc=__doc__,
     )

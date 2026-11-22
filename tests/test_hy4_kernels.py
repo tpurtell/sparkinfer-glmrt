@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import math
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 import torch.nn.functional as F
 
+from tests._reference.helpers import require_b12x
+
 torch.set_float32_matmul_precision("highest")
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 from b12x.integration.cuteafd.hy4_ihc import (
     HY4_FLASH_IHC,
@@ -61,8 +65,8 @@ def _interleaved_rope(x: torch.Tensor, pos: torch.Tensor, theta: float) -> torch
 
 @pytest.mark.parametrize("rows", [1, 7, 64])
 def test_hy4_ihc_and_hc_head_exact_oracle(rows: int):
+    dev = require_b12x()
     torch.manual_seed(42 + rows)
-    dev = "cuda"
     h = 3072
     r = torch.randn(rows, 4, h, dtype=torch.bfloat16, device=dev) * 0.5
     delta = torch.randn(rows, h, dtype=torch.bfloat16, device=dev) * 0.5
@@ -131,8 +135,8 @@ def test_hy4_ihc_and_hc_head_exact_oracle(rows: int):
 
 
 def test_hy4_engram_kernels_exact_oracle():
+    dev = require_b12x()
     torch.manual_seed(7)
-    dev = "cuda"
     rows, h = 11, 3072
     eps = float(torch.finfo(torch.float32).eps)
 
@@ -146,7 +150,9 @@ def test_hy4_engram_kernels_exact_oracle():
 
     res = torch.randn(rows, 4, h, dtype=torch.bfloat16, device=dev) * 0.5
     keys = torch.randn(rows, 4, h, dtype=torch.bfloat16, device=dev) * 0.5
+    key_bias = torch.randn(4, h, dtype=torch.bfloat16, device=dev) * 0.25
     val = torch.randn(rows, h, dtype=torch.bfloat16, device=dev) * 0.5
+    val_bias = torch.randn(h, dtype=torch.bfloat16, device=dev) * 0.25
     nk = torch.randn(4, h, dtype=torch.bfloat16, device=dev) + 1.0
     nq = torch.randn(4, h, dtype=torch.bfloat16, device=dev) + 1.0
     pg = torch.randn(h, dtype=torch.bfloat16, device=dev) + 1.0
@@ -156,11 +162,11 @@ def test_hy4_engram_kernels_exact_oracle():
     masked[8] = 1
 
     # Reference
-    vf = val.float()
+    vf = val.float() + val_bias.float()
     vn = pg.float() * (vf * torch.rsqrt(vf.square().mean(-1, keepdim=True) + eps))
     ref = res.float().clone()
     for j in range(4):
-        kj = _rms_norm(keys[:, j], nk[j], eps)
+        kj = _rms_norm(keys[:, j].float() + key_bias[j].float(), nk[j], eps)
         qj = _rms_norm(res[:, j], nq[j], eps)
         g = (kj * qj).sum(-1) * (h ** -0.5)
         gate = torch.sigmoid(g.abs().clamp_min(1e-6).sqrt() * g.sign())
@@ -169,18 +175,59 @@ def test_hy4_engram_kernels_exact_oracle():
         ref[:, j] = (res[:, j].float() + delta).to(torch.bfloat16).float()
 
     res_gpu = res.clone()
-    compile_hy4_engram_gate_add_aot(HY4_FLASH_ENGRAM).launch(res_gpu, keys, val, nk, nq, pg, hs, masked, scalars=(rows,))
+    compile_hy4_engram_gate_add_aot(HY4_FLASH_ENGRAM).launch(
+        res_gpu, keys, key_bias, val, val_bias, nk, nq, pg, hs, masked, scalars=(rows,)
+    )
     torch.cuda.synchronize()
     assert torch.equal(res_gpu[3], res[3])
     assert torch.equal(res_gpu[8], res[8])
     assert (res_gpu.float() - ref).abs().max().item() <= 0.03
 
 
+@pytest.mark.parametrize("active_splits", [1, 4])
+def test_hy4_mla_long_dsa_dynamic_splits(active_splits: int):
+    """Verify dynamic_split_chunks covers all 384 (> 2*64) tokens even at active_splits=1."""
+    dev = require_b12x()
+    torch.manual_seed(777)
+    seq_len = 384
+    g = Hy4MlaGeometry(heads=16, window_size=None, kv_cache="fp8")
+    q = torch.randn(1, 16, 576, dtype=torch.bfloat16, device=dev) * 0.2
+    kv_a = torch.randn(seq_len, 576, dtype=torch.bfloat16, device=dev) * 0.2
+    q_a = torch.zeros(seq_len, 1024, dtype=torch.bfloat16, device=dev)
+    q_norm = torch.ones(1024, dtype=torch.bfloat16, device=dev)
+    kv_norm = torch.ones(512, dtype=torch.bfloat16, device=dev)
+    inv_freq = (1.0 / (10_000_000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+    positions = torch.arange(seq_len, dtype=torch.int64, device=dev)
+    slots = torch.arange(seq_len, dtype=torch.int64, device=dev)
+    cache = torch.zeros(6, 64, 656, dtype=torch.uint8, device=dev)
+    q_resid = torch.empty(seq_len, 1024, dtype=torch.bfloat16, device=dev)
+    compile_hy4_mla_rank_norm_pack_aot(g).launch(
+        q_a, kv_a, q_norm, kv_norm, slots, positions, inv_freq, q_resid, cache, scalars=(seq_len,)
+    )
+    prog = compile_hy4_mla_attention_aot(g, max_rows=16, max_context=2048, mode="decode", page_size=1)
+    scratch = torch.empty(max(1024, hy4_attention_layout(g, 16, max_context=2048, mode="decode")["scratch_bytes"]),
+                          dtype=torch.uint8, device=dev)
+    pt = torch.arange(seq_len, dtype=torch.int32, device=dev).unsqueeze(0)
+    seqlens = torch.tensor([seq_len], dtype=torch.int32, device=dev)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=dev)
+    out = torch.empty(1, 16, 512, dtype=torch.bfloat16, device=dev)
+    lse = torch.empty(1, 16, dtype=torch.float32, device=dev)
+    prog.launch(q, cache, pt, seqlens, cu, out, lse, scratch, scalars=(1, 1, seq_len, active_splits))
+    torch.cuda.synchronize()
+    k0 = _rms_norm(kv_a[:, :512], kv_norm, 1e-5)
+    kr = _interleaved_rope(kv_a[:, 512:], positions, 10_000_000.0)
+    k_full = torch.cat([k0, kr], dim=-1)  # [T, 576]
+    scores = torch.einsum("hd,td->ht", q[0].float(), k_full) * (256.0 ** -0.5)
+    probs = torch.softmax(scores, dim=-1)
+    ref = torch.matmul(probs, k0)
+    assert (out[0].float() - ref).abs().max().item() <= 0.05
+
+
 @pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
 @pytest.mark.parametrize("heads,window", [(16, None), (32, None), (32, 512), (64, 512)])
 def test_hy4_mla_end_to_end_oracle(kv_cache: str, heads: int, window: int | None):
+    dev = require_b12x()
     torch.manual_seed(123)
-    dev = "cuda"
     seq_len = 96
     g = Hy4MlaGeometry(heads=heads, window_size=window, kv_cache=kv_cache)
     theta = 10_000.0 if window is not None else 10_000_000.0
@@ -258,8 +305,8 @@ def test_hy4_mla_end_to_end_oracle(kv_cache: str, heads: int, window: int | None
 
 
 def test_hy4_indexer_oracle():
+    dev = require_b12x()
     torch.manual_seed(99)
-    dev = "cuda"
     g = HY4_FLASH_INDEXER
     theta = 10_000_000.0
     inv_freq = (1.0 / (theta ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
@@ -323,8 +370,8 @@ def test_hy4_indexer_oracle():
 @pytest.mark.parametrize("heads", [32, 64])
 def test_hy4_mla_swa_extend_clips_window(kv_cache: str, heads: int):
     """Verify mode='extend' prefill on SWA-512 with seq_len=640 (> 512) clips old tokens."""
+    dev = require_b12x()
     torch.manual_seed(321)
-    dev = "cuda"
     seq_len = 640
     window = 512
     g = Hy4MlaGeometry(heads=heads, window_size=window, kv_cache=kv_cache)
@@ -395,23 +442,32 @@ def test_hy4_mla_swa_extend_clips_window(kv_cache: str, heads: int):
 
 
 def test_hy4_indexer_long_context_topk_and_ties():
-    """Verify exact GPU radix top-511 + tie-breaking + non-identity page_table at seq_len > 2048."""
+    """Verify exact GPU radix top-511 + straddling-rank-511 ties + non-identity page_table at seq_len > 2048."""
+    dev = require_b12x()
     torch.manual_seed(777)
-    dev = "cuda"
     g = HY4_FLASH_INDEXER
-    rows = 5
+    rows = 7
     max_groups = 700  # 2800 tokens = 44 pages
     pages = 48
     perm = torch.randperm(pages, dtype=torch.int32, device=dev)
     pt = perm.unsqueeze(0).expand(rows, pages).contiguous()
 
     # Mix short (<=2048) and long (>2048) positions, including exact boundaries 2047, 2048, 2051.
-    positions = torch.tensor([130, 2047, 2048, 2051, 2619], dtype=torch.int32, device=dev)
+    positions = torch.tensor([130, 2047, 2048, 2051, 2619, 2619, 2619], dtype=torch.int32, device=dev)
     scores = torch.randn(rows, max_groups, dtype=torch.float32, device=dev)
-    # Inject deliberate ties (including +0.0 / -0.0 and exact duplicate threshold values) on row 4!
+    # Row 4: arbitrary blocks of duplicates.
     scores[4, 100:250] = 0.5
     scores[4, 250:320] = -0.0
     scores[4, 320:380] = 0.0
+    # Row 5: exact tie block straddling rank 511 (490 strictly > 1.0, 100 tied == 1.0 -> rem=21 > 1 in pass 5).
+    scores[5, :] = -1.0
+    scores[5, 0:490] = 2.0
+    scores[5, 490:590] = 1.0
+    # Row 6: +0.0 / -0.0 tie block straddling rank 511 across non-contiguous gids (500 strictly > 0, 100 signed zeros -> rem=11).
+    scores[6, :] = -2.0
+    scores[6, 0:500] = 3.0
+    scores[6, 500:600:2] = -0.0
+    scores[6, 501:600:2] = 0.0
 
     slots_out = torch.empty(rows, 2048, dtype=torch.int32, device=dev)
     lens_out = torch.empty(rows, dtype=torch.int32, device=dev)

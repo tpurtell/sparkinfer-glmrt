@@ -368,6 +368,7 @@ class _Hy4Attention:
             window_size=g.window_size,
             noncausal_block=False,
             ds_mla_record=g.kv_cache == "fp8",
+            dynamic_split_chunks=True,
             singleton_requests=(self.page_size == 1),
         )
         self.merge = DenseMlaMergeKernel(num_splits=self.splits, value_dim=512) if self.splits > 1 else None
