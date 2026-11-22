@@ -9465,6 +9465,35 @@ def _ld_global_nc_v2_u32_evict_first_pred(
 
 
 @dsl_user_op
+def _ld_global_nc_v2_u32_evict_first(
+    addr: Int64, policy: cutlass.Uint64, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32]:
+    """Side-effecting 64-bit global non-coherent L1-bypass L2-evict-first load.
+
+    Uses ``has_side_effects=True`` so LLVM/NVPTX strictly preserves ordering
+    across ``griddepcontrol.wait`` in PDL-overlapped combine kernels.
+    """
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Uint64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        "ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {$0, $1}, [$2], $3;",
+        "=r,=r,l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
 def _had_bfly_quad_fma(
     h0: cutlass.Float32,
     h1: cutlass.Float32,
@@ -9559,6 +9588,7 @@ class W4A16TopKSumKernel:
         float32_output: bool = False,
         reply_format: int = 0,
         row_addresses: bool = False,
+        sm120_pdl: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -9587,6 +9617,14 @@ class W4A16TopKSumKernel:
         if row_addresses and (not full_rotation or coupled_hadamard):
             raise ValueError("row-address combine requires uncoupled full rotation")
         self.row_addresses = bool(row_addresses)
+        self.sm120_pdl = bool(
+            sm120_pdl
+            and self.full_rotation
+            and not self.coupled_hadamard
+            and self.reply_format == 0
+            and not self.row_addresses
+            and self.topk <= 16
+        )
         if self.use_expert_map:
             if self.route_num_experts <= 0:
                 raise ValueError("expert-map top-k sum requires route_num_experts > 0")
@@ -9708,21 +9746,39 @@ class W4A16TopKSumKernel:
         else:
             total = active_m * Int32(self.hidden_size)
             grid = (_covering_count(total, self.cta_threads), 1, 1)
-        self.kernel(
-            fc2_flat,
-            output_flat,
-            topk_weights_flat,
-            route_expert_ids_flat,
-            expert_map_flat,
-            svh_flat,
-            weight_num_experts,
-            route_num_experts,
-            active_m,
-        ).launch(
-            grid=grid,
-            block=[self.cta_threads, 1, 1],
-            stream=stream,
-        )
+        if cutlass.const_expr(self.sm120_pdl):
+            self.kernel(
+                fc2_flat,
+                output_flat,
+                topk_weights_flat,
+                route_expert_ids_flat,
+                expert_map_flat,
+                svh_flat,
+                weight_num_experts,
+                route_num_experts,
+                active_m,
+            ).launch(
+                grid=grid,
+                block=[self.cta_threads, 1, 1],
+                use_pdl=True,
+                stream=stream,
+            )
+        else:
+            self.kernel(
+                fc2_flat,
+                output_flat,
+                topk_weights_flat,
+                route_expert_ids_flat,
+                expert_map_flat,
+                svh_flat,
+                weight_num_experts,
+                route_num_experts,
+                active_m,
+            ).launch(
+                grid=grid,
+                block=[self.cta_threads, 1, 1],
+                stream=stream,
+            )
 
     @cute.kernel
     def kernel(
@@ -10069,6 +10125,193 @@ class W4A16TopKSumKernel:
                 self._quantize_and_store_reply_slab(
                     output_flat, token, blk, col0, lane, acc0, acc1, acc2, acc3
                 )
+            return
+        if cutlass.const_expr(self.sm120_pdl):
+            tid = Int32(tidx)
+            lane = tid & Int32(31)
+            warp = tid >> Int32(5)
+            unit = Int32(bidx)
+            nblk = Int32(self.hidden_size // 128)
+            total_units = active_m * nblk
+            smem_words = ((self.topk * 512 + self.topk * 4 + 15) // 16) * 4
+            smem = cutlass.utils.SmemAllocator()
+
+            @cute.struct
+            class SumStorage:
+                words: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.Uint32, smem_words], 16
+                ]
+
+            storage = smem.allocate(SumStorage)
+            smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+            if unit < total_units:
+                token = unit // nblk
+                blk = unit - token * nblk
+                col0 = blk * Int32(128) + lane * Int32(4)
+
+                # Pre-resolve expert ids/weights and preload cold svh before
+                # waiting on the preceding FC2 grid via PDL.
+                route0 = warp
+                row0 = token * Int32(self.topk) + route0
+                valid0 = Int32(0)
+                expert0 = Int32(-1)
+                if route0 < Int32(self.topk):
+                    if lane == Int32(0):
+                        raw_e0 = route_expert_ids_flat[row0].to(Int32)
+                        e0 = raw_e0
+                        if cutlass.const_expr(self.use_expert_map):
+                            e0 = Int32(-1)
+                            if raw_e0 >= Int32(0) and raw_e0 < route_num_experts:
+                                e0 = expert_map_flat[raw_e0].to(Int32)
+                        w0 = cutlass.Float32(0.0)
+                        if e0 >= Int32(0) and e0 < weight_num_experts:
+                            valid0 = Int32(1)
+                            expert0 = e0
+                            w0 = topk_weights_flat[row0].to(cutlass.Float32)
+                        st_shared_f32(
+                            smem_base + Int32(self.topk * 512) + route0 * Int32(4), w0
+                        )
+                    valid0 = cute.arch.shuffle_sync(valid0, Int32(0))
+                    expert0 = cute.arch.shuffle_sync(expert0, Int32(0))
+                sp01_0 = Uint32(0)
+                sp23_0 = Uint32(0)
+                if valid0 != Int32(0):
+                    if cutlass.const_expr(self.broadcast_svh):
+                        sbase0 = Int64(col0)
+                    else:
+                        sbase0 = Int64(expert0) * Int64(self.hidden_size) + Int64(col0)
+                    sp01_0, sp23_0 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(svh_flat, sbase0)
+                    )
+
+                route1 = warp + Int32(8)
+                row1 = token * Int32(self.topk) + route1
+                valid1 = Int32(0)
+                sp01_1 = Uint32(0)
+                sp23_1 = Uint32(0)
+                if cutlass.const_expr(self.topk > 8):
+                    expert1 = Int32(-1)
+                    if route1 < Int32(self.topk):
+                        if lane == Int32(0):
+                            raw_e1 = route_expert_ids_flat[row1].to(Int32)
+                            e1 = raw_e1
+                            if cutlass.const_expr(self.use_expert_map):
+                                e1 = Int32(-1)
+                                if raw_e1 >= Int32(0) and raw_e1 < route_num_experts:
+                                    e1 = expert_map_flat[raw_e1].to(Int32)
+                            w1 = cutlass.Float32(0.0)
+                            if e1 >= Int32(0) and e1 < weight_num_experts:
+                                valid1 = Int32(1)
+                                expert1 = e1
+                                w1 = topk_weights_flat[row1].to(cutlass.Float32)
+                            st_shared_f32(
+                                smem_base + Int32(self.topk * 512) + route1 * Int32(4),
+                                w1,
+                            )
+                        valid1 = cute.arch.shuffle_sync(valid1, Int32(0))
+                        expert1 = cute.arch.shuffle_sync(expert1, Int32(0))
+                    if valid1 != Int32(0):
+                        if cutlass.const_expr(self.broadcast_svh):
+                            sbase1 = Int64(col0)
+                        else:
+                            sbase1 = Int64(expert1) * Int64(self.hidden_size) + Int64(
+                                col0
+                            )
+                        sp01_1, sp23_1 = ld_global_nc_v2_u32(
+                            get_ptr_as_int64(svh_flat, sbase1)
+                        )
+
+                cute.arch.griddepcontrol_wait()
+
+                fc2_policy = create_l2_evict_first_policy()
+                if route0 < Int32(self.topk):
+                    hs0 = cutlass.Float32(0.0)
+                    hs1 = cutlass.Float32(0.0)
+                    hs2 = cutlass.Float32(0.0)
+                    hs3 = cutlass.Float32(0.0)
+                    if valid0 != Int32(0):
+                        base0 = Int64(row0) * Int64(self.hidden_size) + Int64(col0)
+                        p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first(
+                            get_ptr_as_int64(fc2_flat, base0), fc2_policy
+                        )
+                        v0, v1 = f16x2_to_f32x2(p01_0)
+                        v2, v3 = f16x2_to_f32x2(p23_0)
+                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+                        s0, s1 = f16x2_to_f32x2(sp01_0)
+                        s2, s3 = f16x2_to_f32x2(sp23_0)
+                        hs0 = h0 * s0
+                        hs1 = h1 * s1
+                        hs2 = h2 * s2
+                        hs3 = h3 * s3
+                    st_shared_v4_f32(
+                        smem_base + route0 * Int32(512) + lane * Int32(16),
+                        hs0,
+                        hs1,
+                        hs2,
+                        hs3,
+                    )
+
+                if cutlass.const_expr(self.topk > 8):
+                    if route1 < Int32(self.topk):
+                        hs0 = cutlass.Float32(0.0)
+                        hs1 = cutlass.Float32(0.0)
+                        hs2 = cutlass.Float32(0.0)
+                        hs3 = cutlass.Float32(0.0)
+                        if valid1 != Int32(0):
+                            base1 = Int64(row1) * Int64(self.hidden_size) + Int64(col0)
+                            p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first(
+                                get_ptr_as_int64(fc2_flat, base1), fc2_policy
+                            )
+                            v0, v1 = f16x2_to_f32x2(p01_1)
+                            v2, v3 = f16x2_to_f32x2(p23_1)
+                            h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+                            s0, s1 = f16x2_to_f32x2(sp01_1)
+                            s2, s3 = f16x2_to_f32x2(sp23_1)
+                            hs0 = h0 * s0
+                            hs1 = h1 * s1
+                            hs2 = h2 * s2
+                            hs3 = h3 * s3
+                        st_shared_v4_f32(
+                            smem_base + route1 * Int32(512) + lane * Int32(16),
+                            hs0,
+                            hs1,
+                            hs2,
+                            hs3,
+                        )
+                cute.arch.sync_threads()
+
+                if warp == Int32(0):
+                    acc0 = cutlass.Float32(0.0)
+                    acc1 = cutlass.Float32(0.0)
+                    acc2 = cutlass.Float32(0.0)
+                    acc3 = cutlass.Float32(0.0)
+                    for route in cutlass.range_constexpr(self.topk):
+                        r0, r1, r2, r3 = ld_shared_v4_f32(
+                            smem_base + Int32(route * 512) + lane * Int32(16)
+                        )
+                        weight = ld_shared_f32(
+                            smem_base + Int32(self.topk * 512 + route * 4)
+                        )
+                        acc0 += r0 * weight
+                        acc1 += r1 * weight
+                        acc2 += r2 * weight
+                        acc3 += r3 * weight
+                    if cutlass.const_expr(self.full_rotation_output_bf16):
+                        out_base_i32 = token * Int32(self.hidden_size) + col0
+                        output_flat[out_base_i32 + Int32(0)] = cutlass.BFloat16(acc0)
+                        output_flat[out_base_i32 + Int32(1)] = cutlass.BFloat16(acc1)
+                        output_flat[out_base_i32 + Int32(2)] = cutlass.BFloat16(acc2)
+                        output_flat[out_base_i32 + Int32(3)] = cutlass.BFloat16(acc3)
+                    else:
+                        out_base = Int64(token) * Int64(self.hidden_size) + Int64(col0)
+                        st_global_v4_f32(
+                            get_ptr_as_int64(output_flat, out_base),
+                            acc0,
+                            acc1,
+                            acc2,
+                            acc3,
+                        )
             return
         if cutlass.const_expr(self.full_rotation):
             tid = Int32(tidx)
@@ -11889,6 +12132,15 @@ def compile_w4a16_topk_sum(
     route_cutlass_dtype = (
         cutlass.Int32 if route_ids_dtype == torch.int32 else cutlass.Int64
     )
+    sm120_pdl = bool(
+        full_rotation
+        and not coupled_hadamard
+        and int(reply_format) == 0
+        and not row_addresses
+        and int(topk) <= 16
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 0)
+    )
     kernel = W4A16TopKSumKernel(
         topk=topk,
         hidden_size=hidden_size,
@@ -11903,6 +12155,7 @@ def compile_w4a16_topk_sum(
         float32_output=float32_output,
         reply_format=reply_format,
         row_addresses=row_addresses,
+        sm120_pdl=sm120_pdl,
     )
     base_cache_key = (
         "w4a16_topk_sum",
@@ -11926,6 +12179,8 @@ def compile_w4a16_topk_sum(
     )
     if row_addresses:
         cache_key += (("row_addresses",),)
+    if sm120_pdl:
+        cache_key += (("sm120_pdl_v1",),)
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return attach_programs(
