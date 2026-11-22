@@ -134,11 +134,11 @@ class _Hy4RankNormPack:
         positions: cute.Pointer,
         inv_freq: cute.Pointer,
         q_resid: cute.Pointer,
-        cache: cute.Pointer,
+        kv_cache: cute.Pointer,
         rows: Int32,
         stream: cuda.CUstream,
     ):
-        self.kernel(q_a, kv_a, q_norm, kv_norm, slots, positions, inv_freq, q_resid, cache).launch(
+        self.kernel(q_a, kv_a, q_norm, kv_norm, slots, positions, inv_freq, q_resid, kv_cache).launch(
             grid=(rows, 1, 1), block=(256, 1, 1), stream=stream
         )
 

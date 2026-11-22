@@ -317,8 +317,8 @@ def compile_hy4_ihc_pre_aot(g: Hy4IhcGeometry = HY4_FLASH_IHC):
         Operand("scale", torch.float32, "[2]", align=4),
         Operand("base", torch.float32, "[8]", align=4),
         Operand("norm", torch.bfloat16, f"[{h}]"),
-        Operand("post", torch.float32, "[rows,4]", "out"),
-        Operand("y", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("post_out", torch.float32, "[rows,4]", "out"),
+        Operand("y_out", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     return compile_program(
         _Hy4IhcPreStandalone(g),
@@ -342,8 +342,8 @@ def compile_hy4_ihc_post_pre_aot(g: Hy4IhcGeometry = HY4_FLASH_IHC):
         Operand("base", torch.float32, "[8]", align=4),
         Operand("norm", torch.bfloat16, f"[{h}]"),
         Operand("residual_out", torch.bfloat16, f"[rows,4,{h}]", "out"),
-        Operand("post", torch.float32, "[rows,4]", "out"),
-        Operand("y", torch.bfloat16, f"[rows,{h}]", "out"),
+        Operand("post_out", torch.float32, "[rows,4]", "out"),
+        Operand("y_out", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     return compile_program(
         _Hy4IhcPreKernel(g, fuse_post=True),
