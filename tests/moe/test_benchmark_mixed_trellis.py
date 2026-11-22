@@ -667,5 +667,26 @@ def test_legacy_spark_prefill_rejects_codebook_mul1_across_cli_dispatch_and_entr
     preflight = bench.json.loads(capsys.readouterr().out)
     assert preflight["preflight"] is True
 
+    # 5. Hy4-flash geometry is registered with latent H=1536, I=1536, E=512, K=16, swiglu_limit=10.
+    assert bench.PREFILL_FAMILIES["hy4f"] == (1536, 512, 16, (4, 5), "silu")
+    assert bench.PREFILL_SWIGLU_LIMITS["hy4f"] == 10.0
+    assert bench.PREFILL_TIER_COUNTS["hy4f"] == (512, 0)
+    spec = bench.COORDINATOR_FAMILIES["hy4f"]
+    assert (spec["hidden"], spec["experts"], spec["top_k"], spec["bits"], spec["activation"], spec["swiglu_limit"]) == (
+        1536, 512, 16, (4, 5), "silu", 10.0,
+    )
+    assert spec["profiles"]["rtx-tp1"] == 1536
+    assert spec["profiles"]["rtx-tp2"] == 768
+    assert spec["profiles"]["spark-tp1-width1536"] == 1536
+    assert spec["profiles"]["spark-tp2-width768"] == 768
+    assert spec["profiles"]["spark-tp4-width384"] == 384
+    assert spec["profiles"]["spark-tp6-width256"] == 256
+    bench.main([
+        "--prefill-family", "hy4f", "--role", "coordinator",
+        "--codebook", "mul1", "--preflight-only", "--output", str(out_file),
+    ])
+    hy4_preflight = bench.json.loads(capsys.readouterr().out)
+    assert hy4_preflight["preflight"] is True
+
 
 

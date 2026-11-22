@@ -1020,6 +1020,7 @@ PREFILL_FAMILIES = {
     "muse": (4096, 256, 8, (4, 5), "silu"),
     "step5": (4096, 352, 8, (4, 5), "silu_post_clamp"),
     "ml4": (6144, 128, 4, (4, 5), "silu"),
+    "hy4f": (1536, 512, 16, (4, 5), "silu"),
 }
 
 PREFILL_SWIGLU_LIMITS = {
@@ -1033,6 +1034,7 @@ PREFILL_SWIGLU_LIMITS = {
     "muse": None,
     "step5": 7.0,
     "ml4": None,
+    "hy4f": 10.0,
 }
 
 PREFILL_TIER_COUNTS = {
@@ -1046,6 +1048,7 @@ PREFILL_TIER_COUNTS = {
     "muse": (256, 0),
     "step5": (352, 0),
     "ml4": (128, 0),
+    "hy4f": (512, 0),
 }
 
 
@@ -1534,6 +1537,15 @@ COORDINATOR_FAMILIES = {
                           "spark-tp6-width1024": 1024, "spark-tp7-width896": 896,
                           "spark-tp7-width768": 768},
                 capacities=GLM_CAPACITIES, routes=None),
+    # Hy4-flash LatentMoE: 512 experts, top-16 on the 1536 latent, K4 MUL1 only.
+    "hy4f": dict(hidden=1536, experts=512, top_k=16, bits=(4, 5), activation="silu",
+                 swiglu_limit=10.0, model="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+                 profiles={"rtx-tp1": 1536, "rtx-tp2": 768,
+                           "spark-tp1-width1536": 1536, "spark-tp2-width768": 768,
+                           "spark-tp3-width512": 512, "spark-tp4-width384": 384,
+                           "spark-tp5-width384": 384, "spark-tp5-width256": 256,
+                           "spark-compact-width384": 384, "spark-tp6-width256": 256},
+                 capacities=GLM_CAPACITIES, routes=None),
 }
 # Shipped cooperative coordinator policy (`package_exl3_aot.py`): the route
 # block and rotation a family's exports actually use, so `served` arms and the
@@ -1550,6 +1562,7 @@ SERVED_ROUTE_BLOCKS = {
     "muse": lambda capacity: 8,
     "step5": lambda capacity: 8,
     "ml4": lambda capacity: 8,
+    "hy4f": lambda capacity: 8,
 }
 SERVED_TOKEN_ROTATION = {
     "glm": lambda capacity: capacity > 256,
@@ -1561,6 +1574,7 @@ SERVED_TOKEN_ROTATION = {
     "muse": lambda capacity: False,
     "step5": lambda capacity: False,
     "ml4": lambda capacity: False,
+    "hy4f": lambda capacity: False,
 }
 
 
