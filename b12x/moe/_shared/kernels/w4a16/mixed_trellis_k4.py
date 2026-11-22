@@ -5706,9 +5706,6 @@ class W4A16MixedTrellisSM120K4Decode(W4A16MixedTrellisKernel):
                     arg2_d = Int32(0)
                     got_work = Int32(0)
                     while got_work == Int32(0):
-                        have_rot = Int32(0)
-                        have_fc1 = Int32(0)
-                        t_task = Int32(0)
                         if phase == Int32(0):
                             if (
                                 _ld_global_acquire_gpu_i32(
@@ -5718,11 +5715,39 @@ class W4A16MixedTrellisSM120K4Decode(W4A16MixedTrellisKernel):
                             ):
                                 phase = Int32(1)
                             else:
-                                t_task = _atomic_add_acq_rel_gpu_i32(
+                                t_rot = _atomic_add_acq_rel_gpu_i32(
                                     ws_base + Int64(_WS_ROT_CURSOR * 4), Int32(1)
                                 )
-                                if t_task < total_rot_tasks:
-                                    have_rot = Int32(1)
+                                if t_rot < total_rot_tasks:
+                                    rb_r = t_rot // Int32(rot_splits)
+                                    chk_r = t_rot - rb_r * Int32(rot_splits)
+                                    ce_r = block_expert_ids[rb_r].to(Int32)
+                                    valid_r = (
+                                        ce_r >= Int32(0) and ce_r < total_experts
+                                    ).to(Int32)
+                                    if valid_r != Int32(0):
+                                        r0_r = packed_route_indices[
+                                            rb_r * Int32(8)
+                                        ].to(Int32)
+                                        if r0_r < Int32(0) or r0_r >= live_routes:
+                                            valid_r = Int32(0)
+                                        elif cutlass.const_expr(self.compact_weights):
+                                            lw_r = descriptor_map[
+                                                Int64(3) * Int64(total_experts)
+                                                + Int64(ce_r)
+                                            ].to(Int32)
+                                            if lw_r <= Int32(0):
+                                                valid_r = Int32(0)
+                                    if valid_r != Int32(0):
+                                        action_d = Int32(_ACT_ROT)
+                                        arg0_d = rb_r
+                                        arg1_d = chk_r
+                                        got_work = Int32(1)
+                                    else:
+                                        _atomic_add_acq_rel_gpu_i32(
+                                            ws_state_base + Int64(rb_r) * Int64(4),
+                                            Int32(_SM120_ROT_DONE_STEP),
+                                        )
                                 else:
                                     phase = Int32(1)
                         elif phase == Int32(1):
@@ -5734,11 +5759,74 @@ class W4A16MixedTrellisSM120K4Decode(W4A16MixedTrellisKernel):
                             ):
                                 phase = Int32(2)
                             else:
-                                t_task = _atomic_add_acq_rel_gpu_i32(
+                                t_fc1 = _atomic_add_acq_rel_gpu_i32(
                                     ws_base + Int64(_WS_FC1_CURSOR * 4), Int32(1)
                                 )
-                                if t_task < total_fc1_tasks:
-                                    have_fc1 = Int32(1)
+                                if t_fc1 < total_fc1_tasks:
+                                    rb_f = t_fc1 // Int32(fc1_n_tiles)
+                                    nt_f = t_fc1 - rb_f * Int32(fc1_n_tiles)
+                                    ce_f = block_expert_ids[rb_f].to(Int32)
+                                    valid_f = (
+                                        ce_f >= Int32(0) and ce_f < total_experts
+                                    ).to(Int32)
+                                    lw_f = Int32(self.intermediate_size)
+                                    if valid_f != Int32(0):
+                                        r0_f = packed_route_indices[
+                                            rb_f * Int32(8)
+                                        ].to(Int32)
+                                        if r0_f < Int32(0) or r0_f >= live_routes:
+                                            valid_f = Int32(0)
+                                        elif cutlass.const_expr(self.compact_weights):
+                                            lw_f = descriptor_map[
+                                                Int64(3) * Int64(total_experts)
+                                                + Int64(ce_f)
+                                            ].to(Int32)
+                                            if lw_f <= Int32(0):
+                                                valid_f = Int32(0)
+                                    active_tile = valid_f
+                                    if cutlass.const_expr(self.compact_weights):
+                                        if active_tile != Int32(0):
+                                            loc_nt = nt_f
+                                            if loc_nt >= Int32(fc1_half_tiles):
+                                                loc_nt -= Int32(fc1_half_tiles)
+                                            if loc_nt * Int32(tile_n) >= lw_f:
+                                                active_tile = Int32(0)
+                                    if active_tile != Int32(0):
+                                        st_val = _ld_global_acquire_gpu_i32(
+                                            ws_state_base + Int64(rb_f) * Int64(4)
+                                        )
+                                        rot_done = (
+                                            (st_val & Int32(_SM120_ROT_MASK))
+                                            == rot_ready_val
+                                        ).to(Int32)
+                                        action_d = Int32(_ACT_FC1)
+                                        arg0_d = rb_f
+                                        arg1_d = nt_f
+                                        arg2_d = rot_done
+                                        got_work = Int32(1)
+                                    else:
+                                        old_st = _atomic_add_acq_rel_gpu_i32(
+                                            ws_state_base + Int64(rb_f) * Int64(4),
+                                            Int32(1),
+                                        )
+                                        if (
+                                            old_st & Int32(_SM120_FC1_CNT_MASK)
+                                        ) + Int32(1) == Int32(fc1_n_tiles):
+                                            if valid_f != Int32(0):
+                                                action_d = Int32(_ACT_ACT_ONLY)
+                                                arg0_d = rb_f
+                                                got_work = Int32(1)
+                                            else:
+                                                slot_f = _atomic_add_acq_rel_gpu_i32(
+                                                    ws_base
+                                                    + Int64(_WS_READY_COUNT * 4),
+                                                    Int32(1),
+                                                )
+                                                _st_global_release_gpu_i32(
+                                                    ws_ready_base
+                                                    + Int64(slot_f) * Int64(4),
+                                                    rb_f + Int32(1),
+                                                )
                                 else:
                                     phase = Int32(2)
                         else:
@@ -5751,140 +5839,45 @@ class W4A16MixedTrellisSM120K4Decode(W4A16MixedTrellisKernel):
                                 action_d = Int32(_ACT_EXIT)
                                 got_work = Int32(1)
                             else:
-                                t = _atomic_add_acq_rel_gpu_i32(
+                                t_fc2 = _atomic_add_acq_rel_gpu_i32(
                                     ws_base + Int64(_WS_FC2_CURSOR * 4), Int32(1)
                                 )
-                                if t < total_fc2_tasks:
-                                    slot_t = t // Int32(fc2_n_tiles)
-                                    nt_t = t - slot_t * Int32(fc2_n_tiles)
+                                if t_fc2 < total_fc2_tasks:
+                                    slot_c = t_fc2 // Int32(fc2_n_tiles)
+                                    nt_c = t_fc2 - slot_c * Int32(fc2_n_tiles)
                                     ready_addr = (
-                                        ws_ready_base + Int64(slot_t) * Int64(4)
+                                        ws_ready_base + Int64(slot_c) * Int64(4)
                                     )
                                     rval = _ld_global_acquire_gpu_i32(ready_addr)
                                     while rval == Int32(0):
                                         _nanosleep(Int32(256))
                                         rval = _ld_global_acquire_gpu_i32(ready_addr)
-                                    rb_t = rval - Int32(1)
-                                    ce_t = block_expert_ids[rb_t].to(Int32)
-                                    valid_blk = (
-                                        ce_t >= Int32(0) and ce_t < total_experts
+                                    rb_c = rval - Int32(1)
+                                    ce_c = block_expert_ids[rb_c].to(Int32)
+                                    valid_c = (
+                                        ce_c >= Int32(0) and ce_c < total_experts
                                     ).to(Int32)
-                                    if valid_blk != Int32(0):
-                                        r0_t = packed_route_indices[
-                                            rb_t * Int32(8)
+                                    if valid_c != Int32(0):
+                                        r0_c = packed_route_indices[
+                                            rb_c * Int32(8)
                                         ].to(Int32)
-                                        if r0_t < Int32(0) or r0_t >= live_routes:
-                                            valid_blk = Int32(0)
+                                        if r0_c < Int32(0) or r0_c >= live_routes:
+                                            valid_c = Int32(0)
                                         elif cutlass.const_expr(self.compact_weights):
-                                            lw_t = descriptor_map[
+                                            lw_c = descriptor_map[
                                                 Int64(3) * Int64(total_experts)
-                                                + Int64(ce_t)
+                                                + Int64(ce_c)
                                             ].to(Int32)
-                                            if lw_t <= Int32(0):
-                                                valid_blk = Int32(0)
-                                    if valid_blk != Int32(0):
+                                            if lw_c <= Int32(0):
+                                                valid_c = Int32(0)
+                                    if valid_c != Int32(0):
                                         action_d = Int32(_ACT_FC2)
-                                        arg0_d = rb_t
-                                        arg1_d = nt_t
+                                        arg0_d = rb_c
+                                        arg1_d = nt_c
                                         got_work = Int32(1)
                                 else:
                                     action_d = Int32(_ACT_EXIT)
                                     got_work = Int32(1)
-
-                        if have_rot != Int32(0):
-                            rb_t = t_task // Int32(rot_splits)
-                            chk_t = t_task - rb_t * Int32(rot_splits)
-                            ce_t = block_expert_ids[rb_t].to(Int32)
-                            valid_blk = (
-                                ce_t >= Int32(0) and ce_t < total_experts
-                            ).to(Int32)
-                            if valid_blk != Int32(0):
-                                r0_t = packed_route_indices[
-                                    rb_t * Int32(8)
-                                ].to(Int32)
-                                if r0_t < Int32(0) or r0_t >= live_routes:
-                                    valid_blk = Int32(0)
-                                elif cutlass.const_expr(self.compact_weights):
-                                    lw_t = descriptor_map[
-                                        Int64(3) * Int64(total_experts)
-                                        + Int64(ce_t)
-                                    ].to(Int32)
-                                    if lw_t <= Int32(0):
-                                        valid_blk = Int32(0)
-                            if valid_blk != Int32(0):
-                                action_d = Int32(_ACT_ROT)
-                                arg0_d = rb_t
-                                arg1_d = chk_t
-                                got_work = Int32(1)
-                            else:
-                                _atomic_add_acq_rel_gpu_i32(
-                                    ws_state_base + Int64(rb_t) * Int64(4),
-                                    Int32(_SM120_ROT_DONE_STEP),
-                                )
-                        elif have_fc1 != Int32(0):
-                            rb_t = t_task // Int32(fc1_n_tiles)
-                            nt_t = t_task - rb_t * Int32(fc1_n_tiles)
-                            ce_t = block_expert_ids[rb_t].to(Int32)
-                            valid_blk = (
-                                ce_t >= Int32(0) and ce_t < total_experts
-                            ).to(Int32)
-                            lw_t = Int32(self.intermediate_size)
-                            if valid_blk != Int32(0):
-                                r0_t = packed_route_indices[
-                                    rb_t * Int32(8)
-                                ].to(Int32)
-                                if r0_t < Int32(0) or r0_t >= live_routes:
-                                    valid_blk = Int32(0)
-                                elif cutlass.const_expr(self.compact_weights):
-                                    lw_t = descriptor_map[
-                                        Int64(3) * Int64(total_experts)
-                                        + Int64(ce_t)
-                                    ].to(Int32)
-                                    if lw_t <= Int32(0):
-                                        valid_blk = Int32(0)
-                            active_tile = valid_blk
-                            if cutlass.const_expr(self.compact_weights):
-                                if active_tile != Int32(0):
-                                    loc_nt = nt_t
-                                    if loc_nt >= Int32(fc1_half_tiles):
-                                        loc_nt -= Int32(fc1_half_tiles)
-                                    if loc_nt * Int32(tile_n) >= lw_t:
-                                        active_tile = Int32(0)
-                            if active_tile != Int32(0):
-                                st_val = _ld_global_acquire_gpu_i32(
-                                    ws_state_base + Int64(rb_t) * Int64(4)
-                                )
-                                rot_done = (
-                                    (st_val & Int32(_SM120_ROT_MASK))
-                                    == rot_ready_val
-                                ).to(Int32)
-                                action_d = Int32(_ACT_FC1)
-                                arg0_d = rb_t
-                                arg1_d = nt_t
-                                arg2_d = rot_done
-                                got_work = Int32(1)
-                            else:
-                                old_st = _atomic_add_acq_rel_gpu_i32(
-                                    ws_state_base + Int64(rb_t) * Int64(4),
-                                    Int32(1),
-                                )
-                                if (old_st & Int32(_SM120_FC1_CNT_MASK)) + Int32(
-                                    1
-                                ) == Int32(fc1_n_tiles):
-                                    if valid_blk != Int32(0):
-                                        action_d = Int32(_ACT_ACT_ONLY)
-                                        arg0_d = rb_t
-                                        got_work = Int32(1)
-                                    else:
-                                        slot_t = _atomic_add_acq_rel_gpu_i32(
-                                            ws_base + Int64(_WS_READY_COUNT * 4),
-                                            Int32(1),
-                                        )
-                                        _st_global_release_gpu_i32(
-                                            ws_ready_base
-                                            + Int64(slot_t) * Int64(4),
-                                            rb_t + Int32(1),
-                                        )
                     st_shared_i32(smem_base + Int32(ctrl_off + 0), action_d)
                     st_shared_i32(smem_base + Int32(ctrl_off + 4), arg0_d)
                     st_shared_i32(smem_base + Int32(ctrl_off + 8), arg1_d)

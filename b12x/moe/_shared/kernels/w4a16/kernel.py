@@ -10127,191 +10127,19 @@ class W4A16TopKSumKernel:
                 )
             return
         if cutlass.const_expr(self.sm120_pdl):
-            tid = Int32(tidx)
-            lane = tid & Int32(31)
-            warp = tid >> Int32(5)
-            unit = Int32(bidx)
-            nblk = Int32(self.hidden_size // 128)
-            total_units = active_m * nblk
-            smem_words = ((self.topk * 512 + self.topk * 4 + 15) // 16) * 4
-            smem = cutlass.utils.SmemAllocator()
-
-            @cute.struct
-            class SumStorage:
-                words: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Uint32, smem_words], 16
-                ]
-
-            storage = smem.allocate(SumStorage)
-            smem_base = shared_ptr_to_u32(storage.words.data_ptr())
-
-            if unit < total_units:
-                token = unit // nblk
-                blk = unit - token * nblk
-                col0 = blk * Int32(128) + lane * Int32(4)
-
-                # Pre-resolve expert ids/weights and preload cold svh before
-                # waiting on the preceding FC2 grid via PDL.
-                route0 = warp
-                row0 = token * Int32(self.topk) + route0
-                valid0 = Int32(0)
-                expert0 = Int32(-1)
-                if route0 < Int32(self.topk):
-                    if lane == Int32(0):
-                        raw_e0 = route_expert_ids_flat[row0].to(Int32)
-                        e0 = raw_e0
-                        if cutlass.const_expr(self.use_expert_map):
-                            e0 = Int32(-1)
-                            if raw_e0 >= Int32(0) and raw_e0 < route_num_experts:
-                                e0 = expert_map_flat[raw_e0].to(Int32)
-                        w0 = cutlass.Float32(0.0)
-                        if e0 >= Int32(0) and e0 < weight_num_experts:
-                            valid0 = Int32(1)
-                            expert0 = e0
-                            w0 = topk_weights_flat[row0].to(cutlass.Float32)
-                        st_shared_f32(
-                            smem_base + Int32(self.topk * 512) + route0 * Int32(4), w0
-                        )
-                    valid0 = cute.arch.shuffle_sync(valid0, Int32(0))
-                    expert0 = cute.arch.shuffle_sync(expert0, Int32(0))
-                sp01_0 = Uint32(0)
-                sp23_0 = Uint32(0)
-                if valid0 != Int32(0):
-                    if cutlass.const_expr(self.broadcast_svh):
-                        sbase0 = Int64(col0)
-                    else:
-                        sbase0 = Int64(expert0) * Int64(self.hidden_size) + Int64(col0)
-                    sp01_0, sp23_0 = ld_global_nc_v2_u32(
-                        get_ptr_as_int64(svh_flat, sbase0)
-                    )
-
-                route1 = warp + Int32(8)
-                row1 = token * Int32(self.topk) + route1
-                valid1 = Int32(0)
-                sp01_1 = Uint32(0)
-                sp23_1 = Uint32(0)
-                if cutlass.const_expr(self.topk > 8):
-                    expert1 = Int32(-1)
-                    if route1 < Int32(self.topk):
-                        if lane == Int32(0):
-                            raw_e1 = route_expert_ids_flat[row1].to(Int32)
-                            e1 = raw_e1
-                            if cutlass.const_expr(self.use_expert_map):
-                                e1 = Int32(-1)
-                                if raw_e1 >= Int32(0) and raw_e1 < route_num_experts:
-                                    e1 = expert_map_flat[raw_e1].to(Int32)
-                            w1 = cutlass.Float32(0.0)
-                            if e1 >= Int32(0) and e1 < weight_num_experts:
-                                valid1 = Int32(1)
-                                expert1 = e1
-                                w1 = topk_weights_flat[row1].to(cutlass.Float32)
-                            st_shared_f32(
-                                smem_base + Int32(self.topk * 512) + route1 * Int32(4),
-                                w1,
-                            )
-                        valid1 = cute.arch.shuffle_sync(valid1, Int32(0))
-                        expert1 = cute.arch.shuffle_sync(expert1, Int32(0))
-                    if valid1 != Int32(0):
-                        if cutlass.const_expr(self.broadcast_svh):
-                            sbase1 = Int64(col0)
-                        else:
-                            sbase1 = Int64(expert1) * Int64(self.hidden_size) + Int64(
-                                col0
-                            )
-                        sp01_1, sp23_1 = ld_global_nc_v2_u32(
-                            get_ptr_as_int64(svh_flat, sbase1)
-                        )
-
-                cute.arch.griddepcontrol_wait()
-
-                fc2_policy = create_l2_evict_first_policy()
-                if route0 < Int32(self.topk):
-                    hs0 = cutlass.Float32(0.0)
-                    hs1 = cutlass.Float32(0.0)
-                    hs2 = cutlass.Float32(0.0)
-                    hs3 = cutlass.Float32(0.0)
-                    if valid0 != Int32(0):
-                        base0 = Int64(row0) * Int64(self.hidden_size) + Int64(col0)
-                        p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first(
-                            get_ptr_as_int64(fc2_flat, base0), fc2_policy
-                        )
-                        v0, v1 = f16x2_to_f32x2(p01_0)
-                        v2, v3 = f16x2_to_f32x2(p23_0)
-                        h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
-                        s0, s1 = f16x2_to_f32x2(sp01_0)
-                        s2, s3 = f16x2_to_f32x2(sp23_0)
-                        hs0 = h0 * s0
-                        hs1 = h1 * s1
-                        hs2 = h2 * s2
-                        hs3 = h3 * s3
-                    st_shared_v4_f32(
-                        smem_base + route0 * Int32(512) + lane * Int32(16),
-                        hs0,
-                        hs1,
-                        hs2,
-                        hs3,
-                    )
-
-                if cutlass.const_expr(self.topk > 8):
-                    if route1 < Int32(self.topk):
-                        hs0 = cutlass.Float32(0.0)
-                        hs1 = cutlass.Float32(0.0)
-                        hs2 = cutlass.Float32(0.0)
-                        hs3 = cutlass.Float32(0.0)
-                        if valid1 != Int32(0):
-                            base1 = Int64(row1) * Int64(self.hidden_size) + Int64(col0)
-                            p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first(
-                                get_ptr_as_int64(fc2_flat, base1), fc2_policy
-                            )
-                            v0, v1 = f16x2_to_f32x2(p01_1)
-                            v2, v3 = f16x2_to_f32x2(p23_1)
-                            h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
-                            s0, s1 = f16x2_to_f32x2(sp01_1)
-                            s2, s3 = f16x2_to_f32x2(sp23_1)
-                            hs0 = h0 * s0
-                            hs1 = h1 * s1
-                            hs2 = h2 * s2
-                            hs3 = h3 * s3
-                        st_shared_v4_f32(
-                            smem_base + route1 * Int32(512) + lane * Int32(16),
-                            hs0,
-                            hs1,
-                            hs2,
-                            hs3,
-                        )
-                cute.arch.sync_threads()
-
-                if warp == Int32(0):
-                    acc0 = cutlass.Float32(0.0)
-                    acc1 = cutlass.Float32(0.0)
-                    acc2 = cutlass.Float32(0.0)
-                    acc3 = cutlass.Float32(0.0)
-                    for route in cutlass.range_constexpr(self.topk):
-                        r0, r1, r2, r3 = ld_shared_v4_f32(
-                            smem_base + Int32(route * 512) + lane * Int32(16)
-                        )
-                        weight = ld_shared_f32(
-                            smem_base + Int32(self.topk * 512 + route * 4)
-                        )
-                        acc0 += r0 * weight
-                        acc1 += r1 * weight
-                        acc2 += r2 * weight
-                        acc3 += r3 * weight
-                    if cutlass.const_expr(self.full_rotation_output_bf16):
-                        out_base_i32 = token * Int32(self.hidden_size) + col0
-                        output_flat[out_base_i32 + Int32(0)] = cutlass.BFloat16(acc0)
-                        output_flat[out_base_i32 + Int32(1)] = cutlass.BFloat16(acc1)
-                        output_flat[out_base_i32 + Int32(2)] = cutlass.BFloat16(acc2)
-                        output_flat[out_base_i32 + Int32(3)] = cutlass.BFloat16(acc3)
-                    else:
-                        out_base = Int64(token) * Int64(self.hidden_size) + Int64(col0)
-                        st_global_v4_f32(
-                            get_ptr_as_int64(output_flat, out_base),
-                            acc0,
-                            acc1,
-                            acc2,
-                            acc3,
-                        )
+            self._run_sm120_pdl_full_rotation(
+                fc2_flat,
+                output_flat,
+                topk_weights_flat,
+                route_expert_ids_flat,
+                expert_map_flat,
+                svh_flat,
+                weight_num_experts,
+                route_num_experts,
+                active_m,
+                Int32(tidx),
+                Int32(bidx),
+            )
             return
         if cutlass.const_expr(self.full_rotation):
             tid = Int32(tidx)
@@ -10446,6 +10274,207 @@ class W4A16TopKSumKernel:
                     )
                     acc += _materialize_w4a16_topk_route_f32(route_value)
             output_flat[idx] = self._cast_elem(acc)
+
+    @cute.jit
+    def _run_sm120_pdl_full_rotation(
+        self,
+        fc2_flat: cute.Tensor,
+        output_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        route_expert_ids_flat: cute.Tensor,
+        expert_map_flat: cute.Tensor,
+        svh_flat: cute.Tensor,
+        weight_num_experts: Int32,
+        route_num_experts: Int32,
+        active_m: Int32,
+        tid: Int32,
+        unit: Int32,
+    ):
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        nblk = Int32(self.hidden_size // 128)
+        total_units = active_m * nblk
+        fc2_policy = create_l2_evict_first_policy()
+        smem_words = ((self.topk * 512 + self.topk * 4 + 15) // 16) * 4
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class SumStorage:
+            words: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, smem_words], 16
+            ]
+
+        storage = smem.allocate(SumStorage)
+        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
+
+        if unit < total_units:
+            token = unit // nblk
+            blk = unit - token * nblk
+            col0 = blk * Int32(128) + lane * Int32(4)
+
+            # Pre-resolve expert ids/weights and preload cold svh before
+            # waiting on the preceding FC2 grid via PDL.
+            route0 = warp
+            row0 = token * Int32(self.topk) + route0
+            valid0 = Int32(0)
+            expert0 = Int32(-1)
+            if route0 < Int32(self.topk):
+                if lane == Int32(0):
+                    raw_e0 = route_expert_ids_flat[row0].to(Int32)
+                    e0 = raw_e0
+                    if cutlass.const_expr(self.use_expert_map):
+                        e0 = Int32(-1)
+                        if raw_e0 >= Int32(0) and raw_e0 < route_num_experts:
+                            e0 = expert_map_flat[raw_e0].to(Int32)
+                    w0 = cutlass.Float32(0.0)
+                    if e0 >= Int32(0) and e0 < weight_num_experts:
+                        valid0 = Int32(1)
+                        expert0 = e0
+                        w0 = topk_weights_flat[row0].to(cutlass.Float32)
+                    st_shared_f32(
+                        smem_base + Int32(self.topk * 512) + route0 * Int32(4), w0
+                    )
+                valid0 = cute.arch.shuffle_sync(valid0, Int32(0))
+                expert0 = cute.arch.shuffle_sync(expert0, Int32(0))
+            sp01_0 = Uint32(0)
+            sp23_0 = Uint32(0)
+            if valid0 != Int32(0):
+                if cutlass.const_expr(self.broadcast_svh):
+                    sbase0 = Int64(col0)
+                else:
+                    sbase0 = Int64(expert0) * Int64(self.hidden_size) + Int64(col0)
+                sp01_0, sp23_0 = ld_global_nc_v2_u32(
+                    get_ptr_as_int64(svh_flat, sbase0)
+                )
+
+            route1 = warp + Int32(8)
+            row1 = token * Int32(self.topk) + route1
+            valid1 = Int32(0)
+            sp01_1 = Uint32(0)
+            sp23_1 = Uint32(0)
+            if cutlass.const_expr(self.topk > 8):
+                expert1 = Int32(-1)
+                if route1 < Int32(self.topk):
+                    if lane == Int32(0):
+                        raw_e1 = route_expert_ids_flat[row1].to(Int32)
+                        e1 = raw_e1
+                        if cutlass.const_expr(self.use_expert_map):
+                            e1 = Int32(-1)
+                            if raw_e1 >= Int32(0) and raw_e1 < route_num_experts:
+                                e1 = expert_map_flat[raw_e1].to(Int32)
+                        w1 = cutlass.Float32(0.0)
+                        if e1 >= Int32(0) and e1 < weight_num_experts:
+                            valid1 = Int32(1)
+                            expert1 = e1
+                            w1 = topk_weights_flat[row1].to(cutlass.Float32)
+                        st_shared_f32(
+                            smem_base + Int32(self.topk * 512) + route1 * Int32(4),
+                            w1,
+                        )
+                    valid1 = cute.arch.shuffle_sync(valid1, Int32(0))
+                    expert1 = cute.arch.shuffle_sync(expert1, Int32(0))
+                if valid1 != Int32(0):
+                    if cutlass.const_expr(self.broadcast_svh):
+                        sbase1 = Int64(col0)
+                    else:
+                        sbase1 = Int64(expert1) * Int64(self.hidden_size) + Int64(col0)
+                    sp01_1, sp23_1 = ld_global_nc_v2_u32(
+                        get_ptr_as_int64(svh_flat, sbase1)
+                    )
+
+            cute.arch.griddepcontrol_wait()
+
+            if route0 < Int32(self.topk):
+                hs0_0 = cutlass.Float32(0.0)
+                hs1_0 = cutlass.Float32(0.0)
+                hs2_0 = cutlass.Float32(0.0)
+                hs3_0 = cutlass.Float32(0.0)
+                if valid0 != Int32(0):
+                    base0 = Int64(row0) * Int64(self.hidden_size) + Int64(col0)
+                    p01_0, p23_0 = _ld_global_nc_v2_u32_evict_first(
+                        get_ptr_as_int64(fc2_flat, base0), fc2_policy
+                    )
+                    v0_0, v1_0 = f16x2_to_f32x2(p01_0)
+                    v2_0, v3_0 = f16x2_to_f32x2(p23_0)
+                    h0_0, h1_0, h2_0, h3_0 = self._had128_quad(
+                        v0_0, v1_0, v2_0, v3_0, lane
+                    )
+                    s0_0, s1_0 = f16x2_to_f32x2(sp01_0)
+                    s2_0, s3_0 = f16x2_to_f32x2(sp23_0)
+                    hs0_0 = h0_0 * s0_0
+                    hs1_0 = h1_0 * s1_0
+                    hs2_0 = h2_0 * s2_0
+                    hs3_0 = h3_0 * s3_0
+                st_shared_v4_f32(
+                    smem_base + route0 * Int32(512) + lane * Int32(16),
+                    hs0_0,
+                    hs1_0,
+                    hs2_0,
+                    hs3_0,
+                )
+
+            if cutlass.const_expr(self.topk > 8):
+                if route1 < Int32(self.topk):
+                    hs0_1 = cutlass.Float32(0.0)
+                    hs1_1 = cutlass.Float32(0.0)
+                    hs2_1 = cutlass.Float32(0.0)
+                    hs3_1 = cutlass.Float32(0.0)
+                    if valid1 != Int32(0):
+                        base1 = Int64(row1) * Int64(self.hidden_size) + Int64(col0)
+                        p01_1, p23_1 = _ld_global_nc_v2_u32_evict_first(
+                            get_ptr_as_int64(fc2_flat, base1), fc2_policy
+                        )
+                        v0_1, v1_1 = f16x2_to_f32x2(p01_1)
+                        v2_1, v3_1 = f16x2_to_f32x2(p23_1)
+                        h0_1, h1_1, h2_1, h3_1 = self._had128_quad(
+                            v0_1, v1_1, v2_1, v3_1, lane
+                        )
+                        s0_1, s1_1 = f16x2_to_f32x2(sp01_1)
+                        s2_1, s3_1 = f16x2_to_f32x2(sp23_1)
+                        hs0_1 = h0_1 * s0_1
+                        hs1_1 = h1_1 * s1_1
+                        hs2_1 = h2_1 * s2_1
+                        hs3_1 = h3_1 * s3_1
+                    st_shared_v4_f32(
+                        smem_base + route1 * Int32(512) + lane * Int32(16),
+                        hs0_1,
+                        hs1_1,
+                        hs2_1,
+                        hs3_1,
+                    )
+            cute.arch.sync_threads()
+
+            if warp == Int32(0):
+                acc0 = cutlass.Float32(0.0)
+                acc1 = cutlass.Float32(0.0)
+                acc2 = cutlass.Float32(0.0)
+                acc3 = cutlass.Float32(0.0)
+                for route in cutlass.range_constexpr(self.topk):
+                    r0, r1, r2, r3 = ld_shared_v4_f32(
+                        smem_base + Int32(route * 512) + lane * Int32(16)
+                    )
+                    weight = ld_shared_f32(
+                        smem_base + Int32(self.topk * 512 + route * 4)
+                    )
+                    acc0 += r0 * weight
+                    acc1 += r1 * weight
+                    acc2 += r2 * weight
+                    acc3 += r3 * weight
+                if cutlass.const_expr(self.full_rotation_output_bf16):
+                    out_base_i32 = token * Int32(self.hidden_size) + col0
+                    output_flat[out_base_i32 + Int32(0)] = cutlass.BFloat16(acc0)
+                    output_flat[out_base_i32 + Int32(1)] = cutlass.BFloat16(acc1)
+                    output_flat[out_base_i32 + Int32(2)] = cutlass.BFloat16(acc2)
+                    output_flat[out_base_i32 + Int32(3)] = cutlass.BFloat16(acc3)
+                else:
+                    out_base = Int64(token) * Int64(self.hidden_size) + Int64(col0)
+                    st_global_v4_f32(
+                        get_ptr_as_int64(output_flat, out_base),
+                        acc0,
+                        acc1,
+                        acc2,
+                        acc3,
+                    )
 
     @cute.jit
     def _resolve_route_lane(
