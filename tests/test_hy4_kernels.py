@@ -471,10 +471,17 @@ def test_hy4_indexer_long_context_topk_and_ties():
 
     slots_out = torch.empty(rows, 2048, dtype=torch.int32, device=dev)
     lens_out = torch.empty(rows, dtype=torch.int32, device=dev)
-    compile_hy4_indexer_topk_expand_aot(g).launch(
-        scores, positions, pt, slots_out, lens_out, scalars=(rows, max_groups, pages)
-    )
-    torch.cuda.synchronize()
+    prog = compile_hy4_indexer_topk_expand_aot(g)
+    def launch():
+        prog.launch(scores, positions, pt, slots_out, lens_out, scalars=(rows, max_groups, pages))
+    launch()
+    first_slots, first_lens = slots_out.clone(), lens_out.clone()
+    for _ in range(8):
+        slots_out.fill_(-2)
+        lens_out.fill_(-1)
+        launch()
+        assert torch.equal(slots_out, first_slots)
+        assert torch.equal(lens_out, first_lens)
 
     for r in range(rows):
         pos = int(positions[r])
@@ -493,13 +500,10 @@ def test_hy4_indexer_long_context_topk_and_ties():
             # Exact deterministic reference: sort descending by score, ascending by gid.
             row_scores = scores[r, :cur_group].cpu().tolist()
             ref_groups = sorted(range(cur_group), key=lambda gid: (-row_scores[gid], gid))[:511]
-            expected_tokens = set()
-            for gid in ref_groups:
-                for sub in range(4):
-                    t = gid * 4 + sub
-                    expected_tokens.add(int(perm[t // 64]) * 64 + (t % 64))
-            for sub in range(cur_valid):
-                t = cur_group * 4 + sub
-                expected_tokens.add(int(perm[t // 64]) * 64 + (t % 64))
-            got_tokens = set(slots_out[r, :expected_len].cpu().tolist())
-            assert got_tokens == expected_tokens, f"row {r} mismatch: diff={len(got_tokens ^ expected_tokens)}"
+            cutoff = row_scores[ref_groups[-1]]
+            ordered = sorted(gid for gid in ref_groups if row_scores[gid] > cutoff)
+            ordered += sorted(gid for gid in ref_groups if row_scores[gid] == cutoff)
+            logical_tokens = [4 * gid + sub for gid in ordered for sub in range(4)]
+            logical_tokens += list(range(4 * cur_group, 4 * cur_group + cur_valid))
+            expected_tokens = [int(perm[t // 64]) * 64 + (t % 64) for t in logical_tokens]
+            assert slots_out[r, :expected_len].tolist() == expected_tokens, f"row {r} order mismatch"
