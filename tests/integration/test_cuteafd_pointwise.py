@@ -421,3 +421,22 @@ def test_runtime_norm_epsilon_export_abi(tmp_path):
             input_dtype=torch.bfloat16, eps=None)
     assert program.abi["scalars"] == [("rows", "int32"), ("epsilon", "float32")]
     check_export(program, tmp_path, "norm_runtime_eps")
+
+
+def test_gated_bf16_residual_matches_torch():
+    require_b12x()
+    from b12x.integration.cuteafd.pointwise import compile_gated_residual_bf16_aot
+
+    # One callable covers the trained slot-zero fusion and larger live extents.
+    width = 3072
+    gen = torch.Generator(device="cuda").manual_seed(424)
+    residual = torch.randn(17, width, generator=gen, device="cuda").bfloat16()
+    delta = torch.randn(residual.shape, generator=gen, device="cuda").bfloat16()
+    gate = torch.randn(width, generator=gen, device="cuda").bfloat16()
+    gate[:4] = torch.tensor([0, 1, -1, 0.25], device="cuda")
+    program = compile_gated_residual_bf16_aot(width=width)
+    for rows in (1, 6, 17):
+        out = torch.empty_like(residual[:rows])
+        program.launch(residual[:rows], delta[:rows], gate, out, scalars=[rows])
+        expected = (residual[:rows].float() + delta[:rows].float() * gate.float()).bfloat16()
+        assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
