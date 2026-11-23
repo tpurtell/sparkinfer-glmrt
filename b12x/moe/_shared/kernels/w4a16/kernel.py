@@ -9494,6 +9494,63 @@ def _ld_global_nc_v2_u32_evict_first(
 
 
 @dsl_user_op
+def _ld_global_nc_v2_u32_evict_first_pred_barrier(
+    addr: Int64, pred: Int32, policy: Int64, *, loc=None, ip=None
+) -> tuple[Uint32, Uint32]:
+    """L2 evict-first 64-bit load ordered strictly after ``griddepcontrol_wait``."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32()]),
+        [
+            Int64(addr).ir_value(loc=loc, ip=ip),
+            Int32(pred).ir_value(loc=loc, ip=ip),
+            Int64(policy).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .pred p;
+            setp.ne.s32 p, $3, 0;
+            @p ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {$0, $1}, [$2], $4;
+            @!p mov.b32 $0, 0;
+            @!p mov.b32 $1, 0;
+        }
+        """,
+        "=r,=r,l,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Uint32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)),
+        Uint32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+    )
+
+
+@dsl_user_op
+def _pack_f32x2_to_bf16x2_exact(
+    x0: cutlass.Float32, x1: cutlass.Float32, *, loc=None, ip=None
+) -> Uint32:
+    """Bit-identical ``cvt.rn.bf16x2.f32`` pack (no ``.satfinite``)."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(x0).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(x1).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _had_bfly_quad_fma(
     h0: cutlass.Float32,
     h1: cutlass.Float32,
@@ -9589,6 +9646,7 @@ class W4A16TopKSumKernel:
         reply_format: int = 0,
         row_addresses: bool = False,
         sm120_pdl: bool = False,
+        sm121_pdl_full_rot: bool = False,
     ):
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
@@ -9669,6 +9727,17 @@ class W4A16TopKSumKernel:
         self.route_warps = 8
         self.cta_threads = 128 if self.reply_format != 0 else 256
         self.warps_per_cta = 4 if self.reply_format != 0 else 8
+        self.sm121_pdl_full_rot = bool(
+            sm121_pdl_full_rot
+            and self.full_rotation
+            and not self.coupled_hadamard
+            and self.reply_format == 0
+            and ((self.topk + self.route_warps - 1) // self.route_warps) <= 4
+        )
+        self.pdl_route_warps = (
+            16 if (self.sm121_pdl_full_rot and self.topk == 16) else self.route_warps
+        )
+        self.pdl_cta_threads = self.pdl_route_warps * 32
 
     @cute.jit
     def _cast_elem(self, x: cutlass.Float32):
@@ -9763,6 +9832,23 @@ class W4A16TopKSumKernel:
                 use_pdl=True,
                 stream=stream,
             )
+        elif cutlass.const_expr(self.sm121_pdl_full_rot):
+            self.kernel_pdl_full_rot(
+                fc2_flat,
+                output_flat,
+                topk_weights_flat,
+                route_expert_ids_flat,
+                expert_map_flat,
+                svh_flat,
+                weight_num_experts,
+                route_num_experts,
+                active_m,
+            ).launch(
+                grid=grid,
+                block=[self.pdl_cta_threads, 1, 1],
+                use_pdl=True,
+                stream=stream,
+            )
         else:
             self.kernel(
                 fc2_flat,
@@ -9779,6 +9865,201 @@ class W4A16TopKSumKernel:
                 block=[self.cta_threads, 1, 1],
                 stream=stream,
             )
+
+    @cute.kernel
+    def kernel_pdl_full_rot(
+        self,
+        fc2_flat: cute.Tensor,
+        output_flat: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        route_expert_ids_flat: cute.Tensor,
+        expert_map_flat: cute.Tensor,
+        svh_flat: cute.Tensor,
+        weight_num_experts: cutlass.Int32,
+        route_num_experts: cutlass.Int32,
+        active_m: cutlass.Int32,
+    ):
+        """SM121 PDL uncoupled full-rotation top-k sum kernel.
+
+        Preloads read-only route metadata, weights, and cold ``svh`` scales
+        before ``griddepcontrol_wait()``, streams ``fc2`` with L2 evict-first
+        after the barrier, exchanges route quads via 16-byte aligned vectorized
+        SMEM loads/stores, and writes vectorized 64-bit BF16 / 128-bit FP32
+        outputs in exact stock reduction order.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        tid = Int32(tidx)
+        lane = tid & Int32(31)
+        warp = tid >> Int32(5)
+        unit = Int32(bidx)
+        nblk = Int32(self.hidden_size // 128)
+        total_units = active_m * nblk
+        fc2_policy = create_l2_evict_first_policy()
+
+        smem = cutlass.utils.SmemAllocator()
+
+        @cute.struct
+        class Storage:
+            route_values: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.topk * 128], 16
+            ]
+            route_weights: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, self.topk], 16
+            ]
+
+        storage = smem.allocate(Storage)
+        rv_smem_base = shared_ptr_to_u32(storage.route_values.data_ptr())
+        route_weights = cute.make_tensor(
+            storage.route_weights.data_ptr(), cute.make_layout(self.topk)
+        )
+
+        in_bounds = (unit < total_units).to(Int32)
+        token = Int32(0)
+        col0 = Int32(0)
+        if in_bounds != Int32(0):
+            token = unit // nblk
+            blk = unit - token * nblk
+            col0 = blk * Int32(128) + lane * Int32(4)
+
+        route_groups = (
+            self.topk + self.pdl_route_warps - 1
+        ) // self.pdl_route_warps
+        pre_valid = []
+        pre_row = []
+        pre_sp01 = []
+        pre_sp23 = []
+        for pre_rg in cutlass.range_constexpr(route_groups):
+            route = warp + Int32(pre_rg * self.pdl_route_warps)
+            valid_route = Int32(0)
+            expert = Int32(-1)
+            row = token * Int32(self.topk) + route
+            if in_bounds != Int32(0) and route < Int32(self.topk):
+                raw_expert = route_expert_ids_flat[row].to(Int32)
+                expert = raw_expert
+                if cutlass.const_expr(self.use_expert_map):
+                    expert = Int32(-1)
+                    if raw_expert >= Int32(0) and raw_expert < Int32(
+                        route_num_experts
+                    ):
+                        expert = expert_map_flat[raw_expert].to(Int32)
+                if expert >= Int32(0) and expert < Int32(weight_num_experts):
+                    valid_route = Int32(1)
+            sbase = Int64(0)
+            if valid_route != Int32(0):
+                if cutlass.const_expr(self.broadcast_svh):
+                    sbase = Int64(col0)
+                else:
+                    sbase = Int64(expert) * Int64(self.hidden_size) + Int64(col0)
+            sp01, sp23 = _ld_global_nc_v2_u32_pred(
+                get_ptr_as_int64(svh_flat, sbase),
+                valid_route,
+            )
+            if (
+                in_bounds != Int32(0)
+                and route < Int32(self.topk)
+                and lane == Int32(0)
+            ):
+                weight = cutlass.Float32(0.0)
+                if valid_route != Int32(0):
+                    weight = topk_weights_flat[row].to(cutlass.Float32)
+                route_weights[route] = weight
+            pre_valid.append(valid_route)
+            pre_row.append(row)
+            pre_sp01.append(sp01)
+            pre_sp23.append(sp23)
+
+        cute.arch.griddepcontrol_wait()
+
+        if in_bounds != Int32(0):
+            for post_rg in cutlass.range_constexpr(route_groups):
+                post_route = warp + Int32(post_rg * self.pdl_route_warps)
+                post_valid = pre_valid[post_rg]
+                post_row = pre_row[post_rg]
+                post_sp01 = pre_sp01[post_rg]
+                post_sp23 = pre_sp23[post_rg]
+                fc2_base = Int64(0)
+                if post_valid != Int32(0):
+                    fc2_base = Int64(post_row) * Int64(self.hidden_size) + Int64(col0)
+                p01, p23 = _ld_global_nc_v2_u32_evict_first_pred_barrier(
+                    get_ptr_as_int64(fc2_flat, fc2_base),
+                    post_valid,
+                    fc2_policy,
+                )
+                hs0 = cutlass.Float32(0.0)
+                hs1 = cutlass.Float32(0.0)
+                hs2 = cutlass.Float32(0.0)
+                hs3 = cutlass.Float32(0.0)
+                if post_valid != Int32(0):
+                    v0, v1 = f16x2_to_f32x2(p01)
+                    v2, v3 = f16x2_to_f32x2(p23)
+                    h0, h1, h2, h3 = self._had128_quad(v0, v1, v2, v3, lane)
+                    s0, s1 = f16x2_to_f32x2(post_sp01)
+                    s2, s3 = f16x2_to_f32x2(post_sp23)
+                    hs0 = h0 * s0
+                    hs1 = h1 * s1
+                    hs2 = h2 * s2
+                    hs3 = h3 * s3
+                if post_route < Int32(self.topk):
+                    st_shared_v4_f32(
+                        rv_smem_base
+                        + post_route * Int32(512)
+                        + lane * Int32(16),
+                        hs0,
+                        hs1,
+                        hs2,
+                        hs3,
+                    )
+            cute.arch.sync_threads()
+
+            if warp == Int32(0):
+                acc0 = cutlass.Float32(0.0)
+                acc1 = cutlass.Float32(0.0)
+                acc2 = cutlass.Float32(0.0)
+                acc3 = cutlass.Float32(0.0)
+                lane_byte = lane * Int32(16)
+                for r_sum in cutlass.range_constexpr(self.topk):
+                    rv0, rv1, rv2, rv3 = ld_shared_v4_f32(
+                        rv_smem_base + Int32(r_sum * 512) + lane_byte
+                    )
+                    sum_weight = route_weights[Int32(r_sum)]
+                    acc0 += rv0 * sum_weight
+                    acc1 += rv1 * sum_weight
+                    acc2 += rv2 * sum_weight
+                    acc3 += rv3 * sum_weight
+                out_base = Int64(token) * Int64(self.hidden_size) + Int64(col0)
+                if cutlass.const_expr(self.row_addresses):
+                    output_dtype = (
+                        cutlass.BFloat16
+                        if self.full_rotation_output_bf16
+                        else cutlass.Float32
+                    )
+                    row_ptr = cute.make_ptr(
+                        output_dtype,
+                        output_flat[token],
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    )
+                    destination = cute.make_tensor(
+                        row_ptr, cute.make_layout((self.hidden_size,))
+                    )
+                    out_base = Int64(col0)
+                else:
+                    destination = output_flat
+                if cutlass.const_expr(self.full_rotation_output_bf16):
+                    st_global_v2_u32(
+                        get_ptr_as_int64(destination, out_base),
+                        _pack_f32x2_to_bf16x2_exact(acc0, acc1),
+                        _pack_f32x2_to_bf16x2_exact(acc2, acc3),
+                    )
+                else:
+                    st_global_v4_f32(
+                        get_ptr_as_int64(destination, out_base),
+                        acc0,
+                        acc1,
+                        acc2,
+                        acc3,
+                    )
 
     @cute.kernel
     def kernel(
@@ -12170,6 +12451,14 @@ def compile_w4a16_topk_sum(
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 0)
     )
+    sm121_pdl_full_rot = bool(
+        full_rotation
+        and not coupled_hadamard
+        and reply_format == 0
+        and ((int(topk) + 7) // 8) <= 4
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(torch.cuda.current_device()) == (12, 1)
+    )
     kernel = W4A16TopKSumKernel(
         topk=topk,
         hidden_size=hidden_size,
@@ -12185,6 +12474,7 @@ def compile_w4a16_topk_sum(
         reply_format=reply_format,
         row_addresses=row_addresses,
         sm120_pdl=sm120_pdl,
+        sm121_pdl_full_rot=sm121_pdl_full_rot,
     )
     base_cache_key = (
         "w4a16_topk_sum",
@@ -12210,6 +12500,8 @@ def compile_w4a16_topk_sum(
         cache_key += (("row_addresses",),)
     if sm120_pdl:
         cache_key += (("sm120_pdl_v1",),)
+    if kernel.sm121_pdl_full_rot:
+        cache_key += (("sm121_pdl_full_rot",),)
     cached = _SUM_CACHE.get(cache_key)
     if cached is not None:
         return attach_programs(

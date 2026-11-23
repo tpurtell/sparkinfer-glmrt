@@ -1,5 +1,22 @@
 # Changes
 
+- SM121 EXL3 routed decode (Neon R3 of the routed MUL1 duel): admit Hy4-flash
+  TP1/TP2/TP4/TP6 and Qwen4 TP4 to the persistent SM121 K4 decode while
+  keeping the cooperative parent's recorded shared-memory bytes and
+  blocks/SM, replace the persistent workspace ready list with a state bit
+  (persistent rows 1-11 on Hy4-flash), run 4 CTAs/SM with wave-aware FC2
+  chunks, and add an SM121 PDL `W4A16TopKSumKernel` path. Manifest recipes,
+  ABIs and outputs are unchanged. On GB10 (kakapo) sealed paired replay
+  against a stock self-pair, geomean stock-normalized time over rows 1-8 is
+  0.854 (repeat 0.857) across Hy4-flash TP1/2/4/6 MUL1 and GLM 5.3 TP6
+  compact MCG+MUL1. Floor ratios: Hy4-flash TP4 1.773 -> 1.276, TP6
+  1.913 -> 1.381. The Qwen4 TP4 guard moved about 0.69. Every cell is
+  bit-exact, and no prefill flag reproduced across three matched sessions.
+  The SM120 persistent decode (#420) keeps its own workspace header
+  constants. Expected changed placement groups: SM121 EXL3 Spark
+  routed-expert programs (K4/K5 and K4/K6 decode buckets, all SM121 EXL3
+  top-k sums). See tpurtell/cuteafd#2540.
+
 - SM120 EXL3 routed decode (Neon R2 of the routed MUL1 duel): a persistent
   K4 mixed-Trellis decode (`W4A16MixedTrellisSM120K4Decode`) for SM120
   coordinator buckets up to capacity 80 (K4 tier0 with K5/K6 tier1, bf16
