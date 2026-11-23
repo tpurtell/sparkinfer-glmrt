@@ -45,9 +45,26 @@ class SmOccupancyLimits:
 def query_sm_occupancy_limits(device: int | None = None) -> SmOccupancyLimits | None:
     """Query runtime CUDA device attributes without hardcoded SM/SMEM/reg limits.
 
-    Strictly non-throwing across CPU/offline containers without libcuda.so.1:
-    returns None on any raised Exception or non-CUDA_SUCCESS driver status.
+    When an offline AOT target is described, answers from that target's
+    measured attributes without touching libcuda. Otherwise strictly
+    non-throwing across CPU/offline containers without libcuda.so.1.
     """
+    from b12x._lib.aot_target import active_target
+
+    offline = active_target()
+    if offline is not None:
+        return SmOccupancyLimits(
+            num_sms=offline.multi_processor_count,
+            max_smem_per_mp=offline.shared_memory_per_multiprocessor,
+            max_smem_per_block=offline.shared_memory_per_block,
+            max_smem_per_block_optin=offline.shared_memory_per_block_optin,
+            reserved_smem_per_block=offline.reserved_shared_memory_per_block,
+            max_regs_per_mp=offline.regs_per_multiprocessor,
+            max_regs_per_block=offline.regs_per_block,
+            max_threads_per_mp=offline.max_threads_per_multi_processor,
+            max_blocks_per_mp=offline.max_blocks_per_multiprocessor,
+            warp_size=offline.warp_size,
+        )
     try:
         if device is None:
             if not torch.cuda.is_available():

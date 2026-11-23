@@ -41,7 +41,12 @@ _DEVICE_CAPS_CACHE: dict[int, tuple[int, int]] = {}
 
 
 def _query_device_caps() -> tuple[int, int]:
-    """Query ``(sm_count, l2_bytes)`` of the active CUDA device at runtime (never bake 188 or L2)."""
+    """Query ``(sm_count, l2_bytes)`` of the active CUDA device (or offline target)."""
+    from b12x._lib.aot_target import active_target
+
+    offline = active_target()
+    if offline is not None:
+        return offline.multi_processor_count, offline.L2_cache_size
     err, ctx_dev = cuda.cuCtxGetDevice()
     dev_id = int(ctx_dev) if err == cuda.CUresult.CUDA_SUCCESS else 0
     cached = _DEVICE_CAPS_CACHE.get(dev_id)
