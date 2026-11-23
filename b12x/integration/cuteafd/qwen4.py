@@ -266,15 +266,18 @@ def compile_qwen4_head_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
                            scratch={"scratch": lambda rows: hc_scratch_bytes(g, rows, inject=False)}, doc=__doc__)
 
 
-def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
-    """FP32 logits of up to 64 rows over an E4M3 copy of ``lm_head`` with per-row
-    x 128-K scales (the MTP drafts' head; the target keeps the BF16 head): x bf16
-    [rows,H], w_fp8 [V,H], scale f32 [V,H/128], logits f32 [rows,V]."""
+def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, max_rows: int | None = None) -> AotProgram:
+    """FP32 logits of up to ``max_rows`` rows (default 64) over an E4M3 copy of ``lm_head``
+    with per-row x 128-K scales (the MTP drafts' head; the target keeps the BF16 head):
+    x bf16 [rows,H], w_fp8 [V,H], scale f32 [V,H/128], logits f32 [rows,V]."""
     from ._fp8_weights import FP8_DECODE_ROWS
     from .glmf import _HeadFp8
 
+    cap = FP8_DECODE_ROWS if max_rows is None else int(max_rows)
+    if cap <= 0:
+        raise ValueError("max_rows must be positive")
     h, vocab = g.hidden, g.vocab
-    launch = _HeadFp8(vocab, h, max_rows=FP8_DECODE_ROWS)
+    launch = _HeadFp8(vocab, h, max_rows=cap)
     return compile_program(
         launch, name="qwen4_head_fp8",
         operands=(Operand("x", torch.bfloat16, f"[rows,{h}]"),
@@ -282,7 +285,7 @@ def compile_qwen4_head_fp8_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgr
                   Operand("scale", torch.float32, f"[{vocab},{h // 128}]", align=4),
                   Operand("logits", torch.float32, f"[rows,{vocab}]", "out")),
         scalars=(Scalar("rows"),), key=(vocab, launch.key()),
-        geometry={"hidden": h, "vocab": vocab, "max_rows": FP8_DECODE_ROWS},
+        geometry={"hidden": h, "vocab": vocab, "max_rows": cap},
         doc=compile_qwen4_head_fp8_aot.__doc__,
     )
 
@@ -553,19 +556,22 @@ def compile_qwen4_ple_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, fp8: bool) ->
     )
 
 
-def compile_qwen4_ple_commit_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT) -> AotProgram:
+def compile_qwen4_ple_commit_aot(g: Qwen4Geometry = QWEN38_FLASH_NEXT, *, replay_rows: int = 64) -> AotProgram:
     """After a speculative step (``qwen4_ple_*`` with ``spec`` = 1): shift each
     sequence's accepted ``norm_conv(gv)`` rows from ``replay`` into its PLE conv
     state. ``tables`` i32 ``[3, sequences]``: state slot (negative: skip), first
     step row and accepted rows."""
+    r = int(replay_rows)
+    if r <= 0:
+        raise ValueError("replay_rows must be positive")
     c = g.hc_width
-    launch = Qwen4PleCommit(c, g.ple_state_rows)
+    launch = Qwen4PleCommit(c, g.ple_state_rows, replay_rows=r)
     return compile_program(
         launch, name="qwen4_ple_commit",
         operands=(Operand("conv_state", torch.bfloat16, f"[slots,{g.ple_state_rows},{c}]", "inout", align=2),
-                  Operand("replay", torch.bfloat16, f"[64,{c}]"),
+                  Operand("replay", torch.bfloat16, f"[{r},{c}]"),
                   Operand("tables", torch.int32, "[3,sequences]", align=4)),
-        scalars=(Scalar("sequences"),), key=(c, g.ple_state_rows),
-        geometry={"channels": c, "state_rows": g.ple_state_rows, "replay_rows": 64},
+        scalars=(Scalar("sequences"),), key=(c, g.ple_state_rows) if r == 64 else (c, g.ple_state_rows, r),
+        geometry={"channels": c, "state_rows": g.ple_state_rows, "replay_rows": r},
         doc=compile_qwen4_ple_commit_aot.__doc__,
     )

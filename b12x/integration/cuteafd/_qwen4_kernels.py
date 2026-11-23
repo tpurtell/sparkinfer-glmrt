@@ -660,14 +660,14 @@ class Qwen4PleConvState:
 
 class Qwen4PleCommit:
     """Shifts each sequence's accepted ``gvn`` rows of a speculative step
-    (``replay`` BF16 ``[64, C]``) into its PLE conv state ``[slots, state_rows, C]``;
+    (``replay`` BF16 ``[replay_rows, C]``) into its PLE conv state ``[slots, state_rows, C]``;
     ``tables`` i32 ``[3, sequences]`` as ``Qwen4GdnCommit``. Grid ``(sequences, C / 256)``."""
 
     threads = 256
-    replay_rows = 64
 
-    def __init__(self, channels: int, state_rows: int):
+    def __init__(self, channels: int, state_rows: int, replay_rows: int = 64):
         self.channels, self.state_rows = int(channels), int(state_rows)
+        self.replay_rows = int(replay_rows)
 
     @cute.jit
     def __call__(self, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,

@@ -20,9 +20,10 @@ from .inkling2_convolution import _mul_rn
 class _ConvolutionReplay:
     threads = 256
 
-    def __init__(self, width, taps, heads, dynamic):
+    def __init__(self, width, taps, heads, dynamic, max_rows=64):
         self.width, self.taps, self.heads = int(width), int(taps), int(heads)
         self.dynamic = bool(dynamic)
+        self.max_rows = int(max_rows)
         self.factor = (self.taps * (2 if self.dynamic else 1) + 1) ** -0.5
 
     @cute.jit
@@ -30,7 +31,7 @@ class _ConvolutionReplay:
                  history: cute.Pointer, first: cute.Pointer, slots: cute.Pointer,
                  out: cute.Pointer, replay: cute.Pointer, rows: Int32, history_slot_stride_elements: Int64, history_lag_stride_elements: Int64,
                  replay_row_stride_elements: Int64, stream: cuda.CUstream):
-        if (rows > 0 and rows <= 64 and history_lag_stride_elements >= self.width
+        if (rows > 0 and rows <= self.max_rows and history_lag_stride_elements >= self.width
                 and history_slot_stride_elements >= (self.taps - 1) * history_lag_stride_elements
                 and replay_row_stride_elements >= self.width):
             self.convolve(x, weight, dynamic, history, first, slots, out, rows,
@@ -102,7 +103,8 @@ class _ConvolutionReplay:
 
 
 def compile_inkling2_convolution_replay_aot(*, width: int, taps: int = 4,
-                                          heads: int = 1, dynamic: bool = False):
+                                          heads: int = 1, dynamic: bool = False,
+                                          max_rows: int = 64):
     """F32 producer; capture source rows in the same convolve launch.
 
     ABI: x, weight, dynamic, history, first, slots, out, replay, rows:i32,
@@ -111,10 +113,12 @@ def compile_inkling2_convolution_replay_aot(*, width: int, taps: int = 4,
     """
     if (type(width) is not int or width <= 0 or width > 11264
             or type(taps) is not int or taps != 4
-            or type(heads) is not int or heads <= 0 or width % heads):
+            or type(heads) is not int or heads <= 0 or width % heads
+            or type(max_rows) is not int or max_rows <= 0 or max_rows > 256):
         raise ValueError("invalid FIR replay convolution geometry")
     kind = "dynamic" if dynamic else "static"
-    return compile_program(_ConvolutionReplay(width, taps, heads, dynamic),
+    key = (width, taps, heads, kind) if max_rows == 64 else (width, taps, heads, kind, max_rows)
+    return compile_program(_ConvolutionReplay(width, taps, heads, dynamic, max_rows=max_rows),
         name=f"inkling2_{kind}_convolution_replay", operands=(
             Operand("x", torch.float32, f"[rows,{width}]"),
             Operand("weight", torch.bfloat16, f"[{taps},{width}]" if dynamic else f"[{width},{taps}]"),
@@ -123,11 +127,11 @@ def compile_inkling2_convolution_replay_aot(*, width: int, taps: int = 4,
             Operand("first", torch.int32, "[rows]", align=4),
             Operand("slots", torch.int64, "[rows]", align=8),
             Operand("out", torch.float32, f"[rows,{width}]", "out"),
-            Operand("replay", torch.float32, f"[64,{width}]", "out"),
+            Operand("replay", torch.float32, f"[{max_rows},{width}]", "out"),
         ), scalars=(Scalar("rows"), Scalar("history_slot_stride_elements", "int64"),
                     Scalar("history_lag_stride_elements", "int64"),
                     Scalar("replay_row_stride_elements", "int64")),
-        key=(width, taps, heads, kind),
+        key=key,
         geometry={"width": width, "taps": taps, "heads": heads,
-                  "dynamic": bool(dynamic), "max_rows": 64, "history": "newest_first"},
+                  "dynamic": bool(dynamic), "max_rows": max_rows, "history": "newest_first"},
         doc=__doc__)
