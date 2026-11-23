@@ -577,7 +577,7 @@ def _k4_persistent_smem_layout(
 class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     """SM121 (GB10) non-cooperative K4 mixed-Trellis decode/verify kernel."""
 
-    K4_DECODE_VERSION = 7
+    K4_DECODE_VERSION = 8
 
     def __init__(
         self,
@@ -1047,16 +1047,6 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 medm_fc1_n_tiles = (
                     2 * self.intermediate_size
                 ) // self.medm_fc1_tile_n
-                medm_fc1_half_tiles = self.intermediate_size // self.medm_fc1_tile_n
-                medm_fc1_chunk = (
-                    2
-                    if (
-                        not self.compact_weights
-                        and self.medm_fc1_tile_n == 128
-                        and medm_fc1_half_tiles % 2 == 0
-                    )
-                    else 1
-                )
                 medm_fc1_threads = 128 if self.medm_fc1_tile_n == 128 else 64
 
                 self.rot_kernel_packed(
@@ -1099,7 +1089,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     active_m,
                     do_fused_act,
                 ).launch(
-                    grid=(medm_fc1_n_tiles // medm_fc1_chunk, max_live_blocks, 1),
+                    grid=(medm_fc1_n_tiles, max_live_blocks, 1),
                     block=[medm_fc1_threads, 1, 1],
                     use_pdl=True,
                     stream=stream,
@@ -1132,11 +1122,7 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     and self.intermediate_size <= 384
                     and fc2_n_tiles % 3 == 0
                 )
-                else (
-                    2
-                    if (self.fc2_tile_n == 128 and fc2_n_tiles % 2 == 0)
-                    else 1
-                )
+                else 1
             )
             self.fc2_kernel(
                 activated,
@@ -1760,10 +1746,15 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 a_stage_stride = Int32(a_slab_bytes)
                 a_sub_stride = Int32(128)
 
-        # Hoist K4 B addressing out of the K-loop (64-bit safe).
+        # Hoist K4 and K5 (N=128) B addressing out of the K-loop (64-bit safe).
         b_base_addr = Int64(0)
         b_iter_step_bytes = Int64(0)
-        b_slab_step_bytes = Int64(0)
+        b_slab_step_bytes = Int64(8) * b_k16_stride_u32 * Int64(4)
+        b5_off0 = Int32(0)
+        b5_off1 = Int32(0)
+        b5_off2 = Int32(0)
+        b5_off3 = Int32(0)
+        b5_off4 = Int32(0)
         if cutlass.const_expr(bits == 4):
             cta_n_blocks = tile_n // 16
             chunks_per_k16 = cta_n_blocks * 8
@@ -1783,7 +1774,37 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 + Int64(in_k16_0 * 4)
             ) * Int64(4)
             b_iter_step_bytes = Int64(k16_step) * b_k16_stride_u32 * Int64(4)
-            b_slab_step_bytes = Int64(8) * b_k16_stride_u32 * Int64(4)
+        elif cutlass.const_expr(bits == 5 and tile_n == 128 and cta_threads == 128):
+            b_base_addr = b_tensor_base + b_tile_base_u32 * Int64(4)
+            k16_0 = tid // Int32(80)
+            in_k16_0 = tid - k16_0 * Int32(80)
+            b5_off0 = (
+                (Int64(k16_0) * b_k16_stride_u32 + Int64(in_k16_0 * 4)) * Int64(4)
+            ).to(Int32)
+            ch1 = tid + Int32(128)
+            k16_1 = ch1 // Int32(80)
+            in_k16_1 = ch1 - k16_1 * Int32(80)
+            b5_off1 = (
+                (Int64(k16_1) * b_k16_stride_u32 + Int64(in_k16_1 * 4)) * Int64(4)
+            ).to(Int32)
+            ch2 = tid + Int32(256)
+            k16_2 = ch2 // Int32(80)
+            in_k16_2 = ch2 - k16_2 * Int32(80)
+            b5_off2 = (
+                (Int64(k16_2) * b_k16_stride_u32 + Int64(in_k16_2 * 4)) * Int64(4)
+            ).to(Int32)
+            ch3 = tid + Int32(384)
+            k16_3 = ch3 // Int32(80)
+            in_k16_3 = ch3 - k16_3 * Int32(80)
+            b5_off3 = (
+                (Int64(k16_3) * b_k16_stride_u32 + Int64(in_k16_3 * 4)) * Int64(4)
+            ).to(Int32)
+            ch4 = tid + Int32(512)
+            k16_4 = ch4 // Int32(80)
+            in_k16_4 = ch4 - k16_4 * Int32(80)
+            b5_off4 = (
+                (Int64(k16_4) * b_k16_stride_u32 + Int64(in_k16_4 * 4)) * Int64(4)
+            ).to(Int32)
 
         # Hoist pre-rotated A addressing out of the K-loop.
         a_row_base0 = Int64(0)
@@ -1825,23 +1846,38 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             # Prefetch cold B0 under PDL before waiting on producer kernel.
             # Keep B1 in its own post-wait commit group with A1 so waves 2..N
             # do not stall waiting for both B0 and B1 before consuming slab 0.
-            self._fetch_b_slab(
-                bits,
-                tile_n,
-                cta_threads,
-                b_tensor_base,
-                smem_base,
-                b_tile_base_u32,
-                b_k16_stride_u32,
-                b_base_addr,
-                b_iter_step_bytes,
-                b_slab_step_bytes,
-                Int32(0),
-                tid,
-                lane,
-                use_evict_first,
-                b_l2_policy,
-            )
+            if cutlass.const_expr(bits == 5 and tile_n == 128 and cta_threads == 128):
+                self._fetch_b_slab_k5_n128(
+                    smem_base,
+                    b_base_addr,
+                    b5_off0,
+                    b5_off1,
+                    b5_off2,
+                    b5_off3,
+                    b5_off4,
+                    tid,
+                    lane,
+                    use_evict_first,
+                    b_l2_policy,
+                )
+            else:
+                self._fetch_b_slab(
+                    bits,
+                    tile_n,
+                    cta_threads,
+                    b_tensor_base,
+                    smem_base,
+                    b_tile_base_u32,
+                    b_k16_stride_u32,
+                    b_base_addr,
+                    b_iter_step_bytes,
+                    b_slab_step_bytes,
+                    Int32(0),
+                    tid,
+                    lane,
+                    use_evict_first,
+                    b_l2_policy,
+                )
             cute.arch.cp_async_commit_group()
 
             cute.arch.griddepcontrol_wait()
@@ -1861,23 +1897,40 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             )
             cute.arch.cp_async_commit_group()
             if k_slabs > Int32(1):
-                self._fetch_b_slab(
-                    bits,
-                    tile_n,
-                    cta_threads,
-                    b_tensor_base,
-                    smem_base + Int32(b_stage_bytes),
-                    b_tile_base_u32,
-                    b_k16_stride_u32,
-                    b_base_addr,
-                    b_iter_step_bytes,
-                    b_slab_step_bytes,
-                    Int32(1),
-                    tid,
-                    lane,
-                    use_evict_first,
-                    b_l2_policy,
-                )
+                if cutlass.const_expr(
+                    bits == 5 and tile_n == 128 and cta_threads == 128
+                ):
+                    self._fetch_b_slab_k5_n128(
+                        smem_base + Int32(b_stage_bytes),
+                        b_base_addr + b_slab_step_bytes,
+                        b5_off0,
+                        b5_off1,
+                        b5_off2,
+                        b5_off3,
+                        b5_off4,
+                        tid,
+                        lane,
+                        use_evict_first,
+                        b_l2_policy,
+                    )
+                else:
+                    self._fetch_b_slab(
+                        bits,
+                        tile_n,
+                        cta_threads,
+                        b_tensor_base,
+                        smem_base + Int32(b_stage_bytes),
+                        b_tile_base_u32,
+                        b_k16_stride_u32,
+                        b_base_addr,
+                        b_iter_step_bytes,
+                        b_slab_step_bytes,
+                        Int32(1),
+                        tid,
+                        lane,
+                        use_evict_first,
+                        b_l2_policy,
+                    )
                 self._fetch_a_prerot_slab(
                     cta_threads,
                     a_base + Int32(a_slab_bytes),
@@ -2011,23 +2064,40 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 next2 = s + Int32(2)
                 if next2 < k_slabs:
                     cute.arch.sync_threads()
-                    self._fetch_b_slab(
-                        bits,
-                        tile_n,
-                        cta_threads,
-                        b_tensor_base,
-                        smem_base + stage * Int32(b_stage_bytes),
-                        b_tile_base_u32,
-                        b_k16_stride_u32,
-                        b_base_addr,
-                        b_iter_step_bytes,
-                        b_slab_step_bytes,
-                        next2,
-                        tid,
-                        lane,
-                        use_evict_first,
-                        b_l2_policy,
-                    )
+                    if cutlass.const_expr(
+                        bits == 5 and tile_n == 128 and cta_threads == 128
+                    ):
+                        self._fetch_b_slab_k5_n128(
+                            smem_base + stage * Int32(b_stage_bytes),
+                            b_base_addr + Int64(next2) * b_slab_step_bytes,
+                            b5_off0,
+                            b5_off1,
+                            b5_off2,
+                            b5_off3,
+                            b5_off4,
+                            tid,
+                            lane,
+                            use_evict_first,
+                            b_l2_policy,
+                        )
+                    else:
+                        self._fetch_b_slab(
+                            bits,
+                            tile_n,
+                            cta_threads,
+                            b_tensor_base,
+                            smem_base + stage * Int32(b_stage_bytes),
+                            b_tile_base_u32,
+                            b_k16_stride_u32,
+                            b_base_addr,
+                            b_iter_step_bytes,
+                            b_slab_step_bytes,
+                            next2,
+                            tid,
+                            lane,
+                            use_evict_first,
+                            b_l2_policy,
+                        )
                     if cutlass.const_expr(not fused_rot):
                         self._fetch_a_prerot_slab(
                             cta_threads,
@@ -2134,23 +2204,40 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     wr_stage -= Int32(3)
                 next2 = s + Int32(2)
                 if next2 < k_slabs:
-                    self._fetch_b_slab(
-                        bits,
-                        tile_n,
-                        cta_threads,
-                        b_tensor_base,
-                        smem_base + wr_stage * Int32(b_stage_bytes),
-                        b_tile_base_u32,
-                        b_k16_stride_u32,
-                        b_base_addr,
-                        b_iter_step_bytes,
-                        b_slab_step_bytes,
-                        next2,
-                        tid,
-                        lane,
-                        use_evict_first,
-                        b_l2_policy,
-                    )
+                    if cutlass.const_expr(
+                        bits == 5 and tile_n == 128 and cta_threads == 128
+                    ):
+                        self._fetch_b_slab_k5_n128(
+                            smem_base + wr_stage * Int32(b_stage_bytes),
+                            b_base_addr + Int64(next2) * b_slab_step_bytes,
+                            b5_off0,
+                            b5_off1,
+                            b5_off2,
+                            b5_off3,
+                            b5_off4,
+                            tid,
+                            lane,
+                            use_evict_first,
+                            b_l2_policy,
+                        )
+                    else:
+                        self._fetch_b_slab(
+                            bits,
+                            tile_n,
+                            cta_threads,
+                            b_tensor_base,
+                            smem_base + wr_stage * Int32(b_stage_bytes),
+                            b_tile_base_u32,
+                            b_k16_stride_u32,
+                            b_base_addr,
+                            b_iter_step_bytes,
+                            b_slab_step_bytes,
+                            next2,
+                            tid,
+                            lane,
+                            use_evict_first,
+                            b_l2_policy,
+                        )
                     if cutlass.const_expr(not fused_rot):
                         self._fetch_a_prerot_slab(
                             cta_threads,
@@ -3095,7 +3182,9 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
             c1_p = Int32(1)
             s1_p = Int32(0)
 
-        # PDL prologue: prefetch initial cold B slabs before griddepcontrol_wait.
+        # PDL prologue: prefetch cold B0 before griddepcontrol_wait, keeping B1
+        # in the post-wait commit group with A1 so waves 2..N do not stall on B1
+        # before consuming slab 0.
         if cutlass.const_expr(bits == 5):
             self._fetch_b_slab_k5_n128(
                 smem_base,
@@ -3128,6 +3217,24 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 use_evict_first,
                 b_l2_policy,
             )
+        cute.arch.cp_async_commit_group()
+
+        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(pdl_signal_after_wait):
+            cute.arch.griddepcontrol_launch_dependents()
+
+        self._fetch_a_prerot_slab(
+            cta_threads,
+            a_base,
+            a_row_base0,
+            a_swz_off0,
+            a_valid0,
+            Int64(0),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+        )
+        cute.arch.cp_async_commit_group()
         if total_steps > Int32(1):
             if cutlass.const_expr(bits == 5):
                 self._fetch_b_slab_k5_n128(
@@ -3163,25 +3270,6 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     use_evict_first,
                     b_l2_policy,
                 )
-        cute.arch.cp_async_commit_group()
-
-        cute.arch.griddepcontrol_wait()
-        if cutlass.const_expr(pdl_signal_after_wait):
-            cute.arch.griddepcontrol_launch_dependents()
-
-        self._fetch_a_prerot_slab(
-            cta_threads,
-            a_base,
-            a_row_base0,
-            a_swz_off0,
-            a_valid0,
-            Int64(0),
-            Int32(0),
-            Int32(0),
-            Int32(0),
-        )
-        cute.arch.cp_async_commit_group()
-        if total_steps > Int32(1):
             if pin_a == Int32(0) or c1_p == Int32(0):
                 self._fetch_a_prerot_slab(
                     cta_threads,
@@ -4510,19 +4598,87 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             sub_t = Int32(0)
                             if in_win < win_rot_tasks:
                                 phase_t = Int32(0)
-                                local_rb = in_win // rot_splits
-                                sub_t = in_win - local_rb * rot_splits
+                                local_rb = Int32(0)
+                                if cutlass.const_expr(rot_nblk == 12):
+                                    if rot_splits == Int32(1):
+                                        local_rb = in_win
+                                        sub_t = Int32(0)
+                                    else:
+                                        local_rb = in_win // Int32(3)
+                                        sub_t = in_win - local_rb * Int32(3)
+                                elif cutlass.const_expr(rot_nblk == 20):
+                                    if rot_splits == Int32(1):
+                                        local_rb = in_win
+                                        sub_t = Int32(0)
+                                    else:
+                                        local_rb = in_win // Int32(5)
+                                        sub_t = in_win - local_rb * Int32(5)
+                                elif cutlass.const_expr(rot_nblk == 48):
+                                    if rot_splits == Int32(4):
+                                        local_rb = in_win >> Int32(2)
+                                        sub_t = in_win & Int32(3)
+                                    elif rot_splits == Int32(6):
+                                        local_rb = in_win // Int32(6)
+                                        sub_t = in_win - local_rb * Int32(6)
+                                    else:
+                                        local_rb = in_win // Int32(12)
+                                        sub_t = in_win - local_rb * Int32(12)
+                                else:
+                                    local_rb = in_win // rot_splits
+                                    sub_t = in_win - local_rb * rot_splits
                                 rb_t = win_rb_base + local_rb
                             elif in_win < win_rot_tasks + win_fc1_tasks:
                                 phase_t = Int32(1)
                                 f1 = in_win - win_rot_tasks
-                                local_rb = f1 // fc1_tasks_per_block
-                                sub_t = (f1 - local_rb * fc1_tasks_per_block) * fc1_chunk
+                                local_rb = Int32(0)
+                                if cutlass.const_expr(
+                                    fc1_half_tiles % 2 == 0
+                                    and self.intermediate_size >= 384
+                                ):
+                                    if fc1_chunk == Int32(1):
+                                        local_rb = f1 // Int32(fc1_n_tiles)
+                                        sub_t = f1 - local_rb * Int32(fc1_n_tiles)
+                                    else:
+                                        local_rb = f1 // Int32(fc1_n_tiles // 2)
+                                        sub_t = (
+                                            f1 - local_rb * Int32(fc1_n_tiles // 2)
+                                        ) << Int32(1)
+                                else:
+                                    local_rb = f1 // Int32(fc1_n_tiles)
+                                    sub_t = f1 - local_rb * Int32(fc1_n_tiles)
                                 rb_t = win_rb_base + local_rb
                             else:
                                 f2 = in_win - win_rot_tasks - win_fc1_tasks
-                                local_rb = f2 // fc2_tasks_per_block
-                                sub_t = (f2 - local_rb * fc2_tasks_per_block) * fc2_chunk
+                                local_rb = Int32(0)
+                                if cutlass.const_expr(
+                                    fc2_n_tiles % 4 == 0
+                                    and self.intermediate_size <= 384
+                                ):
+                                    if fc2_chunk == Int32(4):
+                                        local_rb = f2 // Int32(fc2_n_tiles // 4)
+                                        sub_t = (
+                                            f2 - local_rb * Int32(fc2_n_tiles // 4)
+                                        ) << Int32(2)
+                                    elif fc2_chunk == Int32(2):
+                                        local_rb = f2 // Int32(fc2_n_tiles // 2)
+                                        sub_t = (
+                                            f2 - local_rb * Int32(fc2_n_tiles // 2)
+                                        ) << Int32(1)
+                                    else:
+                                        local_rb = f2 // Int32(fc2_n_tiles)
+                                        sub_t = f2 - local_rb * Int32(fc2_n_tiles)
+                                elif cutlass.const_expr(fc2_n_tiles % 2 == 0):
+                                    if fc2_chunk == Int32(2):
+                                        local_rb = f2 // Int32(fc2_n_tiles // 2)
+                                        sub_t = (
+                                            f2 - local_rb * Int32(fc2_n_tiles // 2)
+                                        ) << Int32(1)
+                                    else:
+                                        local_rb = f2 // Int32(fc2_n_tiles)
+                                        sub_t = f2 - local_rb * Int32(fc2_n_tiles)
+                                else:
+                                    local_rb = f2 // Int32(fc2_n_tiles)
+                                    sub_t = f2 - local_rb * Int32(fc2_n_tiles)
                                 rb_t = win_rb_base + local_rb
 
                             epoch_t = Int32(0)
@@ -5429,17 +5585,69 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             sub_t = Int32(0)
                             if t < total_rot_tasks:
                                 phase_t = Int32(0)
-                                rb_t = t // rot_splits
-                                sub_t = t - rb_t * rot_splits
+                                if cutlass.const_expr(rot_nblk == 12):
+                                    if rot_splits == Int32(1):
+                                        rb_t = t
+                                        sub_t = Int32(0)
+                                    else:
+                                        rb_t = t // Int32(3)
+                                        sub_t = t - rb_t * Int32(3)
+                                elif cutlass.const_expr(rot_nblk == 20):
+                                    if rot_splits == Int32(1):
+                                        rb_t = t
+                                        sub_t = Int32(0)
+                                    else:
+                                        rb_t = t // Int32(5)
+                                        sub_t = t - rb_t * Int32(5)
+                                elif cutlass.const_expr(rot_nblk == 48):
+                                    if rot_splits == Int32(4):
+                                        rb_t = t >> Int32(2)
+                                        sub_t = t & Int32(3)
+                                    elif rot_splits == Int32(6):
+                                        rb_t = t // Int32(6)
+                                        sub_t = t - rb_t * Int32(6)
+                                    else:
+                                        rb_t = t // Int32(12)
+                                        sub_t = t - rb_t * Int32(12)
+                                else:
+                                    rb_t = t // rot_splits
+                                    sub_t = t - rb_t * rot_splits
                             elif t < total_rot_tasks + total_fc1_tasks:
                                 phase_t = Int32(1)
                                 f1 = t - total_rot_tasks
-                                rb_t = f1 // fc1_tasks_per_block
-                                sub_t = f1 - rb_t * fc1_tasks_per_block
+                                rb_t = f1 // Int32(fc1_n_tiles)
+                                sub_t = f1 - rb_t * Int32(fc1_n_tiles)
                             else:
                                 f2 = t - total_rot_tasks - total_fc1_tasks
-                                rb_t = f2 // fc2_tasks_per_block
-                                sub_t = (f2 - rb_t * fc2_tasks_per_block) * fc2_chunk
+                                if cutlass.const_expr(
+                                    fc2_n_tiles % 4 == 0
+                                    and self.intermediate_size <= 384
+                                ):
+                                    if fc2_chunk == Int32(4):
+                                        rb_t = f2 // Int32(fc2_n_tiles // 4)
+                                        sub_t = (
+                                            f2 - rb_t * Int32(fc2_n_tiles // 4)
+                                        ) << Int32(2)
+                                    elif fc2_chunk == Int32(2):
+                                        rb_t = f2 // Int32(fc2_n_tiles // 2)
+                                        sub_t = (
+                                            f2 - rb_t * Int32(fc2_n_tiles // 2)
+                                        ) << Int32(1)
+                                    else:
+                                        rb_t = f2 // Int32(fc2_n_tiles)
+                                        sub_t = f2 - rb_t * Int32(fc2_n_tiles)
+                                elif cutlass.const_expr(fc2_n_tiles % 2 == 0):
+                                    if fc2_chunk == Int32(2):
+                                        rb_t = f2 // Int32(fc2_n_tiles // 2)
+                                        sub_t = (
+                                            f2 - rb_t * Int32(fc2_n_tiles // 2)
+                                        ) << Int32(1)
+                                    else:
+                                        rb_t = f2 // Int32(fc2_n_tiles)
+                                        sub_t = f2 - rb_t * Int32(fc2_n_tiles)
+                                else:
+                                    rb_t = f2 // Int32(fc2_n_tiles)
+                                    sub_t = f2 - rb_t * Int32(fc2_n_tiles)
 
                             ce_t = block_expert_ids[rb_t].to(Int32)
                             valid_blk = (
@@ -7064,80 +7272,39 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         active_m: cutlass.Int32,
         do_fused_act: cutlass.Int32,
     ):
-        medm_fc1_half_tiles = self.intermediate_size // self.medm_fc1_tile_n
-        medm_fc1_chunk = (
-            2
-            if (
-                not self.compact_weights
-                and self.medm_fc1_tile_n == 128
-                and medm_fc1_half_tiles % 2 == 0
-            )
-            else 1
+        self._gemm_tile_body(
+            True,
+            self.medm_fc1_tile_n,
+            self.medm_fc1_stages,
+            False,
+            True,
+            False,
+            True,
+            rotation_gate,
+            rotation_up,
+            rotation_gate,
+            rotation_up,
+            t0_w13,
+            t0_w13_global,
+            t1_w13,
+            t1_w13_global,
+            fc1,
+            activated,
+            intermediate_rotations,
+            workspace,
+            packed_route_indices,
+            block_expert_ids,
+            packed_route_count,
+            descriptor_map,
+            tier0_num_experts,
+            tier1_num_experts,
+            tier0_gate_experts,
+            tier1_gate_experts,
+            tier0_up_experts,
+            tier1_up_experts,
+            active_m,
+            do_fused_act,
         )
-        if cutlass.const_expr(self.medm_fc1_tile_n == 128):
-            self._gemm_tile_body_chunked_n128(
-                True,
-                self.medm_fc1_stages,
-                self.medm_fc1_stages,
-                medm_fc1_chunk,
-                True,
-                rotation_gate,
-                rotation_up,
-                t0_w13,
-                t0_w13_global,
-                t1_w13,
-                t1_w13_global,
-                fc1,
-                activated,
-                intermediate_rotations,
-                workspace,
-                packed_route_indices,
-                block_expert_ids,
-                packed_route_count,
-                descriptor_map,
-                tier0_num_experts,
-                tier1_num_experts,
-                tier0_gate_experts,
-                tier1_gate_experts,
-                tier0_up_experts,
-                tier1_up_experts,
-                active_m,
-                do_fused_act,
-            )
-        else:
-            self._gemm_tile_body(
-                True,
-                self.medm_fc1_tile_n,
-                self.medm_fc1_stages,
-                False,
-                True,
-                False,
-                True,
-                rotation_gate,
-                rotation_up,
-                rotation_gate,
-                rotation_up,
-                t0_w13,
-                t0_w13_global,
-                t1_w13,
-                t1_w13_global,
-                fc1,
-                activated,
-                intermediate_rotations,
-                workspace,
-                packed_route_indices,
-                block_expert_ids,
-                packed_route_count,
-                descriptor_map,
-                tier0_num_experts,
-                tier1_num_experts,
-                tier0_gate_experts,
-                tier1_gate_experts,
-                tier0_up_experts,
-                tier1_up_experts,
-                active_m,
-                do_fused_act,
-            )
 
     @cute.kernel
     def fc2_kernel(
@@ -7159,23 +7326,17 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         active_m: cutlass.Int32,
     ):
         fc2_n_tiles = self.hidden_size // self.fc2_tile_n
-        fc2_chunk = (
-            3
-            if (
-                self.fc2_tile_n == 128
-                and self.intermediate_size <= 384
-                and fc2_n_tiles % 3 == 0
-            )
-            else (
-                2 if (self.fc2_tile_n == 128 and fc2_n_tiles % 2 == 0) else 1
-            )
+        use_pinned_chunk3 = (
+            self.fc2_tile_n == 128
+            and self.intermediate_size <= 384
+            and fc2_n_tiles % 3 == 0
         )
-        if cutlass.const_expr(self.fc2_tile_n == 128):
+        if cutlass.const_expr(use_pinned_chunk3):
             self._gemm_tile_body_chunked_n128(
                 False,
                 _FC2_SLAB_STAGES,
                 self.fc2_a_stages,
-                fc2_chunk,
+                3,
                 False,
                 activated,
                 activated,
