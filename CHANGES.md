@@ -1,5 +1,21 @@
 # Changes
 
+- SM121 persistent K4 routed decode scheduler caching (Hy4-flash Duel 1A
+  winner, Navie R2; tracking tpurtell/cuteafd#2540):
+  - **`mixed_trellis_k4.py` (SM121 `W4A16MixedTrellisK4Decode` persistent
+    path only):** the thread-0 scheduler caches each route block's validity
+    and live width in the fifth control word and reuses them across the
+    block's tiles; a per-phase "dependency observed ready" bit lets later
+    tiles of a ready block take the no-wait prologue (one acquire load per
+    route block per phase instead of one per tile); work cursors use relaxed
+    atomics (per-block state hand-off stays acq_rel); the second CTA-wide
+    barrier in the tile epilogue becomes a warp barrier. Manifest recipe,
+    ABI and GEMM K-reduction order are unchanged; `K4_DECODE_VERSION` 5 -> 7.
+  - **Verification (GB10 kakapo, sealed Duel 1A paired replay):** every
+    timed cell digest-exact against stock; scored-band geomean R/S 0.9977 /
+    0.9976 (confirm); Qwen4 TP4 guard 1-row about 0.965 (MCG) / 0.984 (MUL1);
+    prefill guard 256-4096 and #421 watch cells (dsv4p/kimik3 TP6 2048/2752)
+    clean (stock cores). SM120 objects unchanged.
 - Wide decode (`DECODE_ROWS=128`, up to 256) parameterization for Inkling 2 FIR
   replay/commit and Qwen 3.8 Flash Next GDN/PLE/head_fp8 programs (tracking
   tpurtell/cuteafd#2184):
