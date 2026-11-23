@@ -40,7 +40,6 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
-    atomic_add_shared_i32,
     cvt_f32x4_to_e4m3x4,
     div_rn_f32,
     fabs_f32,
@@ -699,7 +698,6 @@ class _Hy4IndexerTopkExpand:
             out_groups = st.out_groups.get_tensor(cute.make_layout((512,)))
             meta = st.meta.get_tensor(cute.make_layout((4,)))
             hist_addr = shared_ptr_to_u32(hist.iterator)
-            meta_addr = shared_ptr_to_u32(meta.iterator)
 
             cur_group = pos // Int32(4)
             limit = cur_group
@@ -752,28 +750,35 @@ class _Hy4IndexerTopkExpand:
                 mask = mask | (Uint32(0xFF) << Uint32(shift))
                 rem = meta[1]
 
-            # Pass 5: collect all strictly better keys and the first `rem` ties in ascending gid order.
+            # Compact strictly better groups in logical gid order, then the
+            # lowest gids tied at the cutoff. Keep physical COW slot numbering
+            # out of the order so the consumer's reduction is repeatable.
             thresh = prefix
             eq_needed = rem
             eq_base = Int32(self.prior_k) - eq_needed
             if tid == Int32(0):
-                meta[2] = Int32(0)  # strict_pos
+                meta[2] = Int32(0)  # strict_taken: running count of strict-better gids
                 meta[3] = Int32(0)  # eq_taken
             cute.arch.sync_threads()
 
+            # Each scan packs two 9-bit counts into one Int32: strict in the
+            # low field, ties in the next.  Per warp each field is <= 32 and
+            # across the eight warps <= 256, so the fields never carry.
+            scan_base = Int32(512)
             base = Int32(0)
             while base < limit:
                 gid = base + tid
+                is_strict = Int32(0)
                 is_eq = Int32(0)
                 if gid < limit:
                     k = _desc_key(Float32(scores[score_base + Int64(gid)]))
                     if k < thresh:
-                        pos_lt = atomic_add_shared_i32(meta_addr + Int32(8), Int32(1))
-                        out_groups[pos_lt] = gid
+                        is_strict = Int32(1)
                     elif k == thresh:
                         is_eq = Int32(1)
+                strict_start = meta[2]
                 eq_start = meta[3]
-                s = is_eq
+                s = is_strict + is_eq * scan_base
                 for off in cutlass.range_constexpr(5):
                     up = cute.arch.shuffle_sync_up(s, offset=1 << off)
                     if lane >= Int32(1 << off):
@@ -790,14 +795,20 @@ class _Hy4IndexerTopkExpand:
                     if lane < Int32(8):
                         warp_tot[lane] = wt
                 cute.arch.sync_threads()
-                warp_off = warp_tot[warp - Int32(1)] if warp > Int32(0) else Int32(0)
-                local_eq = warp_off + s - is_eq
+                packed_off = warp_tot[warp - Int32(1)] if warp > Int32(0) else Int32(0)
+                strict_off = packed_off % scan_base
+                eq_off = (packed_off // scan_base) % scan_base
+                if is_strict == Int32(1):
+                    local_strict = strict_off + (s % scan_base) - Int32(1)
+                    out_groups[strict_start + local_strict] = gid
                 if is_eq == Int32(1):
+                    local_eq = eq_off + ((s // scan_base) % scan_base) - Int32(1)
                     rank_eq = eq_start + local_eq
                     if rank_eq < eq_needed:
                         out_groups[eq_base + rank_eq] = gid
                 if tid == Int32(255):
-                    meta[3] = eq_start + warp_tot[7]
+                    meta[2] = strict_start + warp_tot[7] % scan_base
+                    meta[3] = eq_start + (warp_tot[7] // scan_base) % scan_base
                 cute.arch.sync_threads()
                 base = base + Int32(256)
 
