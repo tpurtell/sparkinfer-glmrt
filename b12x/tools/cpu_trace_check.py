@@ -14,6 +14,10 @@ package variant, and stops at the first DSL error with its diagnostic. Shapes
 come either from built EXL3 packages (``--package``: every variant's sealed
 ``v41_exl3.json``, i.e. the duel's exact shapes) or from ``--shape`` specs.
 
+Run it from the checkout under test (``python -m b12x.tools.cpu_trace_check``),
+or as a standalone file with that checkout first on ``PYTHONPATH`` when the
+tree predates this module (``PYTHONPATH=$PWD python cpu_trace_check.py``).
+
 Examples::
 
   # Every variant of the duel's stock packages, both arches:
@@ -374,7 +378,9 @@ def run(shapes: list[Shape], *, keep_going: bool, trace_only: bool, verbose: boo
                 json.dump(dump_shapes(subset), handle)
                 path = handle.name
             try:
-                command = [sys.executable, "-m", "b12x.tools.cpu_trace_check", "--shapes-json", path]
+                # Re-run this same file, so a copy bound into an entry tree
+                # that predates the module works as well as ``-m``.
+                command = [sys.executable, os.path.abspath(__file__), "--shapes-json", path]
                 command += ["--keep-going"] * keep_going + ["--trace-only"] * trace_only
                 command += ["--verbose"] * verbose
                 failures += subprocess.run(command, check=False).returncode != 0
