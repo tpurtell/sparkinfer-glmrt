@@ -117,6 +117,19 @@ _WS_FC2_CURSOR = 2
 _WS_EXIT_COUNT = 3
 _WS_HEADER = 4
 
+# Per-route-block scheduler cache, packed into the fifth control word
+# (``ctrl_off + 16``).  Bits 0..10 are ``route_block + 1`` (zero means no
+# cached block), bit 11 is the block validity bit and bits 12..24 are the
+# live weight width.  ``thread 0`` reuses these three lookups for every
+# tile of the same route block instead of re-reading ``block_expert_ids``,
+# ``packed_route_indices`` and (for compact weights) ``descriptor_map``
+# on every cursor claim.
+_CACHE_TAG_MASK = 0x7FF
+_CACHE_VALID_SHIFT = 11
+_CACHE_VALID_BIT = 1 << 11
+_CACHE_LW_SHIFT = 12
+_CACHE_LW_MASK = 0x1FFF << 12
+
 # SM120 persistent decode workspace header (its own layout; the SM121 K4
 # decode above drops the ready count and packs its header one word shorter).
 _SM120_WS_READY_COUNT = 3
@@ -352,6 +365,38 @@ def _atomic_add_acq_rel_gpu_i32(
 
 
 @dsl_user_op
+def _atomic_add_relaxed_gpu_i32(
+    addr: Int64,
+    val: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """GPU-scoped relaxed global int32 atomic add for work cursors.
+
+    The cursor only allocates a task index from constant route metadata; the
+    per-block state hand-off is performed by the separate acquire-release
+    state atomics, so the cursor itself needs no ordering beyond atomicity.
+    """
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(addr).ir_value(loc=loc, ip=ip),
+                Int32(val).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.relaxed.gpu.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def _ld_global_acquire_gpu_i32(
     addr: Int64,
     *,
@@ -501,7 +546,7 @@ def _k4_persistent_smem_layout(
 class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     """SM121 (GB10) non-cooperative K4 mixed-Trellis decode/verify kernel."""
 
-    K4_DECODE_VERSION = 5
+    K4_DECODE_VERSION = 6
 
     def __init__(
         self,
@@ -2936,6 +2981,9 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 Uint32(0),
                 Uint32(0),
             )
+            # Tag zero marks the packed per-block scheduler cache empty; the
+            # cache word is reused across every task of the persistent loop.
+            st_shared_i32(smem_base + Int32(ctrl_off + 16), Int32(0))
 
         actual_blocks = packed_route_count[Int32(0)].to(Int32) >> Int32(3)
         if actual_blocks > max_live_blocks:
@@ -2946,6 +2994,35 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
         ws_base = get_ptr_as_int64(workspace, Int64(0))
         ws_state_base = ws_base + Int64(_WS_HEADER * 4)
         pdl_signaled = Int32(0)
+
+        def _cache_build(
+            rb_t: Int32,
+            total_experts: Int32,
+            live_routes: Int32,
+            block_expert_ids: cute.Tensor,
+            packed_route_indices: cute.Tensor,
+            descriptor_map: cute.Tensor,
+            intermediate_size: int,
+            compact_weights: bool,
+        ) -> Int32:
+            ce = block_expert_ids[rb_t].to(Int32)
+            valid = (ce >= Int32(0) and ce < total_experts).to(Int32)
+            lw = Int32(intermediate_size)
+            if valid != Int32(0):
+                r0 = packed_route_indices[rb_t * Int32(8)].to(Int32)
+                if r0 < Int32(0) or r0 >= live_routes:
+                    valid = Int32(0)
+                elif cutlass.const_expr(compact_weights):
+                    lw = descriptor_map[
+                        Int64(3) * Int64(total_experts) + Int64(ce)
+                    ].to(Int32)
+                    if lw <= Int32(0):
+                        valid = Int32(0)
+            return (
+                (rb_t + Int32(1))
+                | (valid << Int32(_CACHE_VALID_SHIFT))
+                | (lw << Int32(_CACHE_LW_SHIFT))
+            )
 
         if actual_blocks > Int32(0):
             total_experts = tier0_num_experts + tier1_num_experts
@@ -3016,9 +3093,12 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                     arg1_d = Int32(0)
                     arg2_d = Int32(0)
                     got_work = Int32(0)
+                    cache = ld_shared_i32_relaxed(
+                        smem_base + Int32(ctrl_off + 16)
+                    )
                     while got_work == Int32(0):
                         if phase == Int32(0):
-                            t = _atomic_add_acq_rel_gpu_i32(
+                            t = _atomic_add_relaxed_gpu_i32(
                                 ws_base + Int64(_WS_ROT_CURSOR * 4), Int32(1)
                             )
                             if t < total_rot_tasks:
@@ -3031,23 +3111,21 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                 else:
                                     rb_t = t // Int32(rot_splits)
                                     chk_t = t - rb_t * Int32(rot_splits)
-                                ce_t = block_expert_ids[rb_t].to(Int32)
+                                cache_tag = cache & Int32(_CACHE_TAG_MASK)
+                                if cache_tag != rb_t + Int32(1):
+                                    cache = _cache_build(
+                                        rb_t,
+                                        total_experts,
+                                        live_routes,
+                                        block_expert_ids,
+                                        packed_route_indices,
+                                        descriptor_map,
+                                        self.intermediate_size,
+                                        self.compact_weights,
+                                    )
                                 valid_blk = (
-                                    ce_t >= Int32(0) and ce_t < total_experts
-                                ).to(Int32)
-                                if valid_blk != Int32(0):
-                                    r0_t = packed_route_indices[
-                                        rb_t * Int32(8)
-                                    ].to(Int32)
-                                    if r0_t < Int32(0) or r0_t >= live_routes:
-                                        valid_blk = Int32(0)
-                                    elif cutlass.const_expr(self.compact_weights):
-                                        lw_t = descriptor_map[
-                                            Int64(3) * Int64(total_experts)
-                                            + Int64(ce_t)
-                                        ].to(Int32)
-                                        if lw_t <= Int32(0):
-                                            valid_blk = Int32(0)
+                                    cache & Int32(_CACHE_VALID_BIT)
+                                ) >> Int32(_CACHE_VALID_SHIFT)
                                 if valid_blk != Int32(0):
                                     action_d = Int32(_ACT_ROT)
                                     arg0_d = rb_t
@@ -3061,31 +3139,31 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             else:
                                 phase = Int32(1)
                         elif phase == Int32(1):
-                            t = _atomic_add_acq_rel_gpu_i32(
+                            t = _atomic_add_relaxed_gpu_i32(
                                 ws_base + Int64(_WS_FC1_CURSOR * 4), Int32(1)
                             )
                             if t < total_fc1_tasks:
                                 rb_t = t // fc1_tasks_per_block
                                 c_t = t - rb_t * fc1_tasks_per_block
                                 nt_t = c_t * fc1_chunk
-                                ce_t = block_expert_ids[rb_t].to(Int32)
+                                cache_tag = cache & Int32(_CACHE_TAG_MASK)
+                                if cache_tag != rb_t + Int32(1):
+                                    cache = _cache_build(
+                                        rb_t,
+                                        total_experts,
+                                        live_routes,
+                                        block_expert_ids,
+                                        packed_route_indices,
+                                        descriptor_map,
+                                        self.intermediate_size,
+                                        self.compact_weights,
+                                    )
                                 valid_blk = (
-                                    ce_t >= Int32(0) and ce_t < total_experts
-                                ).to(Int32)
-                                lw_t = Int32(self.intermediate_size)
-                                if valid_blk != Int32(0):
-                                    r0_t = packed_route_indices[
-                                        rb_t * Int32(8)
-                                    ].to(Int32)
-                                    if r0_t < Int32(0) or r0_t >= live_routes:
-                                        valid_blk = Int32(0)
-                                    elif cutlass.const_expr(self.compact_weights):
-                                        lw_t = descriptor_map[
-                                            Int64(3) * Int64(total_experts)
-                                            + Int64(ce_t)
-                                        ].to(Int32)
-                                        if lw_t <= Int32(0):
-                                            valid_blk = Int32(0)
+                                    cache & Int32(_CACHE_VALID_BIT)
+                                ) >> Int32(_CACHE_VALID_SHIFT)
+                                lw_t = (
+                                    cache & Int32(_CACHE_LW_MASK)
+                                ) >> Int32(_CACHE_LW_SHIFT)
                                 active_tile = valid_blk
                                 if cutlass.const_expr(self.compact_weights):
                                     if active_tile != Int32(0):
@@ -3095,17 +3173,14 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         if loc_nt * Int32(tile_n) >= lw_t:
                                             active_tile = Int32(0)
                                 if active_tile != Int32(0):
-                                    st_val = _ld_global_acquire_gpu_i32(
-                                        ws_state_base + Int64(rb_t) * Int64(4)
-                                    )
-                                    rot_done = (
-                                        (st_val & Int32(_ROT_MASK))
-                                        == Int32(rot_ready_val)
-                                    ).to(Int32)
                                     action_d = Int32(_ACT_FC1)
                                     arg0_d = rb_t
                                     arg1_d = nt_t
-                                    arg2_d = rot_done
+                                    # The GEMM starts its B prefetch before it
+                                    # polls the rotation-ready state bit, so the
+                                    # acquire wait hides behind weight traffic
+                                    # instead of sitting in the scheduler.
+                                    arg2_d = Int32(0)
                                     got_work = Int32(1)
                                 else:
                                     old_st = _atomic_add_acq_rel_gpu_i32(
@@ -3127,48 +3202,46 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                             else:
                                 phase = Int32(2)
                         else:
-                            t = _atomic_add_acq_rel_gpu_i32(
+                            t = _atomic_add_relaxed_gpu_i32(
                                 ws_base + Int64(_WS_FC2_CURSOR * 4), Int32(1)
                             )
                             if t < total_fc2_tasks:
                                 rb_t = t // fc2_tasks_per_block
                                 c_t = t - rb_t * fc2_tasks_per_block
                                 nt_t = c_t * fc2_chunk
-                                ce_t = block_expert_ids[rb_t].to(Int32)
-                                valid_blk = (
-                                    ce_t >= Int32(0) and ce_t < total_experts
-                                ).to(Int32)
-                                if valid_blk != Int32(0):
-                                    r0_t = packed_route_indices[
-                                        rb_t * Int32(8)
-                                    ].to(Int32)
-                                    if r0_t < Int32(0) or r0_t >= live_routes:
-                                        valid_blk = Int32(0)
-                                    elif cutlass.const_expr(self.compact_weights):
-                                        lw_t = descriptor_map[
-                                            Int64(3) * Int64(total_experts)
-                                            + Int64(ce_t)
-                                        ].to(Int32)
-                                        if lw_t <= Int32(0):
-                                            valid_blk = Int32(0)
-                                if valid_blk != Int32(0):
-                                    st_val = _ld_global_acquire_gpu_i32(
-                                        ws_state_base + Int64(rb_t) * Int64(4)
+                                cache_tag = cache & Int32(_CACHE_TAG_MASK)
+                                if cache_tag != rb_t + Int32(1):
+                                    cache = _cache_build(
+                                        rb_t,
+                                        total_experts,
+                                        live_routes,
+                                        block_expert_ids,
+                                        packed_route_indices,
+                                        descriptor_map,
+                                        self.intermediate_size,
+                                        self.compact_weights,
                                     )
-                                    act_done = (
-                                        (st_val & Int32(_ACT_READY_BIT)) != Int32(0)
-                                    ).to(Int32)
+                                valid_blk = (
+                                    cache & Int32(_CACHE_VALID_BIT)
+                                ) >> Int32(_CACHE_VALID_SHIFT)
+                                if valid_blk != Int32(0):
                                     pdl_now = (
                                         t + persistent_ctas >= total_fc2_tasks
                                     ).to(Int32)
                                     action_d = Int32(_ACT_FC2)
                                     arg0_d = rb_t
                                     arg1_d = nt_t
-                                    arg2_d = act_done | (pdl_now << Int32(1))
+                                    # Activation-ready is polled inside the GEMM
+                                    # after its B prefetch; only the PDL launch
+                                    # hint rides in arg2.
+                                    arg2_d = pdl_now << Int32(1)
                                     got_work = Int32(1)
                             else:
                                 action_d = Int32(_ACT_EXIT)
                                 got_work = Int32(1)
+                    # Publish the packed per-block cache before the action so
+                    # the next outer iteration reuses the same lookups.
+                    st_shared_i32(smem_base + Int32(ctrl_off + 16), cache)
                     st_shared_i32(smem_base + Int32(ctrl_off + 0), action_d)
                     st_shared_i32(smem_base + Int32(ctrl_off + 4), arg0_d)
                     st_shared_i32(smem_base + Int32(ctrl_off + 8), arg1_d)
@@ -3622,12 +3695,21 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                 (old & Int32(_FC1_CNT_MASK)) + Int32(1)
                                 == fc1_tasks_per_block
                             ).to(Int32)
-                            st_shared_i32(smem_base + Int32(ctrl_off + 16), is_last)
+                            # arg2 (the flags word) was zero for FC1 and was
+                            # already consumed by the GEMM; stash the last-tile
+                            # flag in its bit 2 so the packed scheduler cache in
+                            # word 4 stays intact for the next task.
+                            st_shared_i32(
+                                smem_base + Int32(ctrl_off + 12),
+                                is_last << Int32(2),
+                            )
                         cute.arch.sync_threads()
                         if (
-                            ld_shared_i32_relaxed(smem_base + Int32(ctrl_off + 16))
-                            != Int32(0)
-                        ):
+                            ld_shared_i32_relaxed(
+                                smem_base + Int32(ctrl_off + 12)
+                            )
+                            & Int32(4)
+                        ) != Int32(0):
                             if valid_rows > Int32(0) and live_width > Int32(0):
                                 self._run_fused_act_block(
                                     cta_threads,
