@@ -329,6 +329,27 @@ class ResidualAdd:
             out[i] = _add(Float32(residual[i]), Float32(delta[i]))
 
 
+class GatedResidualBf16:
+    def __init__(self, width):
+        self.width = int(width)
+
+    @cute.jit
+    def __call__(self, residual: cute.Pointer, delta: cute.Pointer, gate: cute.Pointer,
+                 out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        count = Int64(rows) * Int64(self.width)
+        self.kernel(residual, delta, gate, out, count).launch(
+            grid=((count + Int64(255)) // Int64(256), 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, residual: cute.Pointer, delta: cute.Pointer, gate: cute.Pointer,
+               out: cute.Pointer, count: Int64):
+        residual, delta, gate, out = _view(residual), _view(delta), _view(gate), _view(out)
+        i = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
+        if i < count:
+            col = i % Int64(self.width)
+            out[i] = _add(Float32(residual[i]), _mul(Float32(delta[i]), Float32(gate[col]))).to(BFloat16)
+
+
 class HeadGate:
     def __init__(self, heads, dim):
         self.heads, self.dim = int(heads), int(dim)
@@ -673,6 +694,18 @@ def compile_residual_add_aot(*, width, delta_dtype=torch.bfloat16):
         Operand("delta", _dtype(delta_dtype), f"[rows,{width}]"),
         Operand("out", torch.float32, f"[rows,{width}]", "out")), scalars=(Scalar("rows"),),
         key=(width, delta_dtype), geometry=dict(width=width))
+
+
+def compile_gated_residual_bf16_aot(*, width):
+    """BF16 residual plus a per-channel BF16 gate times a BF16 update, in F32."""
+    if width <= 0:
+        raise ValueError("width must be positive")
+    return compile_program(GatedResidualBf16(width), name="gated_residual_bf16", operands=(
+        Operand("residual", torch.bfloat16, f"[rows,{width}]"),
+        Operand("delta", torch.bfloat16, f"[rows,{width}]"),
+        Operand("gate", torch.bfloat16, f"[{width}]"),
+        Operand("out", torch.bfloat16, f"[rows,{width}]", "out")), scalars=(Scalar("rows"),),
+        key=(width,), geometry=dict(width=width))
 
 
 def compile_head_gate_aot(*, heads, dim, logits_dtype=torch.bfloat16):
