@@ -310,6 +310,10 @@ def _gather_native_scale_bytes(a: Uint32, b: Uint32, c: Uint32, d: Uint32, byte:
 def _trellis256_execution_lut(
     device: torch.device | str, codebook: str
 ) -> torch.Tensor:
+    from b12x._lib.aot_target import is_offline
+
+    if is_offline():
+        device = torch.device("cpu")
     if codebook == SQG_FP16:
         return sqg_fp16_d3l_descriptors(device)
     return sqg_xor_cheb_t12_lut(device)

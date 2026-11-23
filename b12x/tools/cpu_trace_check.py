@@ -42,20 +42,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Per-arch target description, read from cuDeviceGetAttribute on raptor (RTX
-# PRO 6000) and kakapo (GB10). SM counts equal the AOT workspace ceilings the
-# exporter records (``EXL3_AOT_MAX_SMS``).
-TARGETS = {
-    "sm120": dict(major=12, minor=0, arch="sm_120a", name="NVIDIA RTX PRO 6000 Blackwell (CPU trace)",
-                  multi_processor_count=188, shared_memory_per_block_optin=101376,
-                  shared_memory_per_multiprocessor=102400, L2_cache_size=128 << 20,
-                  total_memory=96 << 30),
-    "sm121": dict(major=12, minor=1, arch="sm_121a", name="NVIDIA GB10 (CPU trace)",
-                  multi_processor_count=48, shared_memory_per_block_optin=101376,
-                  shared_memory_per_multiprocessor=102400, L2_cache_size=24 << 20,
-                  total_memory=121 << 30),
-}
-ARCH_OF_COMPUTE = {(12, 0): "sm120", (12, 1): "sm121"}
+from b12x._lib.aot_target import ARCH_OF_COMPUTE, TARGETS, describe_target
 
 
 @dataclass
@@ -184,84 +171,6 @@ def parse_shape(text: str, arch: str) -> Shape:
     return Shape(**values)
 
 
-def describe_target(arch: str) -> None:
-    """Make Torch and CuTe DSL report the target device without touching CUDA.
-
-    Kernel code selects SM120/SM121 paths with
-    ``torch.cuda.is_available() and torch.cuda.get_device_capability(...)``
-    and sizes with ``get_device_properties``; the DSL lowers for its envar
-    arch. Nothing here allocates device memory or opens a context.
-    """
-    import torch
-
-    spec = TARGETS[arch]
-    props = type("CpuTraceTargetProperties", (), {
-        **spec, "uuid": f"cpu-trace-{arch}", "is_integrated": arch == "sm121",
-        "max_threads_per_multi_processor": 1536, "regs_per_multiprocessor": 65536,
-        "warp_size": 32, "shared_memory_per_block": 49152, "gcnArchName": "", "pci_bus_id": 0,
-        "pci_device_id": 0, "pci_domain_id": 0,
-    })()
-
-    class _Stream:
-        cuda_stream = 0
-
-        def synchronize(self):
-            return None
-
-    torch.cuda.is_available = lambda: True
-    torch.cuda.device_count = lambda: 1
-    torch.cuda.current_device = lambda: 0
-    torch.cuda.get_device_capability = lambda device=None: (spec["major"], spec["minor"])
-    torch.cuda.get_device_properties = lambda device=None: props
-    torch.cuda.get_device_name = lambda device=None: spec["name"]
-    torch.cuda.current_stream = lambda device=None: _Stream()
-    torch.cuda.is_current_stream_capturing = lambda: False
-
-    from cutlass.cutlass_dsl import CuTeDSL
-
-    CuTeDSL._get_dsl().envar.arch = spec["arch"]
-
-    # The DSL itself reads a few driver attributes while generating launch
-    # attributes (e.g. max shared memory per SM for ``min_blocks_per_mp > 1``,
-    # which lands in the IR). Answer them from the measured target table and
-    # refuse any other attribute rather than guess.
-    from cutlass.base_dsl.runtime import cuda as dsl_cuda
-
-    attribute = dsl_cuda.cuda.CUdevice_attribute
-    known = {
-        attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR:
-            spec["shared_memory_per_multiprocessor"],
-        attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN:
-            spec["shared_memory_per_block_optin"],
-        attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: spec["multi_processor_count"],
-        attribute.CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE: spec["L2_cache_size"],
-        attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: spec["major"],
-        attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: spec["minor"],
-    }
-
-    def get_device_attribute(which, device_id: int = 0):
-        if which not in known:
-            raise RuntimeError(f"cpu-trace-check has no {arch} value for device attribute {which}; "
-                               "add the measured value to TARGETS")
-        return known[which]
-
-    dsl_cuda.get_device_attribute = get_device_attribute
-
-    # The compile result carries the Trellis decode LUT as a device tensor
-    # (host data, created after the kernel is compiled); keep it on the host.
-    import importlib
-
-    for name in ("mixed_trellis", "mixed_trellis4"):
-        module = importlib.import_module(f"b12x.moe._shared.kernels.w4a16.{name}")
-        build_lut = getattr(module, "_trellis256_execution_lut", None)
-        if build_lut is not None and not getattr(build_lut, "_cpu_trace", False):
-            def host_lut(device, codebook, _build=build_lut):
-                return _build(torch.device("cpu"), codebook)
-
-            host_lut._cpu_trace = True
-            module._trellis256_execution_lut = host_lut
-
-
 def _checked_environment() -> list[str]:
     """Say when a GPU is visible: the check never asks for it (the target is
     described, not queried), but a sandboxed entrant should see none."""
@@ -280,7 +189,7 @@ def _mixed_options(shape: Shape):
     )
 
     spec = TARGETS[shape.arch]
-    workspace_sms = EXL3_AOT_MAX_SMS[(spec["major"], spec["minor"])]
+    workspace_sms = EXL3_AOT_MAX_SMS[(spec.major, spec.minor)]
     direct = _projection_mixed_direct_topk_routes(shape.capacity, shape.topk, direct_exl3=True)
     if shape.direct is not None:
         direct = shape.direct
@@ -296,7 +205,7 @@ def _mixed_options(shape: Shape):
         tier0_num_experts=shape.experts, tier1_num_experts=shape.experts, top_k=shape.topk,
         route_num_experts=shape.experts, max_m_blocks=route_blocks,
         sms=workspace_sms, workspace_sms=workspace_sms,
-        max_shared_mem=spec["shared_memory_per_block_optin"],
+        max_shared_mem=spec.shared_memory_per_block_optin,
         force_tile_config=_projection_mixed_tile_config(
             shape.tile, hidden_size=shape.hidden, intermediate_size=shape.intermediate,
             token_count=shape.capacity, direct_topk_routes=direct),

@@ -209,6 +209,11 @@ def get_l2_cache_bytes(device: torch.device | None = None) -> int:
     constant: one image serves every card whose L2 differs from the host the
     image was built on.
     """
+    from .aot_target import active_target
+
+    offline = active_target()
+    if offline is not None:
+        return offline.L2_cache_size
     index = None if device is None or device.type != "cuda" else device.index
     if index is None:
         index = torch.cuda.current_device()

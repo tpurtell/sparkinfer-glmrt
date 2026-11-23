@@ -116,7 +116,6 @@ def compile_in_process(plans: Iterable[CompilationPlan]) -> None:
 
 
 _WORKER_TRITON_COMPILES = 0
-_WORKER_RUNTIME_LIBRARIES = ()
 _SPAWN_ENVIRONMENT_LOCK = Lock()
 
 
@@ -124,20 +123,11 @@ def _configure_offline_cutlass_device_attributes(
     cuda_helpers: Any,
     max_shared_memory_per_multiprocessor: int,
 ):
-    max_smem_per_mp_attribute = getattr(
-        cuda_helpers.cuda.CUdevice_attribute,
-        "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR",
+    from .aot_target import configure_offline_cutlass_device_attributes
+
+    configure_offline_cutlass_device_attributes(
+        cuda_helpers, max_shared_memory_per_multiprocessor
     )
-
-    def get_device_attribute(attribute):
-        if attribute == max_smem_per_mp_attribute:
-            return max_shared_memory_per_multiprocessor
-        raise RuntimeError(
-            "compiler target metadata does not provide CUDA device attribute "
-            f"{attribute!r}"
-        )
-
-    cuda_helpers.get_device_attribute = get_device_attribute
 
 
 @contextmanager
@@ -172,131 +162,19 @@ def _initialize_worker(
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     import torch
     from triton import knobs
-    from . import compiler
+    from . import aot_target, compiler
 
     torch.set_num_threads(1)
-    if torch.cuda.is_initialized():
-        raise RuntimeError("compiler worker inherited an initialized CUDA runtime")
-    compiler._configure_offline_compile_target(device_ordinal, device_uuid)
-
-    def target_ordinal(device=None):
-        if device is None:
-            return device_ordinal
-        if type(device) is int:
-            ordinal = device
-        else:
-            resolved = torch.device(device)
-            if resolved.type != "cuda":
-                raise ValueError(f"compiler target must be CUDA, got {resolved}")
-            ordinal = device_ordinal if resolved.index is None else resolved.index
-        if ordinal != device_ordinal:
-            raise ValueError(
-                f"compiler target ordinal changed from {device_ordinal} to {ordinal}"
-            )
-        return ordinal
-
-    @contextmanager
-    def device_scope(device):
-        target_ordinal(device)
-        yield
-
-    class OfflineStream:
-        cuda_stream = 0
-        device = torch.device("cuda", device_ordinal)
-
-        def synchronize(self):
-            raise RuntimeError("compiler workers cannot synchronize CUDA")
-
-    properties = type("OfflineCudaDeviceProperties", (), {
-        "major": compute_capability[0],
-        "minor": compute_capability[1],
-        "multi_processor_count": sm_count,
-        "shared_memory_per_block": max_shared_memory_per_block,
-        "shared_memory_per_block_optin": max_shared_memory_per_block,
-        "shared_memory_per_multiprocessor": max_shared_memory_per_multiprocessor,
-        "name": product_name,
-        "uuid": device_uuid,
-    })()
-    offline_stream = OfflineStream()
-
-    def get_device_properties(device=None):
-        target_ordinal(device)
-        return properties
-
-    def get_device_capability(device=None):
-        target_ordinal(device)
-        return compute_capability
-
-    def current_stream(device=None):
-        target_ordinal(device)
-        return offline_stream
-
-    def reject_cuda_initialization(*_args, **_kwargs):
-        raise RuntimeError("compiler workers cannot initialize CUDA")
-
-    # Compile factories use these calls only to describe their target. Keep
-    # those operations pure and fail closed on every execution-side entrypoint.
-    torch.cuda.is_available = lambda: True
-    torch.cuda.device_count = lambda: max(1, device_ordinal + 1)
-    torch.cuda.current_device = lambda: device_ordinal
-    torch.cuda.set_device = target_ordinal
-    torch.cuda.device = device_scope
-    torch.cuda.get_device_capability = get_device_capability
-    torch.cuda.get_device_properties = get_device_properties
-    torch.cuda.get_device_name = lambda device=None: (
-        get_device_properties(device).name
+    aot_target.describe_target(
+        compute_capability,
+        device_ordinal=device_ordinal,
+        device_uuid=device_uuid,
+        product_name=product_name,
+        sm_count=sm_count,
+        max_shared_memory_per_block_optin=max_shared_memory_per_block,
+        max_shared_memory_per_multiprocessor=max_shared_memory_per_multiprocessor,
+        preserve_existing=False,
     )
-    torch.cuda.current_stream = current_stream
-    torch.cuda.default_stream = current_stream
-    torch.cuda.is_current_stream_capturing = lambda: False
-    torch.cuda.synchronize = reject_cuda_initialization
-    torch.cuda.init = reject_cuda_initialization
-    torch.cuda._lazy_init = reject_cuda_initialization
-
-    # CuTe's PIC object writer resolves the host launch shim while exporting.
-    # Loading the shim supplies symbols only; CUDA remains invisible and any
-    # execution-side Torch entrypoint above still fails closed.
-    import ctypes
-    from cutlass.runtime import find_runtime_libraries
-
-    global _WORKER_RUNTIME_LIBRARIES
-    _WORKER_RUNTIME_LIBRARIES = tuple(
-        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
-        for path in find_runtime_libraries(enable_tvm_ffi=False)
-    )
-
-    major, minor = compute_capability
-    arch_suffix = "a" if major >= 9 else ""
-    from cutlass.cutlass_dsl import CuTeDSL
-    CuTeDSL._get_dsl().envar.arch = f"sm_{major}{minor}{arch_suffix}"
-
-    from cutlass.base_dsl.runtime import cuda as cuda_helpers
-    _configure_offline_cutlass_device_attributes(
-        cuda_helpers, max_shared_memory_per_multiprocessor
-    )
-
-    from triton.backends.compiler import GPUTarget
-    from triton.runtime import driver
-    triton_target = GPUTarget("cuda", major * 10 + minor, 32)
-
-    class OfflineTritonDriver:
-        def get_current_device(self):
-            return device_ordinal
-
-        def get_device_capability(self, device):
-            target_ordinal(device)
-            return compute_capability
-
-        def get_current_target(self):
-            return triton_target
-
-        def get_current_stream(self, device):
-            target_ordinal(device)
-            return 0
-
-    driver.set_active(OfflineTritonDriver())
-    if torch.cuda.is_initialized():
-        raise RuntimeError("compiler worker initialized CUDA during setup")
     original = compiler._call_cute_compile
 
     def compile_counted(*args, **kwargs):

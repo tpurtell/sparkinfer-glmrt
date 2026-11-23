@@ -883,12 +883,15 @@ def validate_fc2_slice_geometry(
 def query_optin_shared_memory() -> int | None:
     """This host's per-CTA opt-in shared memory, or None without a device.
 
-    The CTA budget comes from the driver (cudaDevAttrMaxSharedMemoryPerBlock-
-    Optin) every time a kernel is built, so no card's limit is baked into a
-    layout. Offline AOT export runs with CUDA hidden from the compiler
-    workers; there the caller gets None and only the universal streamed
-    layout is compiled, which fits whenever FC1 does on every SM12x card.
+    The CTA budget comes from the described offline target during AOT export,
+    or from the driver (cudaDevAttrMaxSharedMemoryPerBlockOptin) at runtime,
+    so no card's limit is baked into a layout.
     """
+    from b12x._lib.aot_target import active_target
+
+    offline = active_target()
+    if offline is not None:
+        return offline.shared_memory_per_block_optin
     try:
         status = cuda.cuInit(0)
         if isinstance(status, tuple):
