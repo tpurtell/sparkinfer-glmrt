@@ -1,5 +1,41 @@
 # Changes
 
+- Wide decode (`DECODE_ROWS=128`, up to 256) parameterization for Inkling 2 FIR
+  replay/commit and Qwen 3.8 Flash Next GDN/PLE/head_fp8 programs (tracking
+  tpurtell/cuteafd#2184):
+  - **Inkling 2 FIR (`inkling2_convolution_replay.py`, `fir_history.py`):** add
+    optional `max_rows: int = 64` (1..256) to
+    `compile_inkling2_convolution_replay_aot` and
+    `compile_fir_history_commit_aot`. Default `max_rows=64` preserves exact
+    cache keys, ABIs, C headers and CUDA ELF bytes (6/6 verified byte-identical
+    against `914833ce03`).
+  - **Qwen 3.8 Flash Next (`_qwen4_gdn_kernels.py`, `qwen4_gdn.py`,
+    `_qwen4_kernels.py`, `qwen4.py`):** parameterize `replay_rows` on
+    `gdn_replay_layout`, `Qwen4GdnRecurrent`, `Qwen4GdnCommit`,
+    `Qwen4GdnConvCommit`, `compile_qwen4_gdn_commit_aot`, `Qwen4PleCommit` and
+    `compile_qwen4_ple_commit_aot`; add `decode: bool | None = None` to
+    `compile_qwen4_gdn_aot` (allowing BF16 `decode=True`, `fp8=True`, and
+    `fp8_only="decode"` at `max_rows=128` with token-sequential recurrence and
+    128-row replay records, mirroring `glmf.py`); add optional `max_rows` to
+    `compile_qwen4_head_fp8_aot`. Existing `m64` and `m4096` programs preserve
+    exact cache keys, ABIs, C headers and CUDA ELF bytes (8/8 verified
+    byte-identical against `914833ce03`).
+  - **Verification (SM120 RTX PRO 6000):** 14/14 existing `m64`/`m4096`
+    programs byte-identical CUDA ELF + header vs `914833ce03`; 9/9 new `m128`
+    programs export CPU-only with zero CUDA init; 38/38 SM120 GPU oracle tests
+    pass bit-exact (`tests/integration/test_fir_history_decode_128.py`,
+    `tests/integration/test_cuteafd_qwen4_decode_128.py`); warmed SM120 row
+    curves (`rows = 1..128`) show zero per-row collapse across `64..128`
+    (`fir_history_commit_m128` flat `5.65-5.98 us/seq`,
+    `qwen4_gdn_w8_m128` `3.17 -> 2.40 us/row`, `qwen4_gdn_bf16_m128`
+    `3.07 -> 2.57 us/row`, `qwen4_ple_commit_m128` flat `2.1 us`;
+    `qwen4_head_fp8_m128` shows expected 2-band M-tile step `11.69 -> 14.13 ->
+    11.67 us/row` at 64->80->128 from `cta_tiles=4`, and is only used at
+    draft batch sizes `<= 16`).
+  - **Expected changed placement groups:** none for existing `m64`/`m4096`
+    exports (`--expect []` on a pin-only bump; new `m128` stems in `programs`
+    will be added in the follow-up CuteAFD Phase C exporter PR).
+
 - SM121 EXL3 routed decode (Neon R3 of the routed MUL1 duel): admit Hy4-flash
   TP1/TP2/TP4/TP6 and Qwen4 TP4 to the persistent SM121 K4 decode while
   keeping the cooperative parent's recorded shared-memory bytes and

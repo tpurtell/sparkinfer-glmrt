@@ -39,23 +39,27 @@ HEAD = 128
 REPLAY_ROWS = 64
 
 
-def gdn_replay_layout(key_heads: int, heads: int, channels: int) -> dict[str, int]:
-    """Byte offsets of a GDN layer's replay record: ``k`` FP32 ``[REPLAY_ROWS, key_heads, 128]``
-    (L2-normalized keys), ``v`` FP32 ``[REPLAY_ROWS, heads, 128]``, ``gates`` FP32
-    ``[REPLAY_ROWS, heads, 2]`` (decay, beta), ``proj`` BF16 ``[REPLAY_ROWS, channels]`` (the
+def gdn_replay_layout(key_heads: int, heads: int, channels: int, replay_rows: int = REPLAY_ROWS) -> dict[str, int]:
+    """Byte offsets of a GDN layer's replay record: ``k`` FP32 ``[replay_rows, key_heads, 128]``
+    (L2-normalized keys), ``v`` FP32 ``[replay_rows, heads, 128]``, ``gates`` FP32
+    ``[replay_rows, heads, 2]`` (decay, beta), ``proj`` BF16 ``[replay_rows, channels]`` (the
     q/k/v in-projection rows for the conv state) and ``bytes`` (the record size)."""
+    r = int(replay_rows)
+    if r <= 0:
+        raise ValueError("replay_rows must be positive")
     k = 0
-    v = k + REPLAY_ROWS * key_heads * HEAD * 4
-    gates = v + REPLAY_ROWS * heads * HEAD * 4
-    proj = gates + REPLAY_ROWS * heads * 2 * 4
-    total = proj + REPLAY_ROWS * channels * 2
+    v = k + r * key_heads * HEAD * 4
+    gates = v + r * heads * HEAD * 4
+    proj = gates + r * heads * 2 * 4
+    total = proj + r * channels * 2
     return {"k": k, "v": v, "gates": gates, "proj": proj, "bytes": (total + 1023) // 1024 * 1024}
 
 
 @cute.jit
-def _replay_f32(address: Int64, heads: cutlass.Constexpr, width: cutlass.Constexpr) -> cute.Tensor:
+def _replay_f32(address: Int64, heads: cutlass.Constexpr, width: cutlass.Constexpr,
+                rows: cutlass.Constexpr = REPLAY_ROWS) -> cute.Tensor:
     return cute.make_tensor(cute.make_ptr(Float32, address, cute.AddressSpace.gmem, assumed_align=16),
-                            cute.make_layout((REPLAY_ROWS, heads, width), stride=(heads * width, width, 1)))
+                            cute.make_layout((rows, heads, width), stride=(heads * width, width, 1)))
 
 
 class Qwen4GdnConv:
@@ -186,7 +190,8 @@ class Qwen4GdnRecurrent:
     threads = 256
     v_block = 32
 
-    def __init__(self, *, heads: int, key_heads: int, ab_stride: int, eps: float = 1.0e-6):
+    def __init__(self, *, heads: int, key_heads: int, ab_stride: int, eps: float = 1.0e-6,
+                 replay_rows: int = REPLAY_ROWS):
         self.heads, self.key_heads = int(heads), int(key_heads)
         self.ratio = self.heads // self.key_heads
         self.key_width = self.key_heads * HEAD
@@ -195,6 +200,7 @@ class Qwen4GdnRecurrent:
         self.ab_stride = int(ab_stride)
         self.eps = float(eps)
         self.scale = HEAD ** -0.5
+        self.replay_rows = int(replay_rows)
 
     @cute.jit
     def __call__(self, qkv: cute.Pointer, a_raw: cute.Pointer, b_raw: cute.Pointer, a_log: cute.Pointer,
@@ -228,11 +234,11 @@ class Qwen4GdnRecurrent:
                replay_ptr: cute.Pointer, spec: Int32, rows: Int32):
         head = Int64(cute.arch.block_idx()[0])
         tidx = Int32(cute.arch.thread_idx()[0])
-        layout = gdn_replay_layout(self.key_heads, self.heads, self.qkv_width)
+        layout = gdn_replay_layout(self.key_heads, self.heads, self.qkv_width, self.replay_rows)
         base = Int64(replay_ptr.toint())
-        replay_k = _replay_f32(base + Int64(layout["k"]), self.key_heads, HEAD)
-        replay_v = _replay_f32(base + Int64(layout["v"]), self.heads, HEAD)
-        replay_g = _replay_f32(base + Int64(layout["gates"]), self.heads, 2)
+        replay_k = _replay_f32(base + Int64(layout["k"]), self.key_heads, HEAD, self.replay_rows)
+        replay_v = _replay_f32(base + Int64(layout["v"]), self.heads, HEAD, self.replay_rows)
+        replay_g = _replay_f32(base + Int64(layout["gates"]), self.heads, 2, self.replay_rows)
         # Warp 0 of the first CTA of a key head's first value head records the key;
         # thread 0 of each head's first CTA its decay and beta.
         first_cta = Int32(cute.arch.block_idx()[1]) == Int32(0)
@@ -338,10 +344,11 @@ class Qwen4GdnCommit:
     threads = 256
     v_block = 32
 
-    def __init__(self, *, heads: int, key_heads: int, channels: int):
+    def __init__(self, *, heads: int, key_heads: int, channels: int, replay_rows: int = REPLAY_ROWS):
         self.heads, self.key_heads = int(heads), int(key_heads)
         self.ratio = self.heads // self.key_heads
-        self.layout = gdn_replay_layout(self.key_heads, self.heads, int(channels))
+        self.replay_rows = int(replay_rows)
+        self.layout = gdn_replay_layout(self.key_heads, self.heads, int(channels), self.replay_rows)
 
     @cute.jit
     def __call__(self, state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
@@ -368,9 +375,9 @@ class Qwen4GdnCommit:
             st = cute.make_tensor(cute.make_ptr(Float32, base, cute.AddressSpace.gmem, assumed_align=16),
                                   cute.make_layout((HEAD, HEAD), stride=(HEAD, 1)))
             record = Int64(replay.toint()) + layer * Int64(self.layout["bytes"])
-            keys = _replay_f32(record + Int64(self.layout["k"]), self.key_heads, HEAD)
-            values = _replay_f32(record + Int64(self.layout["v"]), self.heads, HEAD)
-            gates = _replay_f32(record + Int64(self.layout["gates"]), self.heads, 2)
+            keys = _replay_f32(record + Int64(self.layout["k"]), self.key_heads, HEAD, self.replay_rows)
+            values = _replay_f32(record + Int64(self.layout["v"]), self.heads, HEAD, self.replay_rows)
+            gates = _replay_f32(record + Int64(self.layout["gates"]), self.heads, 2, self.replay_rows)
             kh = head // Int64(self.ratio)
             s = cute.make_rmem_tensor(cute.make_layout((4, 4), stride=(4, 1)), Float32)
             k = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
@@ -405,9 +412,10 @@ class Qwen4GdnConvCommit:
 
     threads = 256
 
-    def __init__(self, *, heads: int, key_heads: int, channels: int):
+    def __init__(self, *, heads: int, key_heads: int, channels: int, replay_rows: int = REPLAY_ROWS):
         self.channels = int(channels)
-        self.layout = gdn_replay_layout(int(key_heads), int(heads), self.channels)
+        self.replay_rows = int(replay_rows)
+        self.layout = gdn_replay_layout(int(key_heads), int(heads), self.channels, self.replay_rows)
 
     @cute.jit
     def __call__(self, conv_state: cute.Pointer, replay: cute.Pointer, tables: cute.Pointer, sequences: Int32,
@@ -435,5 +443,5 @@ class Qwen4GdnConvCommit:
                                       cute.make_layout((CONV_TAPS - 1, c), stride=(c, 1)))
                 record = Int64(replay.toint()) + layer * Int64(self.layout["bytes"]) + Int64(self.layout["proj"])
                 proj = cute.make_tensor(cute.make_ptr(BFloat16, record, cute.AddressSpace.gmem, assumed_align=16),
-                                        cute.make_layout((REPLAY_ROWS, c), stride=(c, 1)))
+                                        cute.make_layout((self.replay_rows, c), stride=(c, 1)))
                 _shift_conv_state(st, proj, first, keep, ch)
