@@ -119,16 +119,21 @@ _WS_HEADER = 4
 
 # Per-route-block scheduler cache, packed into the fifth control word
 # (``ctrl_off + 16``).  Bits 0..10 are ``route_block + 1`` (zero means no
-# cached block), bit 11 is the block validity bit and bits 12..24 are the
-# live weight width.  ``thread 0`` reuses these three lookups for every
-# tile of the same route block instead of re-reading ``block_expert_ids``,
-# ``packed_route_indices`` and (for compact weights) ``descriptor_map``
-# on every cursor claim.
+# cached block), bit 11 is the block validity bit, bits 12..24 are the
+# live weight width, bit 25 records that the block's rotation-ready state
+# was observed and bit 26 the same for activation-ready.  ``thread 0``
+# reuses these lookups for every tile of the same route block instead of
+# re-reading ``block_expert_ids``, ``packed_route_indices`` and (for
+# compact weights) ``descriptor_map`` on every cursor claim, and stops
+# polling the per-block state word once a phase's dependency has been
+# seen satisfied.
 _CACHE_TAG_MASK = 0x7FF
 _CACHE_VALID_SHIFT = 11
 _CACHE_VALID_BIT = 1 << 11
 _CACHE_LW_SHIFT = 12
 _CACHE_LW_MASK = 0x1FFF << 12
+_CACHE_ROT_READY_BIT = 1 << 25
+_CACHE_ACT_READY_BIT = 1 << 26
 
 # SM120 persistent decode workspace header (its own layout; the SM121 K4
 # decode above drops the ready count and packs its header one word shorter).
@@ -546,7 +551,7 @@ def _k4_persistent_smem_layout(
 class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
     """SM121 (GB10) non-cooperative K4 mixed-Trellis decode/verify kernel."""
 
-    K4_DECODE_VERSION = 6
+    K4_DECODE_VERSION = 7
 
     def __init__(
         self,
@@ -2260,7 +2265,11 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                 half_out_base + (row1 * Int32(40) + col_hi1) * Int32(2),
                 (acc[7][0] + f1_3) * global_scale_f32,
             )
-        cute.arch.sync_threads()
+        # The transpose writers (warps 0/1) are also the only readers of
+        # their own w_n fold half in the global-store loop, so a warp
+        # barrier suffices; the next CTA-wide barrier is the caller's
+        # tile/task boundary.
+        cute.arch.sync_warp()
 
         # Coalesced 16-byte global stores: warp 0 writes cols 0..31, warp 1 cols 32..63.
         if tid < Int32(64):
@@ -3173,14 +3182,32 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                         if loc_nt * Int32(tile_n) >= lw_t:
                                             active_tile = Int32(0)
                                 if active_tile != Int32(0):
+                                    rot_ready = (
+                                        (cache & Int32(_CACHE_ROT_READY_BIT))
+                                        != Int32(0)
+                                    ).to(Int32)
+                                    if rot_ready == Int32(0):
+                                        st_val = _ld_global_acquire_gpu_i32(
+                                            ws_state_base
+                                            + Int64(rb_t) * Int64(4)
+                                        )
+                                        if (
+                                            st_val & Int32(_ROT_MASK)
+                                        ) == Int32(rot_ready_val):
+                                            rot_ready = Int32(1)
+                                            cache = (
+                                                cache
+                                                | Int32(_CACHE_ROT_READY_BIT)
+                                            )
                                     action_d = Int32(_ACT_FC1)
                                     arg0_d = rb_t
                                     arg1_d = nt_t
-                                    # The GEMM starts its B prefetch before it
-                                    # polls the rotation-ready state bit, so the
-                                    # acquire wait hides behind weight traffic
-                                    # instead of sitting in the scheduler.
-                                    arg2_d = Int32(0)
+                                    # arg2 == 1 selects the stock no-wait
+                                    # prologue once the block's rotation has
+                                    # been observed complete; 0 keeps the
+                                    # GEMM's post-B-prefetch poll for the
+                                    # first tile that has to wait.
+                                    arg2_d = rot_ready
                                     got_work = Int32(1)
                                 else:
                                     old_st = _atomic_add_acq_rel_gpu_i32(
@@ -3228,13 +3255,31 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                     pdl_now = (
                                         t + persistent_ctas >= total_fc2_tasks
                                     ).to(Int32)
+                                    act_done = (
+                                        (cache & Int32(_CACHE_ACT_READY_BIT))
+                                        != Int32(0)
+                                    ).to(Int32)
+                                    if act_done == Int32(0):
+                                        st_val = _ld_global_acquire_gpu_i32(
+                                            ws_state_base
+                                            + Int64(rb_t) * Int64(4)
+                                        )
+                                        if (
+                                            st_val & Int32(_ACT_READY_BIT)
+                                        ) != Int32(0):
+                                            act_done = Int32(1)
+                                            cache = (
+                                                cache
+                                                | Int32(_CACHE_ACT_READY_BIT)
+                                            )
                                     action_d = Int32(_ACT_FC2)
                                     arg0_d = rb_t
                                     arg1_d = nt_t
-                                    # Activation-ready is polled inside the GEMM
-                                    # after its B prefetch; only the PDL launch
-                                    # hint rides in arg2.
-                                    arg2_d = pdl_now << Int32(1)
+                                    # act_done selects the stock no-wait
+                                    # prologue once the block's activation has
+                                    # been observed complete; bit 1 stays the
+                                    # PDL launch hint.
+                                    arg2_d = act_done | (pdl_now << Int32(1))
                                     got_work = Int32(1)
                             else:
                                 action_d = Int32(_ACT_EXIT)
@@ -3695,10 +3740,11 @@ class W4A16MixedTrellisK4Decode(W4A16MixedTrellisKernel):
                                 (old & Int32(_FC1_CNT_MASK)) + Int32(1)
                                 == fc1_tasks_per_block
                             ).to(Int32)
-                            # arg2 (the flags word) was zero for FC1 and was
-                            # already consumed by the GEMM; stash the last-tile
-                            # flag in its bit 2 so the packed scheduler cache in
-                            # word 4 stays intact for the next task.
+                            # arg2 (the flags word) held only FC1's readiness
+                            # flag and was already consumed by the GEMM; stash
+                            # the last-tile flag in its bit 2 so the packed
+                            # scheduler cache in word 4 stays intact for the
+                            # next task.
                             st_shared_i32(
                                 smem_base + Int32(ctrl_off + 12),
                                 is_last << Int32(2),
