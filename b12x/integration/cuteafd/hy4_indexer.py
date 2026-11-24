@@ -49,14 +49,17 @@ from b12x._lib.intrinsics import (
 )
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _fp8_scale
+from .context_split import _pair_before, _sort_pairs
 
 __all__ = [
     "HY4_FLASH_INDEXER",
     "Hy4IndexerGeometry",
     "compile_hy4_indexer_expand_slots_aot",
+    "compile_hy4_indexer_merge_expand_owned_aot",
     "compile_hy4_indexer_pool_group_aot",
     "compile_hy4_indexer_query_rope_aot",
     "compile_hy4_indexer_score_groups_aot",
+    "compile_hy4_indexer_scored_topk_aot",
     "compile_hy4_indexer_topk_expand_aot",
 ]
 
@@ -839,6 +842,502 @@ class _Hy4IndexerTopkExpand:
                 idx = idx + Int32(256)
             if tid == Int32(0):
                 lengths_out[row] = total_valid
+
+
+@cute.jit
+def _norm_score(val: Float32) -> Float32:
+    """Canonicalize -0.0 to +0.0 so score outputs and comparisons stay deterministic."""
+    return Float32(0.0) if val == Float32(0.0) else val
+
+
+class _Hy4IndexerScoredTopk:
+    """Per-shard deterministic top-511 scored candidate selector in global logical group coordinates.
+
+    For ``pos + 1 <= 2048`` or ``local_limits[row] <= 0`` emits ``(-inf, -1)`` without
+    reading ``scores``. Otherwise selects up to 511 local groups (radix select when
+    ``limit > 511``), maps each local group id ``lg`` to its global logical group id
+    ``((lg // 16) * page_stride + page_offset) * 16 + (lg % 16)``, pads slot 511 (and any
+    missing slots) with ``(-inf, -1)``, and sorts all 512 pairs in total
+    ``(score desc, global gid asc)`` order for bitonic merge across ranks.
+    """
+
+    def __init__(self, g: Hy4IndexerGeometry):
+        self.group_topk = g.group_topk      # 512
+        self.prior_k = g.group_topk - 1     # 511
+        self.candidate_topk = g.candidate_topk
+
+    def _storage(self):
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "hist": cute.struct.Align[cute.struct.MemRange[Int32, 256], 16],
+            "excl": cute.struct.Align[cute.struct.MemRange[Int32, 256], 16],
+            "warp_tot": cute.struct.Align[cute.struct.MemRange[Int32, 8], 16],
+            "sv": cute.struct.Align[cute.struct.MemRange[Float32, 512], 16],
+            "si": cute.struct.Align[cute.struct.MemRange[Int32, 512], 16],
+            "meta": cute.struct.Align[cute.struct.MemRange[Int32, 4], 16],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def __call__(
+        self,
+        scores: cute.Pointer,
+        positions: cute.Pointer,
+        local_limits: cute.Pointer,
+        out_scores: cute.Pointer,
+        out_indices: cute.Pointer,
+        rows: Int32,
+        score_stride: Int32,
+        page_stride: Int32,
+        page_offset: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            scores, positions, local_limits, out_scores, out_indices,
+            score_stride, page_stride, page_offset,
+        ).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        scores: cute.Pointer,
+        positions: cute.Pointer,
+        local_limits: cute.Pointer,
+        out_scores: cute.Pointer,
+        out_indices: cute.Pointer,
+        score_stride: Int32,
+        page_stride: Int32,
+        page_offset: Int32,
+    ):
+        row = Int64(cute.arch.block_idx()[0])
+        tid = Int32(cute.arch.thread_idx()[0])
+        warp = tid // Int32(32)
+        lane = tid % Int32(32)
+
+        smem = cutlass_utils.SmemAllocator()
+        st = smem.allocate(self._storage())
+        hist = st.hist.get_tensor(cute.make_layout((256,)))
+        excl = st.excl.get_tensor(cute.make_layout((256,)))
+        warp_tot = st.warp_tot.get_tensor(cute.make_layout((8,)))
+        sv = st.sv.get_tensor(cute.make_layout((512,)))
+        si = st.si.get_tensor(cute.make_layout((512,)))
+        meta = st.meta.get_tensor(cute.make_layout((4,)))
+        hist_addr = shared_ptr_to_u32(hist.iterator)
+
+        pos = Int32(positions[row])
+        seq_len = pos + Int32(1)
+        limit = Int32(local_limits[row])
+        out_base = row * Int64(self.group_topk)
+        score_base = row * Int64(score_stride)
+
+        if seq_len <= Int32(self.candidate_topk) or limit <= Int32(0):
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                out_scores[out_base + Int64(i)] = Float32(float("-inf"))
+                out_indices[out_base + Int64(i)] = Int32(-1)
+        elif limit <= Int32(self.prior_k):
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                if i < limit:
+                    val = _norm_score(Float32(scores[score_base + Int64(i)]))
+                    gid = ((i // Int32(_GROUPS_PER_PAGE)) * page_stride + page_offset) * Int32(_GROUPS_PER_PAGE) + (
+                        i % Int32(_GROUPS_PER_PAGE)
+                    )
+                    sv[i] = val
+                    si[i] = gid
+                else:
+                    sv[i] = Float32(float("-inf"))
+                    si[i] = Int32(-1)
+            cute.arch.sync_threads()
+            _sort_pairs(sv, si, 512, True)
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                out_scores[out_base + Int64(i)] = sv[i]
+                out_indices[out_base + Int64(i)] = si[i]
+        else:
+            prefix = Uint32(0)
+            mask = Uint32(0)
+            rem = Int32(self.prior_k)
+
+            for pass_idx in cutlass.range_constexpr(4):
+                shift = 24 - pass_idx * 8
+                hist[tid] = Int32(0)
+                cute.arch.sync_threads()
+                lg = tid
+                while lg < limit:
+                    k = _desc_key(Float32(scores[score_base + Int64(lg)]))
+                    if (k & mask) == prefix:
+                        bucket = Int32((k >> Uint32(shift)) & Uint32(0xFF))
+                        red_add_shared_i32(hist_addr + bucket * Int32(4), Int32(1))
+                    lg = lg + Int32(256)
+                cute.arch.sync_threads()
+
+                v = hist[tid]
+                s = v
+                for off in cutlass.range_constexpr(5):
+                    up = cute.arch.shuffle_sync_up(s, offset=1 << off)
+                    if lane >= Int32(1 << off):
+                        s = s + up
+                if lane == Int32(31):
+                    warp_tot[warp] = s
+                cute.arch.sync_threads()
+                if warp == Int32(0):
+                    wt = warp_tot[lane] if lane < Int32(8) else Int32(0)
+                    for off in cutlass.range_constexpr(3):
+                        up = cute.arch.shuffle_sync_up(wt, offset=1 << off)
+                        if lane >= Int32(1 << off):
+                            wt = wt + up
+                    if lane < Int32(8):
+                        warp_tot[lane] = wt
+                cute.arch.sync_threads()
+                warp_off = warp_tot[warp - Int32(1)] if warp > Int32(0) else Int32(0)
+                excl_val = warp_off + s - v
+                excl[tid] = excl_val
+                if excl_val < rem and excl_val + v >= rem:
+                    meta[0] = tid
+                    meta[1] = rem - excl_val
+                cute.arch.sync_threads()
+                chosen = Uint32(meta[0])
+                prefix = prefix | (chosen << Uint32(shift))
+                mask = mask | (Uint32(0xFF) << Uint32(shift))
+                rem = meta[1]
+
+            thresh = prefix
+            eq_needed = rem
+            eq_base = Int32(self.prior_k) - eq_needed
+            if tid == Int32(0):
+                meta[2] = Int32(0)
+                meta[3] = Int32(0)
+                sv[511] = Float32(float("-inf"))
+                si[511] = Int32(-1)
+            cute.arch.sync_threads()
+
+            scan_base = Int32(512)
+            base = Int32(0)
+            while base < limit:
+                lg = base + tid
+                is_strict = Int32(0)
+                is_eq = Int32(0)
+                val = Float32(float("-inf"))
+                if lg < limit:
+                    val = _norm_score(Float32(scores[score_base + Int64(lg)]))
+                    k = _desc_key(val)
+                    if k < thresh:
+                        is_strict = Int32(1)
+                    elif k == thresh:
+                        is_eq = Int32(1)
+                strict_start = meta[2]
+                eq_start = meta[3]
+                s = is_strict + is_eq * scan_base
+                for off in cutlass.range_constexpr(5):
+                    up = cute.arch.shuffle_sync_up(s, offset=1 << off)
+                    if lane >= Int32(1 << off):
+                        s = s + up
+                if lane == Int32(31):
+                    warp_tot[warp] = s
+                cute.arch.sync_threads()
+                if warp == Int32(0):
+                    wt = warp_tot[lane] if lane < Int32(8) else Int32(0)
+                    for off in cutlass.range_constexpr(3):
+                        up = cute.arch.shuffle_sync_up(wt, offset=1 << off)
+                        if lane >= Int32(1 << off):
+                            wt = wt + up
+                    if lane < Int32(8):
+                        warp_tot[lane] = wt
+                cute.arch.sync_threads()
+                packed_off = warp_tot[warp - Int32(1)] if warp > Int32(0) else Int32(0)
+                strict_off = packed_off % scan_base
+                eq_off = (packed_off // scan_base) % scan_base
+                if is_strict == Int32(1):
+                    local_strict = strict_off + (s % scan_base) - Int32(1)
+                    dst = strict_start + local_strict
+                    gid = ((lg // Int32(_GROUPS_PER_PAGE)) * page_stride + page_offset) * Int32(_GROUPS_PER_PAGE) + (
+                        lg % Int32(_GROUPS_PER_PAGE)
+                    )
+                    sv[dst] = val
+                    si[dst] = gid
+                if is_eq == Int32(1):
+                    local_eq = eq_off + ((s // scan_base) % scan_base) - Int32(1)
+                    rank_eq = eq_start + local_eq
+                    if rank_eq < eq_needed:
+                        dst = eq_base + rank_eq
+                        gid = ((lg // Int32(_GROUPS_PER_PAGE)) * page_stride + page_offset) * Int32(
+                            _GROUPS_PER_PAGE
+                        ) + (lg % Int32(_GROUPS_PER_PAGE))
+                        sv[dst] = val
+                        si[dst] = gid
+                if tid == Int32(255):
+                    meta[2] = strict_start + warp_tot[7] % scan_base
+                    meta[3] = eq_start + (warp_tot[7] // scan_base) % scan_base
+                cute.arch.sync_threads()
+                base = base + Int32(256)
+
+            _sort_pairs(sv, si, 512, True)
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                out_scores[out_base + Int64(i)] = sv[i]
+                out_indices[out_base + Int64(i)] = si[i]
+
+
+class _Hy4IndexerMergeExpandOwned:
+    """Bitonic-merge two shards' top-511 scored group candidates and expand owned physical slots.
+
+    For ``pos + 1 <= 2048`` never reads ``scores``/``indices``; emits every causal token
+    in ``[0, pos]`` whose logical page parity matches ``rank`` into compact ``local_slots``
+    and ``local_lengths``. For ``pos + 1 > 2048`` merges GPU0 ``[0..512)`` and GPU1
+    ``[512..1024)`` into the exact global top-511 prior groups, filters to groups owned by
+    ``rank`` in ascending logical group order, and expands them plus ``cur_group = pos // 4``
+    (if owned) into compact ``local_slots`` + ``local_lengths``.
+
+    When ``write_draft != 0``, also populates sparse global-position ``draft_slots [rows, 2048]``
+    with this rank's physical token slots at their exact global recall positions and ``-1`` for
+    peer-owned tokens, enabling zero-sync dual-rank DFly2 recall gather.
+    """
+
+    def __init__(self, g: Hy4IndexerGeometry):
+        self.group_topk = g.group_topk      # 512
+        self.prior_k = g.group_topk - 1     # 511
+        self.candidate_topk = g.candidate_topk
+        self.page_rows = g.page_rows        # 64
+
+    def _storage(self):
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "sv": cute.struct.Align[cute.struct.MemRange[Float32, 512], 16],
+            "si": cute.struct.Align[cute.struct.MemRange[Int32, 512], 16],
+            "owned": cute.struct.Align[cute.struct.MemRange[Int32, 512], 16],
+            "meta": cute.struct.Align[cute.struct.MemRange[Int32, 2], 16],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def __call__(
+        self,
+        scores: cute.Pointer,
+        indices: cute.Pointer,
+        positions: cute.Pointer,
+        page_table: cute.Pointer,
+        local_slots: cute.Pointer,
+        local_lengths: cute.Pointer,
+        draft_slots: cute.Pointer,
+        rows: Int32,
+        table_stride: Int32,
+        rank: Int32,
+        write_draft: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            scores, indices, positions, page_table, local_slots, local_lengths, draft_slots,
+            table_stride, rank, write_draft,
+        ).launch(grid=(rows, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        scores: cute.Pointer,
+        indices: cute.Pointer,
+        positions: cute.Pointer,
+        page_table: cute.Pointer,
+        local_slots: cute.Pointer,
+        local_lengths: cute.Pointer,
+        draft_slots: cute.Pointer,
+        table_stride: Int32,
+        rank: Int32,
+        write_draft: Int32,
+    ):
+        row = Int64(cute.arch.block_idx()[0])
+        tid = Int32(cute.arch.thread_idx()[0])
+
+        smem = cutlass_utils.SmemAllocator()
+        st = smem.allocate(self._storage())
+        sv = st.sv.get_tensor(cute.make_layout((512,)))
+        si = st.si.get_tensor(cute.make_layout((512,)))
+        owned = st.owned.get_tensor(cute.make_layout((512,)))
+        meta = st.meta.get_tensor(cute.make_layout((2,)))
+
+        pos = Int32(positions[row])
+        seq_len = pos + Int32(1)
+        out_base = row * Int64(self.candidate_topk)
+        pt_base = row * Int64(table_stride)
+
+        if seq_len <= Int32(self.candidate_topk):
+            full_pairs = seq_len // Int32(128)
+            pair_rem = seq_len % Int32(128)
+            extra = Int32(0)
+            if rank == Int32(0):
+                extra = pair_rem if pair_rem < Int32(64) else Int32(64)
+            else:
+                extra = (pair_rem - Int32(64)) if pair_rem > Int32(64) else Int32(0)
+            owned_len = full_pairs * Int32(64) + extra
+
+            idx = tid
+            while idx < Int32(self.candidate_topk):
+                if idx < owned_len:
+                    local_page = idx // Int32(64)
+                    off = idx % Int32(64)
+                    phys_page = Int64(page_table[pt_base + Int64(local_page)])
+                    local_slots[out_base + Int64(idx)] = Int32(phys_page * Int64(64) + Int64(off))
+                else:
+                    local_slots[out_base + Int64(idx)] = Int32(-1)
+                idx = idx + Int32(256)
+            if tid == Int32(0):
+                local_lengths[row] = owned_len
+
+            if write_draft != Int32(0):
+                idx = tid
+                while idx < Int32(self.candidate_topk):
+                    slot_val = Int32(-1)
+                    if idx < seq_len:
+                        logical_page = idx // Int32(64)
+                        if logical_page % Int32(2) == rank:
+                            phys_page = Int64(page_table[pt_base + Int64(logical_page // Int32(2))])
+                            slot_val = Int32(phys_page * Int64(64) + Int64(idx % Int32(64)))
+                    draft_slots[out_base + Int64(idx)] = slot_val
+                    idx = idx + Int32(256)
+        else:
+            # Bitonic compare-exchange: A[0..512) + reverse(B[512..1024)) -> exact global top-512.
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                a = row * Int64(1024) + Int64(i)
+                b = row * Int64(1024) + Int64(1023) - Int64(i)
+                ai, av = Int32(indices[a]), Float32(scores[a])
+                bi, bv = Int32(indices[b]), Float32(scores[b])
+                si[i], sv[i] = bi, bv
+                if _pair_before(av, ai, bv, bi):
+                    si[i], sv[i] = ai, av
+            cute.arch.sync_threads()
+            _sort_pairs(sv, si, 512, True, True)
+
+            # Filter exact global top-511 prior groups (indices 0..510) to this rank's parity.
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                gid = Int32(si[i]) if i < Int32(self.prior_k) else Int32(-1)
+                if gid >= Int32(0) and ((gid // Int32(_GROUPS_PER_PAGE)) % Int32(2) != rank):
+                    gid = Int32(-1)
+                owned[i] = gid
+            if tid == Int32(0):
+                meta[0] = Int32(0)
+            cute.arch.sync_threads()
+            _sort_pairs(sv, owned, 512, False)
+
+            for slot in cutlass.range_constexpr(2):
+                i = tid + Int32(slot * 256)
+                g_cur = Int32(owned[i])
+                if g_cur >= Int32(0):
+                    if i == Int32(511):
+                        meta[0] = Int32(512)
+                    elif Int32(owned[i + Int32(1)]) < Int32(0):
+                        meta[0] = i + Int32(1)
+            cute.arch.sync_threads()
+            owned_groups = Int32(meta[0])
+
+            cur_group = pos // Int32(4)
+            cur_valid_all = (pos % Int32(4)) + Int32(1)
+            cur_owned = Int32(1) if ((cur_group // Int32(_GROUPS_PER_PAGE)) % Int32(2) == rank) else Int32(0)
+            cur_valid = cur_valid_all if cur_owned != Int32(0) else Int32(0)
+            prior_tokens = owned_groups * Int32(4)
+            total_local = prior_tokens + cur_valid
+
+            idx = tid
+            while idx < Int32(self.candidate_topk):
+                if idx < prior_tokens:
+                    g_i = idx // Int32(4)
+                    sub = idx % Int32(4)
+                    gid = Int32(owned[g_i])
+                    local_page = gid // Int32(32)
+                    tok_in_page = (gid % Int32(_GROUPS_PER_PAGE)) * Int32(4) + sub
+                    phys_page = Int64(page_table[pt_base + Int64(local_page)])
+                    local_slots[out_base + Int64(idx)] = Int32(phys_page * Int64(64) + Int64(tok_in_page))
+                elif idx < total_local:
+                    sub = idx - prior_tokens
+                    local_page = cur_group // Int32(32)
+                    tok_in_page = (cur_group % Int32(_GROUPS_PER_PAGE)) * Int32(4) + sub
+                    phys_page = Int64(page_table[pt_base + Int64(local_page)])
+                    local_slots[out_base + Int64(idx)] = Int32(phys_page * Int64(64) + Int64(tok_in_page))
+                else:
+                    local_slots[out_base + Int64(idx)] = Int32(-1)
+                idx = idx + Int32(256)
+            if tid == Int32(0):
+                local_lengths[row] = total_local
+
+            if write_draft != Int32(0):
+                prior_all = Int32(self.prior_k * 4)
+                total_all = prior_all + cur_valid_all
+                idx = tid
+                while idx < Int32(self.candidate_topk):
+                    slot_val = Int32(-1)
+                    if idx < prior_all:
+                        g_i = idx // Int32(4)
+                        sub = idx % Int32(4)
+                        gid = Int32(si[g_i])
+                        if gid >= Int32(0) and ((gid // Int32(_GROUPS_PER_PAGE)) % Int32(2) == rank):
+                            local_page = gid // Int32(32)
+                            tok_in_page = (gid % Int32(_GROUPS_PER_PAGE)) * Int32(4) + sub
+                            phys_page = Int64(page_table[pt_base + Int64(local_page)])
+                            slot_val = Int32(phys_page * Int64(64) + Int64(tok_in_page))
+                    elif idx < total_all:
+                        sub = idx - prior_all
+                        if cur_owned != Int32(0):
+                            local_page = cur_group // Int32(32)
+                            tok_in_page = (cur_group % Int32(_GROUPS_PER_PAGE)) * Int32(4) + sub
+                            phys_page = Int64(page_table[pt_base + Int64(local_page)])
+                            slot_val = Int32(phys_page * Int64(64) + Int64(tok_in_page))
+                    draft_slots[out_base + Int64(idx)] = slot_val
+                    idx = idx + Int32(256)
+
+
+def compile_hy4_indexer_scored_topk_aot(g: Hy4IndexerGeometry = HY4_FLASH_INDEXER):
+    operands = (
+        Operand("scores", torch.float32, "[rows,score_stride]", align=4),
+        Operand("positions", torch.int32, "[rows]", align=4),
+        Operand("local_limits", torch.int32, "[rows]", align=4),
+        Operand("out_scores", torch.float32, f"[rows,{g.group_topk}]", "out", align=4),
+        Operand("out_indices", torch.int32, f"[rows,{g.group_topk}]", "out", align=4),
+    )
+    return compile_program(
+        _Hy4IndexerScoredTopk(g),
+        name="hy4_indexer_scored_topk",
+        operands=operands,
+        scalars=(
+            Scalar("rows"),
+            Scalar("score_stride"),
+            Scalar("page_stride"),
+            Scalar("page_offset"),
+        ),
+        key=(g, "scored_topk"),
+        geometry={**vars(g), "prior_k": g.group_topk - 1},
+        doc=_Hy4IndexerScoredTopk.__doc__,
+    )
+
+
+def compile_hy4_indexer_merge_expand_owned_aot(g: Hy4IndexerGeometry = HY4_FLASH_INDEXER):
+    operands = (
+        Operand("scores", torch.float32, f"[rows,{2 * g.group_topk}]", align=4),
+        Operand("indices", torch.int32, f"[rows,{2 * g.group_topk}]", align=4),
+        Operand("positions", torch.int32, "[rows]", align=4),
+        Operand("page_table", torch.int32, "[rows,table_stride]", align=4),
+        Operand("local_slots", torch.int32, f"[rows,{g.candidate_topk}]", "out", align=4),
+        Operand("local_lengths", torch.int32, "[rows]", "out", align=4),
+        Operand("draft_slots", torch.int32, f"[rows,{g.candidate_topk}]", "out", align=4),
+    )
+    return compile_program(
+        _Hy4IndexerMergeExpandOwned(g),
+        name="hy4_indexer_merge_expand_owned",
+        operands=operands,
+        scalars=(
+            Scalar("rows"),
+            Scalar("table_stride"),
+            Scalar("rank"),
+            Scalar("write_draft"),
+        ),
+        key=(g, "merge_expand_owned"),
+        geometry={**vars(g), "prior_k": g.group_topk - 1},
+        doc=_Hy4IndexerMergeExpandOwned.__doc__,
+    )
 
 
 def compile_hy4_indexer_topk_expand_aot(g: Hy4IndexerGeometry = HY4_FLASH_INDEXER):

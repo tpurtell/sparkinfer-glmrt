@@ -30,18 +30,22 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32, fabs_f32, fmax_f32
 from b12x.attention.dense_mla._forward import DenseMlaForwardKernel
-from b12x.attention.dense_mla._layout import choose_layout
+from b12x.attention.dense_mla._layout import choose_layout, make_smem_layout
 from b12x.attention.dense_mla._merge import DenseMlaMergeKernel
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import BatchedBf16Gemm, _bf16, _block_sum, _fp8_scale, _reduction_storage, _rsqrt, _warp_max
+from .kimi_mla import _ContextPartialMerge
 
 __all__ = [
     "Hy4MlaGeometry",
     "compile_hy4_mla_attention_aot",
+    "compile_hy4_mla_dsa_partial_aot",
+    "compile_hy4_mla_gate_uv_aot",
     "compile_hy4_mla_q_absorb_aot",
     "compile_hy4_mla_rank_norm_pack_aot",
     "compile_hy4_mla_sink_gate_uv_aot",
     "hy4_attention_layout",
+    "hy4_dsa_partial_scratch_bytes",
 ]
 
 
@@ -115,6 +119,18 @@ def hy4_attention_layout(g: Hy4MlaGeometry, rows: int, *, max_context: int, mode
         partial_lse_bytes=lse,
         scratch_bytes=part + lse,
     )
+
+
+def hy4_dsa_partial_scratch_bytes(
+    rows: int,
+    *,
+    head_count: int = 16,
+    num_splits: int = 16,
+    row_chunk_size: int = 64,
+) -> int:
+    chunk_rows = min(max(int(rows), 1), int(row_chunk_size))
+    n = chunk_rows * int(head_count) * int(num_splits)
+    return _align(n * 512 * 2) + _align(n * 4)
 
 
 class _Hy4RankNormPack:
@@ -348,6 +364,226 @@ class _Hy4SinkGateUv:
         self.mul(out, gate, lse, sink, out, rows, stream)
 
 
+class _Hy4GateMul:
+    """Apply sigmoid(gate) to UV output when sink was already folded by lse_combine2."""
+
+    def __init__(self, heads: int, v_dim: int = 256):
+        self.heads = heads
+        self.v_dim = v_dim
+
+    @cute.jit
+    def __call__(
+        self,
+        uv: cute.Pointer,
+        gate: cute.Pointer,
+        out: cute.Pointer,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(uv, gate, out).launch(
+            grid=(rows, self.heads, 1), block=(self.v_dim, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, uv: cute.Pointer, gate: cute.Pointer, out: cute.Pointer):
+        row = Int64(cute.arch.block_idx()[0])
+        head = Int64(cute.arch.block_idx()[1])
+        d = Int64(cute.arch.thread_idx()[0])
+        rh = row * Int64(self.heads) + head
+        idx = rh * Int64(self.v_dim) + d
+        g_val = Float32(gate[idx])
+        g_sig = Float32(1.0) / (Float32(1.0) + cute.math.exp(-g_val, fastmath=False))
+        out[idx] = (Float32(uv[idx]) * g_sig).to(BFloat16)
+
+
+class _Hy4GateUv:
+    def __init__(self, g: Hy4MlaGeometry):
+        self.uv = BatchedBf16Gemm(
+            n=256, k=512, batch=g.heads,
+            a_row=g.heads * 512, a_batch=512,
+            o_row=g.heads * 256, o_batch=256,
+        )
+        self.mul = _Hy4GateMul(g.heads, 256)
+
+    @cute.jit
+    def __call__(
+        self,
+        attn: cute.Pointer,
+        w_uv: cute.Pointer,
+        gate: cute.Pointer,
+        out: cute.Pointer,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        self.uv(attn, w_uv, out, rows, stream)
+        self.mul(out, gate, out, rows, stream)
+
+
+class _Hy4DsaPartial:
+    """Sink-free DSA partial over owned page_size=1 slots with base-2 FP32 LSE.
+
+    Reads a [head_begin, head_begin + head_count) slice from the full 32-head query
+    and writes compact [rows, head_count, 512] BF16 partial output plus base-2 FP32
+    LSE [rows, head_count]. Empty rows (cache_seqlens[r] == 0) emit zero and -inf.
+    """
+
+    def __init__(
+        self,
+        g: Hy4MlaGeometry,
+        *,
+        head_begin: int,
+        head_count: int,
+        num_splits: int,
+        heads_per_tile: int = 8,
+    ):
+        self.g = g
+        self.begin = int(head_begin)
+        self.heads = int(head_count)
+        self.splits = int(num_splits)
+        self.smem = make_smem_layout(query_tile=1, fp8=False, heads_per_tile=heads_per_tile)
+        chunks_total = (2048 + self.smem.candidates_per_chunk - 1) // self.smem.candidates_per_chunk
+        self.chunks_per_split = (chunks_total + self.splits - 1) // self.splits
+        self.forward = DenseMlaForwardKernel(
+            layout=self.smem,
+            page_size=1,
+            num_heads=self.heads,
+            num_splits=self.splits,
+            chunks_per_split=self.chunks_per_split,
+            query_tile=1,
+            fp8=False,
+            qk_dim=576,
+            value_dim=512,
+            window_size=None,
+            noncausal_block=False,
+            ds_mla_record=(g.kv_cache == "fp8"),
+            dynamic_split_chunks=True,
+            singleton_requests=True,
+        )
+        self.merge = _ContextPartialMerge(self.heads, self.splits)
+
+    @cute.jit
+    def run_partial(
+        self,
+        query: cute.Pointer,
+        kv_cache: cute.Pointer,
+        page_table: cute.Pointer,
+        cache_seqlens: cute.Pointer,
+        cu_seqlens_q: cute.Pointer,
+        attn: cute.Pointer,
+        lse: cute.Pointer,
+        scratch: cute.Pointer,
+        rows: Int32,
+        page_table_width: Int64,
+        active_splits: Int32,
+        stream: cuda.CUstream,
+    ):
+        g, h, s = self.g, self.heads, self.splits
+        # DenseMlaForwardKernel only writes base-2 partial_lse when active_splits > 1;
+        # clamp to [2, s] so single-split natural-log final output can never leak onto the wire.
+        splits = active_splits if active_splits >= Int32(2) else Int32(2)
+        if splits > Int32(s):
+            splits = Int32(s)
+        q = cute.make_tensor(
+            cute.recast_ptr(query + Int64(self.begin * 576), dtype=cutlass.Uint8),
+            cute.make_layout((1,)),
+        )
+        kv = cute.make_tensor(cute.recast_ptr(kv_cache, dtype=cutlass.Uint8), cute.make_layout((1,)))
+        table = cute.make_tensor(page_table, cute.make_layout((Int64(rows) * page_table_width,)))
+        lengths = cute.make_tensor(cache_seqlens, cute.make_layout((rows,)))
+        cu = cute.make_tensor(cu_seqlens_q, cute.make_layout((rows + Int32(1),)))
+        out = cute.make_tensor(attn, cute.make_layout((rows, h, 512), stride=(h * 512, 512, 1)))
+        lo = cute.make_tensor(lse, cute.make_layout((rows, h), stride=(h, 1)))
+        po = cute.make_tensor(
+            cute.recast_ptr(scratch, dtype=BFloat16),
+            cute.make_layout((rows, h, s, 512), stride=(h * s * 512, s * 512, 512, 1)),
+        )
+        pl_ptr = cute.make_ptr(
+            Float32,
+            Int64(scratch.toint()) + _offset(Int64(rows) * Int64(h * s * 512 * 2)),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        pl = cute.make_tensor(pl_ptr, cute.make_layout((rows, h, s), stride=(h * s, s, 1)))
+        self.forward(
+            q, kv, table, lengths, cu, out, lo, po, pl, lo, lo,
+            Float32(g.softmax_scale * math.log2(math.e)),
+            Int64(g.heads * 576 * 2),
+            Int64(576 * 2),
+            Int64(g.record_bytes),
+            Int64(g.record_bytes),
+            page_table_width,
+            rows,
+            rows,
+            splits,
+            stream,
+        )
+        self.merge(po, pl, attn, lse, rows, splits, stream)
+
+
+class _Hy4DsaPartialChunks(_Hy4DsaPartial):
+    def __init__(
+        self,
+        g: Hy4MlaGeometry,
+        *,
+        max_rows: int,
+        head_begin: int,
+        head_count: int,
+        num_splits: int,
+        row_chunk_size: int,
+        heads_per_tile: int = 8,
+    ):
+        self.row_chunk_size = min(int(max_rows), int(row_chunk_size))
+        super().__init__(
+            g,
+            head_begin=head_begin,
+            head_count=head_count,
+            num_splits=num_splits,
+            heads_per_tile=heads_per_tile,
+        )
+
+    def scratch_bytes(self, rows: int) -> int:
+        return hy4_dsa_partial_scratch_bytes(
+            rows,
+            head_count=self.heads,
+            num_splits=self.splits,
+            row_chunk_size=self.row_chunk_size,
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        query: cute.Pointer,
+        kv_cache: cute.Pointer,
+        page_table: cute.Pointer,
+        cache_seqlens: cute.Pointer,
+        cu_seqlens_q: cute.Pointer,
+        attn: cute.Pointer,
+        lse: cute.Pointer,
+        scratch: cute.Pointer,
+        rows: Int32,
+        page_table_width: Int64,
+        active_splits: Int32,
+        stream: cuda.CUstream,
+    ):
+        for first in cutlass.range(0, rows, self.row_chunk_size):
+            count = min(Int32(self.row_chunk_size), rows - first)
+            row = Int64(first)
+            self.run_partial(
+                query + row * Int64(self.g.heads * 576),
+                kv_cache,
+                page_table + row * page_table_width,
+                cache_seqlens + row,
+                cu_seqlens_q,
+                attn + row * Int64(self.heads * 512),
+                lse + row * Int64(self.heads),
+                scratch,
+                count,
+                page_table_width,
+                active_splits,
+                stream,
+            )
+
+
 class _Hy4Attention:
     def __init__(self, g: Hy4MlaGeometry, rows: int, max_context: int, mode: str, *, page_size: int):
         self.g = g
@@ -494,6 +730,108 @@ def compile_hy4_mla_sink_gate_uv_aot(g: Hy4MlaGeometry):
         key=(g.heads, "sink_gate_uv"),
         geometry={"heads": g.heads, "v_head_dim": 256, "kv_lora_rank": 512},
         doc=__doc__,
+    )
+
+
+def compile_hy4_mla_gate_uv_aot(g: Hy4MlaGeometry):
+    operands = (
+        Operand("attn", torch.bfloat16, f"[rows,{g.heads},512]"),
+        Operand("w_uv", torch.bfloat16, f"[{g.heads},256,512]"),
+        Operand("gate", torch.bfloat16, f"[rows,{g.heads},256]"),
+        Operand("out", torch.bfloat16, f"[rows,{g.heads},256]", "out"),
+    )
+    return compile_program(
+        _Hy4GateUv(g),
+        name=f"hy4_mla_gate_uv_h{g.heads}",
+        operands=operands,
+        scalars=(Scalar("rows"),),
+        key=(g.heads, "gate_uv"),
+        geometry={"heads": g.heads, "v_head_dim": 256, "kv_lora_rank": 512},
+        doc=__doc__,
+    )
+
+
+def compile_hy4_mla_dsa_partial_aot(
+    g: Hy4MlaGeometry,
+    *,
+    max_rows: int = 4096,
+    head_begin: int = 0,
+    head_count: int = 16,
+    num_splits: int = 16,
+    row_chunk_size: int = 64,
+):
+    """Sink-free Hy4 DSA ContextSplit partial + base-2 FP32 LSE over owned page_size=1 slots.
+
+    For every DSA layer on 2 GPUs, each rank launches both ``head_begin=0`` and ``head_begin=16``
+    over its own parity-owned pages (32 heads total over local context), keeps its own 16-head
+    partial, and pushes the peer's 16-head partial before ``lse_combine2(heads=16, has_sink=True)``.
+    ``active_splits`` is clamped to ``[2, num_splits]`` at launch so base-2 partial LSE is always
+    emitted. Empty rows (``cache_seqlens[r] == 0``) produce zero output and ``-inf`` LSE.
+    """
+    if g.heads != 32 or g.window_size is not None:
+        raise ValueError("Hy4 DSA partial requires 32-head full-context DSA geometry")
+    if head_begin not in (0, 16) or head_count != 16:
+        raise ValueError("Hy4 DSA partial requires head_begin in (0, 16) and head_count == 16")
+    if num_splits != 16:
+        raise ValueError("Hy4 DSA partial requires num_splits == 16")
+    if not 1 <= int(max_rows) <= 4096 or not 1 <= int(row_chunk_size) <= 4096:
+        raise ValueError("Hy4 DSA partial requires 1 <= max_rows, row_chunk_size <= 4096")
+    launch = _Hy4DsaPartialChunks(
+        g,
+        max_rows=int(max_rows),
+        head_begin=int(head_begin),
+        head_count=int(head_count),
+        num_splits=int(num_splits),
+        row_chunk_size=int(row_chunk_size),
+    )
+    operands = (
+        Operand("query", torch.bfloat16, "[rows,32,576]"),
+        Operand(
+            "kv_cache",
+            torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
+            "[pool_tokens,656]" if g.kv_cache == "fp8" else "[pool_tokens,576]",
+        ),
+        Operand("page_table", torch.int32, "[rows,page_table_width]", align=4),
+        Operand("cache_seqlens", torch.int32, "[rows]", align=4),
+        Operand("cu_seqlens_q", torch.int32, "[rows+1]", align=4),
+        Operand("attn", torch.bfloat16, f"[rows,{head_count},512]", "out"),
+        Operand("lse", torch.float32, f"[rows,{head_count}]", "out", align=4),
+        Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch"),
+    )
+    return compile_program(
+        launch,
+        name=f"hy4_mla_dsa_partial_{g.kv_cache}_h{head_begin}",
+        operands=operands,
+        scalars=(Scalar("rows"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
+        key=(
+            g,
+            int(max_rows),
+            int(head_begin),
+            int(head_count),
+            int(num_splits),
+            launch.row_chunk_size,
+            launch.smem.query_tile,
+            launch.smem.kv_stages,
+            launch.smem.heads_per_tile,
+            launch.smem.candidates_per_chunk,
+            launch.smem.math_warps_per_query,
+            "dsa_partial_base2",
+        ),
+        geometry={
+            **vars(g),
+            "head_begin": int(head_begin),
+            "head_count": int(head_count),
+            "heads_per_tile": launch.smem.heads_per_tile,
+            "num_splits": int(num_splits),
+            "chunks_per_split": launch.chunks_per_split,
+            "max_rows": int(max_rows),
+            "topk": 2048,
+            "page_size": 1,
+            "row_chunk_size": launch.row_chunk_size,
+            "lse_base": 2,
+        },
+        scratch={"scratch": launch.scratch_bytes},
+        doc=compile_hy4_mla_dsa_partial_aot.__doc__,
     )
 
 
