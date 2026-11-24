@@ -352,14 +352,24 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
                 lin_g, lin_u, scalars=(rows,))
     torch.cuda.synchronize()
 
-    # Exact-decode vs BF16-rounded-amax/weight reference on expert 0's row 0.
+    # Vendor-order exact-decode oracle on expert 0's row 0 (matches StreamNvfp4GateUpDyn):
+    # 1. Exact dyadic (e2m1 * e4m3) grid dot product summed in F64 and verified exact in F32.
+    # 2. Epilogue folded in F32: acc * (x_amax * (w_amax / (1536 * DENOM))), then single BF16 round.
     x_q_ref, x_s_ref, x_amax_ref, x_recon_ref = _reference_quantize_nvfp4_exact(x[:1].float())
-    w1_grid, w1_outer_exact = small_nvfp4._grid_expert(m1, 0, "cuda")
-    w3_grid, w3_outer_exact = small_nvfp4._grid_expert(m3, 0, "cuda")
-    w1_exact = w1_grid * w1_outer_exact
-    w3_exact = w3_grid * w3_outer_exact
-    gate_exact = (x_recon_ref.double() @ w1_exact.T).float().bfloat16()
-    up_exact = (x_recon_ref.double() @ w3_exact.T).float().bfloat16()
+    x_grid_ref = x_recon_ref.double() * (1536.0 / x_amax_ref.double()[:, None])
+    w1_grid, _ = small_nvfp4._grid_expert(m1, 0, "cuda")
+    w3_grid, _ = small_nvfp4._grid_expert(m3, 0, "cuda")
+    acc_gate_f64 = x_grid_ref @ w1_grid.T
+    acc_up_f64 = x_grid_ref @ w3_grid.T
+    acc_gate_f32 = acc_gate_f64.float()
+    acc_up_f32 = acc_up_f64.float()
+    assert torch.equal(acc_gate_f32.double(), acc_gate_f64) and torch.equal(acc_up_f32.double(), acc_up_f64), (
+        "32-column dyadic NVFP4 grid accumulation must be exact in F32"
+    )
+    expert_factor = exact_amax[0] / torch.tensor(1536.0 * DENOM, dtype=torch.float32, device="cuda")
+    row_factor = x_amax_ref * expert_factor
+    gate_exact = (acc_gate_f32 * row_factor[:, None]).bfloat16()
+    up_exact = (acc_up_f32 * row_factor[:, None]).bfloat16()
     act_exact = small_nvfp4._situ(gate_exact, up_exact, torch.ones(1, device="cuda"), g.situ_gate_cap, g.situ_up_cap)
     aq_exact, as_exact, aamax_exact, _ = _reference_quantize_nvfp4_exact(act_exact.float())
 
@@ -388,50 +398,61 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     kernel_as = a_s[slot_idx : slot_idx + 1]
     kernel_aamax = aamax[slot_idx : slot_idx + 1]
 
-    flipped_bug_codes = int((aq_exact != aq_bug).sum().item())
-    flipped_bug_scales = int((as_exact != as_bug).sum().item())
-    gate_bug_max = float((gate_exact.float() - gate_bug.float()).abs().max().item())
-    assert flipped_bug_codes > 0 or flipped_bug_scales > 0, (
-        "negative control failed to fire: BF16 amax/weight rounding did not flip any NVFP4 act codes"
-    )
-    assert gate_bug_max > 0.0, "negative control expected nonzero FC1 divergence from BF16 rounding"
-
-    def _diff_summary(label: str, actual: torch.Tensor, expected: torch.Tensor) -> str:
+    def _bf16_metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict:
         mask = actual != expected
         n_diff = int(mask.sum().item())
         max_abs = float((actual.float() - expected.float()).abs().max().item())
+        ulp_m = small_nvfp4._bf16_ulps(actual.float(), expected.float())
+        if actual.dtype == torch.bfloat16 and expected.dtype == torch.bfloat16 and n_diff > 0:
+            au = actual.view(torch.uint16).to(torch.int32)
+            eu = expected.view(torch.uint16).to(torch.int32)
+            single_lsb = bool(((au[mask] - eu[mask]).abs() == 1).all().item())
+        else:
+            single_lsb = True
         sample = []
         for idx in mask.nonzero(as_tuple=False)[:5].tolist():
             t = tuple(idx)
             sample.append((t, float(actual[t].float().item()), float(expected[t].float().item())))
-        return f"{label}: n_diff={n_diff}/{actual.numel()} max_abs={max_abs:.6e} sample={sample}"
+        return dict(n_diff=n_diff, total=actual.numel(), max_abs=max_abs, max_ulp=ulp_m["ulp"],
+                    single_lsb=single_lsb, sample=sample)
 
-    gate_diff_n = int((kernel_gate != gate_exact[0]).sum().item())
-    gate_diff_max = float((kernel_gate.float() - gate_exact[0].float()).abs().max().item())
-    up_diff_n = int((kernel_up != up_exact[0]).sum().item())
-    up_diff_max = float((kernel_up.float() - up_exact[0].float()).abs().max().item())
-    assert torch.equal(xamax[slot_idx : slot_idx + 1], x_amax_ref), _diff_summary("xamax", xamax[slot_idx : slot_idx + 1], x_amax_ref)
-    assert torch.equal(xs[slot_idx], x_s_ref[0]), _diff_summary("xs", xs[slot_idx], x_s_ref[0])
-    assert torch.equal(xq[slot_idx], x_q_ref[0]), _diff_summary("xq", xq[slot_idx], x_q_ref[0])
-    assert torch.equal(kernel_gate, lin_g[pos0]), _diff_summary("exch_gate vs lin_g", kernel_gate, lin_g[pos0])
+    def _fmt(label: str, m: dict) -> str:
+        return (f"{label}: n_diff={m['n_diff']}/{m['total']} max_abs={m['max_abs']:.6e} "
+                f"max_ulp={m['max_ulp']:.2f} single_bf16_lsb_only={m['single_lsb']} sample={m['sample']}")
+
+    flipped_bug_codes = int((aq_exact != aq_bug).sum().item())
+    flipped_bug_scales = int((as_exact != as_bug).sum().item())
+    bug_gate_m = _bf16_metrics(gate_bug[0], gate_exact[0])
+    assert flipped_bug_codes > 0 or flipped_bug_scales > 0, (
+        "negative control failed to fire: BF16 amax/weight rounding did not flip any NVFP4 act codes"
+    )
+    assert bug_gate_m["max_ulp"] > 1.0 and bug_gate_m["n_diff"] > 0, (
+        f"negative control must diverge strictly beyond 1 BF16 ULP: {_fmt('gate_bug vs gate_exact', bug_gate_m)}"
+    )
+
+    gate_m = _bf16_metrics(kernel_gate, gate_exact[0])
+    up_m = _bf16_metrics(kernel_up, up_exact[0])
+    assert torch.equal(xamax[slot_idx : slot_idx + 1], x_amax_ref), _fmt("xamax", _bf16_metrics(xamax[slot_idx : slot_idx + 1], x_amax_ref))
+    assert torch.equal(xs[slot_idx], x_s_ref[0]), _fmt("xs", _bf16_metrics(xs[slot_idx], x_s_ref[0]))
+    assert torch.equal(xq[slot_idx], x_q_ref[0]), _fmt("xq", _bf16_metrics(xq[slot_idx], x_q_ref[0]))
+    assert torch.equal(kernel_gate, lin_g[pos0]), _fmt("exch_gate vs lin_g", _bf16_metrics(kernel_gate, lin_g[pos0]))
     assert torch.equal(kernel_gate, gate_exact[0]), (
-        f"kernel FC1 gate must match exact F32 decode bit-for-bit ({_diff_summary('kernel_gate vs gate_exact', kernel_gate, gate_exact[0])}; "
-        f"vs gate_bug: {_diff_summary('kernel_gate vs gate_bug', kernel_gate, gate_bug[0])})"
+        f"kernel FC1 gate must match vendor-order exact-decode oracle bit-for-bit "
+        f"({_fmt('kernel_gate vs gate_exact', gate_m)}; {_fmt('gate_bug vs gate_exact', bug_gate_m)})"
     )
     assert torch.equal(kernel_up, up_exact[0]), (
-        f"kernel FC1 up must match exact F32 decode bit-for-bit ({_diff_summary('kernel_up vs up_exact', kernel_up, up_exact[0])})"
+        f"kernel FC1 up must match vendor-order exact-decode oracle bit-for-bit ({_fmt('kernel_up vs up_exact', up_m)})"
     )
-    assert torch.equal(kernel_aamax, aamax_exact), _diff_summary("aamax", kernel_aamax, aamax_exact)
-    assert torch.equal(kernel_as, as_exact), _diff_summary("a_s", kernel_as, as_exact)
-    assert torch.equal(kernel_aq, aq_exact), _diff_summary("aq", kernel_aq, aq_exact)
+    assert torch.equal(kernel_aamax, aamax_exact), _fmt("aamax", _bf16_metrics(kernel_aamax, aamax_exact))
+    assert torch.equal(kernel_as, as_exact), _fmt("a_s", _bf16_metrics(kernel_as, as_exact))
+    assert torch.equal(kernel_aq, aq_exact), _fmt("aq", _bf16_metrics(kernel_aq, aq_exact))
     assert not torch.equal(kernel_aq, aq_bug) or not torch.equal(kernel_as, as_bug), (
         "kernel unexpectedly matched BF16-rounded path"
     )
-    print(f"inkling2_mini nvfp4 exact-decode negative control PASSED: "
-          f"kernel vs exact-decode gate={gate_diff_n}/{i} diffs (max|d|={gate_diff_max:.4e}), "
-          f"up={up_diff_n}/{i} diffs (max|d|={up_diff_max:.4e}), aq/as=0/0 diffs; "
-          f"BF16-rounded negative control flipped {flipped_bug_codes} packed code bytes / "
-          f"{flipped_bug_scales} scale bytes (max|d_fc1|={gate_bug_max:.4e})")
+    print(f"inkling2_mini nvfp4 exact-decode negative control PASSED (branch=exact-F32-accum bit-exact): "
+          f"{_fmt('gate', gate_m)}; {_fmt('up', up_m)}; aq/as=0/0 diffs; "
+          f"BF16-rounded negative control: {_fmt('gate_bug', bug_gate_m)}, "
+          f"flipped {flipped_bug_codes} packed code bytes / {flipped_bug_scales} scale bytes")
 
 
 def test_inkling2_mini_nvfp4_geometry():
