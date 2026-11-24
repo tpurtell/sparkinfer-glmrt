@@ -66,6 +66,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
     u32_as_f32,
 )
+from b12x._lib.utils import runtime_num_sm
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _fp8_scale
@@ -132,11 +133,6 @@ def _warp_max(v: Float32) -> Float32:
         other = cute.arch.shuffle_sync_bfly(v, offset=1 << shift)
         v = fmax_f32(v, other)
     return v
-
-
-def _device_sm_count() -> int:
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return max(int(getattr(props, "multi_processor_count", 0)), 1)
 
 
 class _Hy4IndexerQueryRope:
@@ -474,7 +470,6 @@ class _Hy4IndexerScoreGroups:
 
     def __init__(self, g: Hy4IndexerGeometry):
         self.heads = g.heads
-        self.sm_count = _device_sm_count()
 
     def _storage_1row(self):
         class Storage:
@@ -515,10 +510,11 @@ class _Hy4IndexerScoreGroups:
         stream: cuda.CUstream,
     ):
         if rows > Int32(0) and max_groups > Int32(0):
+            sm_count = runtime_num_sm()
             total_pages = (max_groups + Int32(_GROUPS_PER_PAGE - 1)) // Int32(_GROUPS_PER_PAGE)
             total_pairs = (total_pages + Int32(1)) // Int32(2)
             if rows == Int32(1):
-                target_ctas = Int32(self.sm_count * 4)
+                target_ctas = sm_count * Int32(4)
                 grid_y = total_pairs
                 if grid_y > target_ctas:
                     grid_y = target_ctas
@@ -528,7 +524,7 @@ class _Hy4IndexerScoreGroups:
                 ).launch(grid=(Int32(1), grid_y, 1), block=(160, 1, 1), stream=stream)
             else:
                 row_tiles = (rows + Int32(7)) // Int32(8)
-                target_ctas = Int32(self.sm_count * 2)
+                target_ctas = sm_count * Int32(2)
                 grid_y = (target_ctas + row_tiles - Int32(1)) // row_tiles
                 if grid_y > total_pairs:
                     grid_y = total_pairs

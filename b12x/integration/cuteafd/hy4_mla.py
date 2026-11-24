@@ -66,6 +66,7 @@ from b12x._lib.intrinsics import (
     st_shared_v4_u32,
     store_bf16x2,
 )
+from b12x._lib.utils import runtime_num_sm
 from b12x.attention.dense_mla._forward import DenseMlaForwardKernel, _exit_thread
 from b12x.attention.dense_mla._layout import choose_layout, make_smem_layout
 from b12x.attention.dense_mla._math import exp2_approx, log2_approx
@@ -95,11 +96,6 @@ _TWO_PI_HI = 6.25
 _TWO_PI_MID = 0.032958984375
 _TWO_PI_LO = 0.00022632280888501555
 _FP8_RECORD_BYTES = 656
-
-
-def _device_sm_count() -> int:
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return max(int(getattr(props, "multi_processor_count", 0)), 1)
 
 
 @dsl_user_op
@@ -3367,7 +3363,6 @@ class _Hy4Attention:
         self.max_context = int(max_context)
         self.layout = hy4_attention_layout(g, rows, max_context=max_context, mode=mode)
         self.splits = self.layout["num_splits"]
-        self.sm_count = _device_sm_count()
         self.use_fast_fp8 = g.kv_cache == "fp8" and _is_tp1(g)
         if self.use_fast_fp8:
             self.has_h32 = (g.heads >= 32 and g.heads % 32 == 0)
@@ -3459,10 +3454,11 @@ class _Hy4Attention:
             if rows > Int32(0):
                 if cutlass.const_expr(self.page_size == 1):
                     # DSA selected-token gather: dynamic split-K + hpb=16/32 dispatch from runtime SM count.
+                    sm_count = runtime_num_sm()
                     h16_tiles: cutlass.Constexpr = g.heads // 16
                     if cutlass.const_expr(self.has_h32):
                         h32_tiles: cutlass.Constexpr = g.heads // 32
-                        if rows * Int32(h16_tiles * self.splits) <= Int32(self.sm_count):
+                        if rows * Int32(h16_tiles * self.splits) <= sm_count:
                             eff = Int32(self.splits)
                             self.fwd_h16(
                                 query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
@@ -3473,7 +3469,7 @@ class _Hy4Attention:
                                     self.merge(po, pl, out, lse_out, eff, stream)
                         else:
                             max_chunks_32: cutlass.Constexpr = (self.max_context + 31) // 32
-                            max_s = Int32(self.sm_count) // (rows * Int32(h32_tiles))
+                            max_s = sm_count // (rows * Int32(h32_tiles))
                             if max_s > Int32(self.splits):
                                 max_s = Int32(self.splits)
                             if max_s < Int32(1):
@@ -3493,7 +3489,7 @@ class _Hy4Attention:
                                     self.merge(po, pl, out, lse_out, eff, stream)
                     else:
                         max_chunks_32: cutlass.Constexpr = (self.max_context + 31) // 32
-                        max_s = Int32(self.sm_count) // (rows * Int32(h16_tiles))
+                        max_s = sm_count // (rows * Int32(h16_tiles))
                         if max_s > Int32(self.splits):
                             max_s = Int32(self.splits)
                         if max_s < Int32(1):
@@ -3529,14 +3525,15 @@ class _Hy4Attention:
                         if eff > Int32(1):
                             self.merge(po, pl, out, lse_out, eff, stream)
                     else:
+                        sm_count = runtime_num_sm()
                         # swa_extend: 2-WG hpb=8 (1 wave up to sm_count/8 rows, e.g. rows=2..16 on SM120),
                         # hpb=16 (up to sm_count/4 rows, e.g. rows=32), hpb=32 above (rows=64 and prefill).
-                        if cutlass.const_expr(self.has_swa_2wg) and rows * Int32(h8_tiles) <= Int32(self.sm_count):
+                        if cutlass.const_expr(self.has_swa_2wg) and rows * Int32(h8_tiles) <= sm_count:
                             self.fwd_swa_2wg(
                                 query, kv_cache, table, lengths, cu, out, lse_out,
                                 scale_log2, page_table_width, rows, batch, stream,
                             )
-                        elif cutlass.const_expr(self.has_h32) and rows * Int32(h16_tiles) > Int32(self.sm_count):
+                        elif cutlass.const_expr(self.has_h32) and rows * Int32(h16_tiles) > sm_count:
                             self.fwd_h32(
                                 query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
                                 scale_log2, page_table_width, rows, batch, Int32(1), stream,
