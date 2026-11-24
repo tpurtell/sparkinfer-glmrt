@@ -383,11 +383,14 @@ def _ml4_programs():
             lambda: ml4.compile_index_q_fp8_aot(g, mode="prefill", max_rows=256),
             lambda: ml4.compile_draft_producer_aot(ml4.ML4_DRAFT, max_rows=64),
             lambda: ml4.compile_draft_attention_aot(ml4.ML4_DRAFT, max_rows=64, max_context=8192),
-            lambda: ml4.compile_draft_output_aot(ml4.ML4_DRAFT, max_rows=64)]
+            lambda: ml4.compile_draft_output_aot(ml4.ML4_DRAFT, max_rows=64),
+            lambda: ml4.compile_draft_producer_aot(ml4.ML4_DRAFT_TP2, max_rows=64),
+            lambda: ml4.compile_draft_attention_aot(ml4.ML4_DRAFT_TP2, max_rows=64, max_context=8192),
+            lambda: ml4.compile_draft_output_aot(ml4.ML4_DRAFT_TP2, max_rows=64)]
     return out
 
 
-@pytest.mark.parametrize("index", range(16))
+@pytest.mark.parametrize("index", range(19))
 def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
     """The exporter's header check (pointer names = the declared operands) on
     every ml4 program: launches here pass pointers positionally, so only the
@@ -396,7 +399,7 @@ def test_every_ml4_program_exports_with_its_declared_abi(index, tmp_path):
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
 
     thunks = _ml4_programs()
-    assert len(thunks) == 16
+    assert len(thunks) == 19
     with exportable_compilation():
         program = thunks[index]()
     label = f"ml4_export_check_{index}"
@@ -582,3 +585,206 @@ def test_head_split_context_strides_refuse_misuse():
         compile_query_scale_aot(ML4_TP2, rope=True, max_rows=64, query_row=32 * 576 - 576)
     with pytest.raises(ValueError):
         compile_kv_b_aot(ML4_TP2, stage="values", rope=True, max_rows=64, query_row=2 * 32 * 128)
+
+
+@pytest.mark.parametrize("kv_cache_requests", [((2100, 3), (65, 3)), ((2048, 3), (1, 3))])
+def test_draft_tp2_attention_matches_whole_and_replays_bit_identically(kv_cache_requests):
+    """ml4_draft2_attention (32 heads, block_window): each 32-head share matches the
+    corresponding head slice of 64-head ml4_draft_attention bit-for-bit, matches the
+    PyTorch block_window oracle, and replays identically under CUDA graphs."""
+    device = require_b12x()
+    from b12x.attention._shared.mla.reference import pack_mla_kv_cache_reference, unpack_mla_kv_cache_reference
+    from b12x.integration.cuteafd.mistral_large4 import (ML4_DRAFT, ML4_DRAFT_TP2, compile_draft_attention_aot)
+
+    p_whole = compile_draft_attention_aot(ML4_DRAFT, max_rows=16, max_context=4352)
+    p_tp2 = compile_draft_attention_aot(ML4_DRAFT_TP2, max_rows=16, max_context=4352)
+    assert p_tp2.name == "ml4_draft2_attention"
+    contexts = [c for c, _ in kv_cache_requests]
+    counts = [n for _, n in kv_cache_requests]
+    lengths = [c + n for c, n in kv_cache_requests]
+    width = max(-(-length // 64) for length in lengths)
+    gen = torch.Generator(device="cuda").manual_seed(91)
+    latent = (torch.randn(2 * width * 64, 576, generator=gen, device="cuda") * 0.1).bfloat16()
+    packed = pack_mla_kv_cache_reference(latent[:, :512], latent[:, 512:])
+    oracle = unpack_mla_kv_cache_reference(packed).bfloat16().reshape(2 * width, 64, 576)
+    cache = packed.reshape(2 * width, 64, 656)
+    table = torch.arange(2 * width, dtype=torch.int32, device="cuda").flip(0).reshape(width, 2).T.contiguous()
+    rows = sum(counts)
+    q = (torch.randn(rows, 64, 576, generator=gen, device="cuda") * 0.5).bfloat16()
+    cu = torch.tensor([0, counts[0], rows], dtype=torch.int32, device="cuda")
+    lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    scale = 128 ** -0.5
+
+    out_whole = torch.empty(rows, 64, 512, dtype=torch.bfloat16, device="cuda")
+    lse_whole = torch.empty(rows, 64, device="cuda")
+    p_whole.launch(q, cache, table, lens, cu, out_whole, lse_whole,
+                   torch.empty(p_whole.scratch_bytes(16)["scratch"], dtype=torch.uint8, device="cuda"),
+                   scalars=(rows, 2, width, p_whole.geometry["num_splits"], scale))
+
+    out_parts, lse_parts = [], []
+    scratch_tp2 = torch.empty(p_tp2.scratch_bytes(16)["scratch"], dtype=torch.uint8, device="cuda")
+    for rank in (0, 1):
+        sl = slice(rank * 32, (rank + 1) * 32)
+        q_part = q[:, sl].contiguous()
+        out_p = torch.empty(rows, 32, 512, dtype=torch.bfloat16, device="cuda")
+        lse_p = torch.empty(rows, 32, device="cuda")
+
+        def run(q_part=q_part, out_p=out_p, lse_p=lse_p):
+            p_tp2.launch(q_part, cache, table, lens, cu, out_p, lse_p, scratch_tp2,
+                         scalars=(rows, 2, width, p_tp2.geometry["num_splits"], scale))
+
+        run()
+        torch.cuda.synchronize()
+        saved = out_p.clone(), lse_p.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+        for actual, expected in zip((out_p, lse_p), saved):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        out_parts.append(out_p)
+        lse_parts.append(lse_p)
+
+    out_cat = torch.cat(out_parts, dim=1)
+    lse_cat = torch.cat(lse_parts, dim=1)
+    assert torch.equal(out_cat.view(torch.uint8), out_whole.view(torch.uint8))
+    assert torch.equal(lse_cat.view(torch.uint8), lse_whole.view(torch.uint8))
+    begin = 0
+    for index, (context, count, length) in enumerate(zip(contexts, counts, lengths)):
+        records = oracle[table[index].long()].flatten(0, 1)[:length].float()
+        scores = torch.einsum("thd,sd->hts", q[begin:begin + count].float(), records) * scale
+        keys = torch.arange(length, device="cuda")
+        visible = keys >= max(context - ML4_DRAFT_TP2.window_size, 0)
+        scores.masked_fill_(~visible[None, None], -torch.inf)
+        expected = torch.einsum("hts,sd->thd", scores.softmax(-1), records[:, :512])
+        torch.testing.assert_close(out_cat[begin:begin + count].float(), expected, atol=0.003, rtol=0.03)
+        torch.testing.assert_close(lse_cat[begin:begin + count], scores.logsumexp(-1).T, atol=2e-4, rtol=2e-5)
+        begin += count
+
+
+def test_draft_tp2_layer_sums_to_whole_draft_layer_and_reference():
+    """Two 32-head TP2 ranks running ml4_draft2_{producer,attention,output} produce
+    bit-identical FP8 KV records on both ranks, match 64-head ml4_draft_* query and
+    attention per head slice, and sum their o_proj partials to the whole 64-head
+    output (cosine > 0.9999) and the BF16 dspark.py reference (cosine > 0.995)."""
+    device = require_b12x()
+    from b12x.integration.cuteafd.mistral_large4 import (ML4_DRAFT, ML4_DRAFT_TP2, compile_draft_attention_aot,
+                                                         compile_draft_output_aot, compile_draft_producer_aot)
+
+    H, half, depth, context = 64, 32, 3, 2100
+    gen = torch.Generator().manual_seed(57)
+    w = _attention_weights(True, gen)
+    n = context + depth
+    x = (torch.randn(n, 6144, generator=gen)).bfloat16()
+    positions = torch.arange(n, dtype=torch.int64)
+    kv_b = w["wkv_b"].view(H, 64 + 128, 512)
+    d = lambda t: t.to(device)  # noqa: E731
+    pages = -(-n // 64)
+    table = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
+    table_cs = d(_cos_sin_table(positions))
+    w_q_full = w["wq"].view(H, 128, 6144)
+    w_uk_full = kv_b[:, :64, :].transpose(1, 2).contiguous()
+    w_uv_full = kv_b[:, 64:, :].contiguous()
+    w_o_full = w["wo"].view(6144, H, 128)
+
+    # Whole 64-head path
+    p_prod_w = compile_draft_producer_aot(ML4_DRAFT, max_rows=4096)
+    p_attn_w = compile_draft_attention_aot(ML4_DRAFT, max_rows=16, max_context=4352)
+    p_out_w = compile_draft_output_aot(ML4_DRAFT, max_rows=16)
+    cache_w = torch.zeros(pages, 64, 656, dtype=torch.uint8, device=device)
+    query_w = torch.zeros(n, H, 576, dtype=torch.bfloat16, device=device)
+    scratch_pw = torch.empty(p_prod_w.scratch_bytes(4096)["scratch"], dtype=torch.uint8, device=device)
+    unit_s_w, unit_b_w = d(torch.zeros(H, dtype=torch.bfloat16)), d(torch.ones(H, dtype=torch.bfloat16))
+    for first, count in ((0, context), (context, depth)):
+        p_prod_w.launch(d(x[first:first + count]), d(positions[first:first + count]), d(positions[first:first + count]),
+                        table_cs, unit_s_w, unit_b_w, d(w["wq"]), d(w["wkv_a"]), d(w["kv_a_norm"]),
+                        d(w_uk_full), cache_w, query_w[first:first + count], scratch_pw, scalars=(count,))
+    attn_w = torch.empty(depth, H, 512, dtype=torch.bfloat16, device=device)
+    lse_w = torch.empty(depth, H, device=device)
+    p_attn_w.launch(query_w[context:].contiguous(), cache_w, table,
+                    torch.tensor([n], dtype=torch.int32, device=device),
+                    torch.tensor([0, depth], dtype=torch.int32, device=device), attn_w, lse_w,
+                    torch.empty(p_attn_w.scratch_bytes(16)["scratch"], dtype=torch.uint8, device=device),
+                    scalars=(depth, 1, pages, p_attn_w.geometry["num_splits"], 128 ** -0.5))
+    actual_w = torch.empty(depth, 6144, dtype=torch.bfloat16, device=device)
+    p_out_w.launch(attn_w, d(w_uv_full), d(w["wo"]), actual_w,
+                   torch.empty(p_out_w.scratch_bytes(16)["scratch"], dtype=torch.uint8, device=device),
+                   scalars=(depth,))
+
+    # Split 32-head TP2 path (rank 0 and rank 1)
+    p_prod_2 = compile_draft_producer_aot(ML4_DRAFT_TP2, max_rows=4096)
+    p_attn_2 = compile_draft_attention_aot(ML4_DRAFT_TP2, max_rows=16, max_context=4352)
+    p_out_2 = compile_draft_output_aot(ML4_DRAFT_TP2, max_rows=16)
+    assert (p_prod_2.name, p_attn_2.name, p_out_2.name) == (
+        "ml4_draft2_producer", "ml4_draft2_attention", "ml4_draft2_output")
+    scratch_p2 = torch.empty(p_prod_2.scratch_bytes(4096)["scratch"], dtype=torch.uint8, device=device)
+    scratch_a2 = torch.empty(p_attn_2.scratch_bytes(16)["scratch"], dtype=torch.uint8, device=device)
+    scratch_o2 = torch.empty(p_out_2.scratch_bytes(16)["scratch"], dtype=torch.uint8, device=device)
+    unit_s_2, unit_b_2 = d(torch.zeros(half, dtype=torch.bfloat16)), d(torch.ones(half, dtype=torch.bfloat16))
+    caches, queries, attns, lses, partials = [], [], [], [], []
+    for rank in (0, 1):
+        sl = slice(rank * half, (rank + 1) * half)
+        cache_r = torch.zeros(pages, 64, 656, dtype=torch.uint8, device=device)
+        query_r = torch.zeros(n, half, 576, dtype=torch.bfloat16, device=device)
+        w_q_r = d(w_q_full[sl].reshape(half * 128, 6144).contiguous())
+        w_uk_r = d(w_uk_full[sl].contiguous())
+        w_uv_r = d(w_uv_full[sl].contiguous())
+        w_o_r = d(w_o_full[:, sl, :].reshape(6144, half * 128).contiguous())
+        for first, count in ((0, context), (context, depth)):
+            p_prod_2.launch(d(x[first:first + count]), d(positions[first:first + count]),
+                            d(positions[first:first + count]), table_cs, unit_s_2, unit_b_2, w_q_r,
+                            d(w["wkv_a"]), d(w["kv_a_norm"]), w_uk_r, cache_r, query_r[first:first + count],
+                            scratch_p2, scalars=(count,))
+        attn_r = torch.empty(depth, half, 512, dtype=torch.bfloat16, device=device)
+        lse_r = torch.empty(depth, half, device=device)
+        p_attn_2.launch(query_r[context:].contiguous(), cache_r, table,
+                        torch.tensor([n], dtype=torch.int32, device=device),
+                        torch.tensor([0, depth], dtype=torch.int32, device=device), attn_r, lse_r,
+                        scratch_a2, scalars=(depth, 1, pages, p_attn_2.geometry["num_splits"], 128 ** -0.5))
+        part_r = torch.empty(depth, 6144, dtype=torch.bfloat16, device=device)
+        p_out_2.launch(attn_r, w_uv_r, w_o_r, part_r, scratch_o2, scalars=(depth,))
+        caches.append(cache_r)
+        queries.append(query_r)
+        attns.append(attn_r)
+        lses.append(lse_r)
+        partials.append(part_r)
+    torch.cuda.synchronize()
+
+    # Replicated FP8 KV records are bit-identical across both ranks and match the 64-head producer.
+    assert torch.equal(caches[0], caches[1])
+    assert torch.equal(caches[0], cache_w)
+    # Absorbed queries and attention outputs match 64-head slices closely.
+    q_cos = torch.nn.functional.cosine_similarity(
+        torch.cat(queries, dim=1)[context:].float().flatten(), query_w[context:].float().flatten(), dim=0)
+    a_cos = torch.nn.functional.cosine_similarity(
+        torch.cat(attns, dim=1).float().flatten(), attn_w.float().flatten(), dim=0)
+    # Reduced TP2 BF16 sum matches 64-head output.
+    reduced = (partials[0] + partials[1]).float().cpu()
+    whole_cos = torch.nn.functional.cosine_similarity(reduced, actual_w.float().cpu(), dim=-1)
+    assert float(q_cos) > 0.99999, float(q_cos)
+    assert float(a_cos) > 0.99999, float(a_cos)
+    assert float(whole_cos.min()) > 0.9999, float(whole_cos.min())
+
+    # Compare against PyTorch BF16 reference (dspark.py).
+    angles = positions.float()[:, None] * _inv_freq()[None, :]
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    kv = (x.float() @ w["wkv_a"].float().t()).bfloat16()
+    lat = kv[:, :512].float()
+    lat = (lat * torch.rsqrt(lat.pow(2).mean(-1, keepdim=True) + 1e-5)).bfloat16() * w["kv_a_norm"]
+    rot = kv[:, 512:]
+    k_rot = torch.cat([rot[:, 0::2] * cos - rot[:, 1::2] * sin, rot[:, 1::2] * cos + rot[:, 0::2] * sin], -1)
+    keep = torch.arange(n) >= context - 2048
+    kvb = (lat[keep].float() @ w["wkv_b"].float().t()).bfloat16().view(-1, H, 192)
+    k = torch.cat([kvb[..., :64], k_rot[keep][:, None, :].expand(-1, H, -1)], -1)
+    v = kvb[..., 64:]
+    q = (x[context:].float() @ w["wq"].float().t()).bfloat16().view(depth, H, 128)
+    c, s = cos[context:][:, None], sin[context:][:, None]
+    e, o = q[..., 64::2], q[..., 65::2]
+    q = torch.cat([q[..., :64], e * c - o * s, o * c + e * s], -1)
+    scores = torch.einsum("rhd,khd->hrk", q.float(), k.float()) * 128 ** -0.5
+    attn_ref = torch.einsum("hrk,khd->rhd", scores.softmax(-1).bfloat16().float(), v.float()).bfloat16()
+    expected = attn_ref.reshape(depth, -1).float() @ w["wo"].float().t()
+    ref_cos = torch.nn.functional.cosine_similarity(reduced, expected, dim=-1)
+    print(f"ML4 TP2 draft layer: q_cos={float(q_cos):.6f} a_cos={float(a_cos):.6f} "
+          f"vs_whole_min={float(whole_cos.min()):.6f} vs_ref_min={float(ref_cos.min()):.6f}")
+    assert float(ref_cos.min()) > 0.995, float(ref_cos.min())
