@@ -263,6 +263,141 @@ def test_inkling2_mini_nvfp4_fouroversix_selection():
     )
 
 
+def test_inkling2_mini_nvfp4_exact_decode_negative_control():
+    """Exact-decode negative control (ref root cause on f1940f40eb):
+
+    HF's loader rounds packed weight ``amax`` to BF16 and expands weights to BF16,
+    flipping down-projection NVFP4 activation codes. Here we construct packed
+    checkpoint weights whose F32 ``w1_amax`` carries non-BF16 lower mantissa bits
+    (``exact = 1.0 + 3 * 2^-10`` vs BF16-rounded ``1.0``), run the production
+    ``inkling2_mini_nvfp4`` stage kernel, and assert BOTH:
+      1. Negative control: BF16-rounding ``w1_amax`` / expanding weights to BF16
+         flips down-projection NVFP4 activation codes (``aq``/``a_s``) and creates
+         a large output error vs exact-decode reference.
+      2. Kernel exactness: the production kernel matches the exact-decode reference
+         bit-for-bit on FC1 and down-projection NVFP4 activation codes/scales (and
+         disagrees with the BF16-corrupted path).
+    """
+    from b12x.integration.cuteafd._fp8_moe_stream import STREAM_TILE_M
+
+    g = _geometry()
+    e, k, h, i = g.experts, g.top_k, g.hidden, g.slice
+    DENOM = 2688.0
+    capacity, rows = 16, 4
+    pairs = rows * k
+    groups = min(pairs, e)
+    mt = (pairs + STREAM_TILE_M - 1) // STREAM_TILE_M + groups
+    P = mt * STREAM_TILE_M
+
+    # Deterministic power-of-two activations so F32 dot products have zero accumulation ambiguity:
+    # row r puts +1.0 in the first 32 columns and 0 elsewhere, so each expert's FC1 output is exact.
+    x = torch.zeros((rows, h), dtype=torch.bfloat16, device="cuda")
+    x[:, :32] = 1.0
+    ids = torch.arange(k, dtype=torch.int32, device="cuda").unsqueeze(0).expand(rows, k).contiguous()
+    weights = torch.ones((rows, k), dtype=torch.float32, device="cuda")
+
+    # Pack exact checkpoint weights: constant E2M1=1.0 (code 2 -> byte 0x22), E4M3 scale=256.0 (0x78)
+    # on columns 0..32 (zero elsewhere), and non-BF16 F32 w1_amax = 1.0 + 3 * 2^-10 on experts 0..k-1.
+    # For each expert, exact dequant on cols 0..32 is 1.0 * 256.0 * (w_amax / 2688.0), so the 32-element
+    # sum is 32 * 256 * w_amax / 2688 = (64/21) * w_amax. We vary row/column codes slightly so the
+    # BF16-rounded w1_amax crosses E2M1 midpoints and flips down-projection NVFP4 activation codes.
+    def make_packed(amax_vec: torch.Tensor, rows_w: int, cols_w: int, col_pattern: torch.Tensor):
+        packed = torch.zeros((e, rows_w, cols_w // 2), dtype=torch.uint8, device="cuda")
+        scales = torch.zeros((e, rows_w, cols_w // 16), dtype=torch.uint8, device="cuda")
+        # E4M3 256.0 = 0x78, 128.0 = 0x70; E2M1 codes from col_pattern [rows_w] in {2 (1.0), 4 (2.0), 5 (3.0), 6 (4.0)}.
+        pat = (col_pattern.to(torch.uint8) | (col_pattern.to(torch.uint8) << 4))[:, None]
+        packed[:k, :, :16] = pat.expand(k, rows_w, 16)
+        scales[:k, :, :2] = 0x78  # E4M3 256.0
+        denom_t = torch.tensor([DENOM], dtype=torch.float32, device="cuda")
+        s_flat = torch.cat([scales.flatten(), amax_vec.view(torch.uint8), denom_t.view(torch.uint8)]).contiguous()
+        return packed.contiguous(), s_flat, (packed, scales, amax_vec, DENOM)
+
+    # Exact F32 amax whose lower mantissa bits vanish under BF16 rounding (1.0 + 3*2^-10 -> BF16 1.0).
+    exact_amax = torch.full((e,), float(1.0 + 3.0 * (2.0 ** -10)), dtype=torch.float32, device="cuda")
+    bf16_amax = exact_amax.bfloat16().float()
+    assert not torch.equal(exact_amax, bf16_amax), "test setup requires non-BF16 exact_amax"
+
+    # Vary row codes across the intermediate dimension so act rows span E2M1 rounding boundaries.
+    row_pat = torch.tensor([2, 3, 4, 5, 6, 7, 1, 2], dtype=torch.uint8, device="cuda").repeat(i // 8)
+    w1, s1, m1 = make_packed(exact_amax, i, h, row_pat)
+    w3, s3, m3 = make_packed(exact_amax, i, h, torch.full((i,), 4, dtype=torch.uint8, device="cuda"))
+    w2, s2, m2 = make_packed(exact_amax, h, i, torch.full((h,), 2, dtype=torch.uint8, device="cuda"))
+
+    prog = small_nvfp4._stage_program(g, capacity)
+    meta = torch.empty(16 + 2 * e + 2 * mt, dtype=torch.int32, device="cuda")
+    pair_row = torch.empty(pairs, dtype=torch.int32, device="cuda")
+    pair_pos = torch.empty(pairs, dtype=torch.int32, device="cuda")
+    xq = torch.empty((P, h // 2), dtype=torch.uint8, device="cuda")
+    xs = torch.empty((P, h // 16), dtype=torch.uint8, device="cuda")
+    xamax = torch.empty(P, dtype=torch.float32, device="cuda")
+    gamma = torch.empty(pairs, dtype=torch.float32, device="cuda")
+    act16 = torch.empty((P, i), dtype=torch.bfloat16, device="cuda")
+    part = torch.empty((P, i // 16), dtype=torch.float32, device="cuda")
+    aq = torch.empty((P, i // 2), dtype=torch.uint8, device="cuda")
+    a_s = torch.empty((P, i // 16), dtype=torch.uint8, device="cuda")
+    aamax = torch.empty(P, dtype=torch.float32, device="cuda")
+    y = torch.empty((pairs, h), dtype=torch.bfloat16, device="cuda")
+    out = torch.empty((rows, h), dtype=torch.bfloat16, device="cuda")
+    exch = torch.empty((P, 2 * i), dtype=torch.bfloat16, device="cuda")
+    exch_rows = torch.empty((P, 4), dtype=torch.int32, device="cuda")
+    lin_g = torch.empty((pairs, i), dtype=torch.bfloat16, device="cuda")
+    lin_u = torch.empty((pairs, i), dtype=torch.bfloat16, device="cuda")
+
+    prog.launch(x, ids, weights, w1, s1, w3, s3, w2, s2, meta, pair_row, pair_pos,
+                xq, xs, xamax, gamma, act16, part, aq, a_s, aamax, y, out, exch, exch_rows,
+                lin_g, lin_u, scalars=(rows,))
+    torch.cuda.synchronize()
+
+    # Exact-decode vs BF16-rounded-amax/weight reference on expert 0's row 0.
+    x_q_ref, x_s_ref, x_amax_ref, x_recon_ref = _reference_quantize_nvfp4_exact(x[:1].float())
+    w1_grid, w1_outer_exact = small_nvfp4._grid_expert(m1, 0, "cuda")
+    w3_grid, w3_outer_exact = small_nvfp4._grid_expert(m3, 0, "cuda")
+    w1_exact = w1_grid * w1_outer_exact
+    w3_exact = w3_grid * w3_outer_exact
+    gate_exact = (x_recon_ref.double() @ w1_exact.T).float().bfloat16()
+    up_exact = (x_recon_ref.double() @ w3_exact.T).float().bfloat16()
+    act_exact = small_nvfp4._situ(gate_exact, up_exact, torch.ones(1, device="cuda"), g.situ_gate_cap, g.situ_up_cap)
+    aq_exact, as_exact, aamax_exact, _ = _reference_quantize_nvfp4_exact(act_exact.float())
+
+    # Negative control: HF loader bug (BF16-rounded amax + BF16-expanded weights).
+    w1_bf16 = (w1_grid * (bf16_amax[0].double() / DENOM)).bfloat16().double()
+    w3_bf16 = (w3_grid * (bf16_amax[0].double() / DENOM)).bfloat16().double()
+    gate_bug = (x_recon_ref.double() @ w1_bf16.T).float().bfloat16()
+    up_bug = (x_recon_ref.double() @ w3_bf16.T).float().bfloat16()
+    act_bug = small_nvfp4._situ(gate_bug, up_bug, torch.ones(1, device="cuda"), g.situ_gate_cap, g.situ_up_cap)
+    aq_bug, as_bug, _, _ = _reference_quantize_nvfp4_exact(act_bug.float())
+
+    # Locate expert 0's first live tile row in the kernel's packed buffers.
+    live_mask = (exch_rows[:, 0] == 0) & (exch_rows[:, 1] == 0)
+    assert live_mask.any(), "expert 0 row 0 missing from stage dump"
+    slot_idx = int(live_mask.nonzero(as_tuple=False)[0, 0].item())
+    kernel_gate = exch[slot_idx, :i]
+    kernel_up = exch[slot_idx, i:]
+    kernel_aq = aq[slot_idx : slot_idx + 1]
+    kernel_as = a_s[slot_idx : slot_idx + 1]
+    kernel_aamax = aamax[slot_idx : slot_idx + 1]
+
+    flipped_bug_codes = int((aq_exact != aq_bug).sum().item())
+    flipped_bug_scales = int((as_exact != as_bug).sum().item())
+    gate_bug_max = float((gate_exact.float() - gate_bug.float()).abs().max().item())
+    assert flipped_bug_codes > 0 or flipped_bug_scales > 0, (
+        "negative control failed to fire: BF16 amax/weight rounding did not flip any NVFP4 act codes"
+    )
+    assert gate_bug_max > 0.0, "negative control expected nonzero FC1 divergence from BF16 rounding"
+
+    assert torch.equal(kernel_gate, gate_exact[0]), "kernel FC1 gate must match exact F32 decode bit-for-bit"
+    assert torch.equal(kernel_up, up_exact[0]), "kernel FC1 up must match exact F32 decode bit-for-bit"
+    assert torch.equal(kernel_aamax, aamax_exact), "kernel act amax must match exact-decode reference"
+    assert torch.equal(kernel_as, as_exact), "kernel act E4M3 scales must match exact-decode reference"
+    assert torch.equal(kernel_aq, aq_exact), "kernel act E2M1 codes must match exact-decode reference"
+    assert not torch.equal(kernel_aq, aq_bug) or not torch.equal(kernel_as, as_bug), (
+        "kernel unexpectedly matched BF16-rounded path"
+    )
+    print(f"inkling2_mini nvfp4 exact-decode negative control PASSED: "
+          f"kernel vs exact-decode = 0/0 diffs; BF16-rounded negative control flipped "
+          f"{flipped_bug_codes} packed code bytes / {flipped_bug_scales} scale bytes (max|d_fc1|={gate_bug_max:.4e})")
+
+
 def test_inkling2_mini_nvfp4_geometry():
     g = _geometry()
     assert (g.hidden, g.intermediate, g.slice, g.experts, g.top_k) == (2304, 1152, 1152, 128, 8)
