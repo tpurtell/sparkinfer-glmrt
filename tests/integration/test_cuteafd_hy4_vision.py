@@ -18,7 +18,8 @@ def _official_position(table, h, w):
     grid = table.float().permute(2, 0, 1).unsqueeze(0)
     out = F.interpolate(grid, scale_factor=((h + 0.1) / 128, (w + 0.1) / 128),
                         mode="bilinear", align_corners=False)
-    return out.permute(0, 2, 3, 1).reshape(-1, table.shape[-1]).bfloat16()
+    # permute+reshape is a strided view; the raw ABI writes raster storage.
+    return out.permute(0, 2, 3, 1).reshape(-1, table.shape[-1]).bfloat16().contiguous()
 
 
 def _rscale(size):
@@ -39,7 +40,7 @@ def test_scaled_bilinear_position_matches_official_interpolate():
     mismatches = {}
     for h, w in GRIDS:
         expected = _official_position(table, h, w)
-        out = torch.empty_like(expected)
+        out = torch.empty(expected.shape, device="cuda", dtype=torch.bfloat16)
         with kernel_resolution_guard():
             program.launch(table, out, scalars=[h, w, _rscale(h), _rscale(w)])
         bad = int((out.view(torch.int16) != expected.view(torch.int16)).sum())
@@ -61,8 +62,8 @@ def test_still_patches_p16_raster(height, width):
     gh, gw = height // 16, width // 16
     # SGLang/Tencent patchify: (t,gh,gw,c,py,px) with raster patch order.
     expected = normalized.permute(2, 0, 1).reshape(3, gh, 16, gw, 16).permute(1, 3, 0, 2, 4)
-    expected = expected.reshape(gh * gw, 3 * 256).bfloat16()
-    out = torch.empty_like(expected)
+    expected = expected.reshape(gh * gw, 3 * 256).bfloat16().contiguous()
+    out = torch.empty(expected.shape, device="cuda", dtype=torch.bfloat16)
     compile_still_patches_aot(patch=16).launch(rgb, lut, out, scalars=[height, width])
     assert torch.equal(out, expected)
 
