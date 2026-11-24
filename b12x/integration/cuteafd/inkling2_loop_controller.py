@@ -1,0 +1,197 @@
+"""Inkling 2 Mini looped cross-pass controller fused boundary programs.
+
+Implements the non-GEMM boundaries of Inkling 2 Mini's core-layer cross-pass
+controller (``controllers.{attn,k,v,mlp}``) with zero scratch and live row
+counts as runtime scalars:
+
+* ``compile_inkling2_loop_pair_norm_aot``: unweighted F32 RMSNorm of both
+  ``dest`` (current-pass input) and ``msg`` (previous-pass cross-pass message),
+  concatenated into BF16 ``[slots, rows, 2 * hidden]`` for ``down_weight``.
+* ``compile_inkling2_loop_blend_norm_aot``: F32 ``tanh`` on stacked
+  ``[forget; gain]`` logits, F32 gated blend
+  ``(1 - tanh(forget)) * dest + tanh(gain) * msg``, followed immediately by the
+  sublayer's weighted F32 RMSNorm to BF16 ``[slots, rows, hidden]``.
+
+``slots`` is 1 (MLP) or 3 (attention Q/K/V). When ``broadcast_dest=True``
+(local core layers, where ``attn_res`` produces one shared input before the
+three distinct ``attn``/``k``/``v`` controllers), ``dest`` has shape
+``[1, rows, hidden]``; similarly ``broadcast_weight=True`` shares one
+``attn_norm.weight`` across all three slots.
+"""
+from __future__ import annotations
+
+import math
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass import BFloat16, Float32, Int32, Int64
+import torch
+
+from b12x._lib.intrinsics import div_rn_f32
+from ._common import Operand, Scalar, compile_program
+from ._glm_kernels import _block_sum, _reduction_storage, _rsqrt
+
+
+class _LoopPairNorm:
+    threads = 256
+
+    def __init__(self, hidden: int, slots: int, broadcast_dest: bool, eps: float):
+        self.hidden = hidden
+        self.slots = slots
+        self.broadcast_dest = broadcast_dest
+        self.eps = float(eps)
+
+    @cute.jit
+    def __call__(self, dest: cute.Pointer, msg: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        if rows > Int32(0):
+            self.kernel(dest, msg, out, rows).launch(
+                grid=(rows, self.slots, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, dest: cute.Pointer, msg: cute.Pointer, out: cute.Pointer, rows: Int32):
+        row = Int64(cute.arch.block_idx()[0])
+        slot = Int64(cute.arch.block_idx()[1])
+        tid = Int64(cute.arch.thread_idx()[0])
+        dest_slot = Int64(0) if cutlass.const_expr(self.broadcast_dest) else slot
+        dest_base = (dest_slot * Int64(rows) + row) * Int64(self.hidden)
+        msg_base = (slot * Int64(rows) + row) * Int64(self.hidden)
+        out_base = (slot * Int64(rows) + row) * Int64(2 * self.hidden)
+        storage = utils.SmemAllocator().allocate(_reduction_storage(2, self.threads // 32))
+        sums = storage.sums.get_tensor(
+            cute.make_layout((2, self.threads // 32), stride=(self.threads // 32, 1)))
+        d_vals = cute.make_rmem_tensor((self.hidden // self.threads,), Float32)
+        m_vals = cute.make_rmem_tensor((self.hidden // self.threads,), Float32)
+        d_sq = Float32(0)
+        m_sq = Float32(0)
+        for j in cutlass.range_constexpr(self.hidden // self.threads):
+            col = tid + Int64(j * self.threads)
+            dv = Float32(dest[dest_base + col])
+            mv = Float32(msg[msg_base + col])
+            d_vals[j] = dv
+            m_vals[j] = mv
+            d_sq = d_sq + dv * dv
+            m_sq = m_sq + mv * mv
+        d_tot = _block_sum(d_sq, sums, Int32(0), self.threads // 32)
+        m_tot = _block_sum(m_sq, sums, Int32(1), self.threads // 32)
+        d_inv = _rsqrt(div_rn_f32(d_tot, Float32(self.hidden)) + Float32(self.eps))
+        m_inv = _rsqrt(div_rn_f32(m_tot, Float32(self.hidden)) + Float32(self.eps))
+        for j in cutlass.range_constexpr(self.hidden // self.threads):
+            col = tid + Int64(j * self.threads)
+            out[out_base + col] = BFloat16(d_vals[j] * d_inv)
+            out[out_base + Int64(self.hidden) + col] = BFloat16(m_vals[j] * m_inv)
+
+
+class _LoopBlendNorm:
+    threads = 256
+
+    def __init__(self, hidden: int, slots: int, broadcast_dest: bool,
+                 broadcast_weight: bool, eps: float):
+        self.hidden = hidden
+        self.slots = slots
+        self.broadcast_dest = broadcast_dest
+        self.broadcast_weight = broadcast_weight
+        self.eps = float(eps)
+
+    @cute.jit
+    def __call__(self, dest: cute.Pointer, msg: cute.Pointer, forget_gain: cute.Pointer,
+                 weight: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        if rows > Int32(0):
+            self.kernel(dest, msg, forget_gain, weight, out, rows).launch(
+                grid=(rows, self.slots, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, dest: cute.Pointer, msg: cute.Pointer, forget_gain: cute.Pointer,
+               weight: cute.Pointer, out: cute.Pointer, rows: Int32):
+        row = Int64(cute.arch.block_idx()[0])
+        slot = Int64(cute.arch.block_idx()[1])
+        tid = Int64(cute.arch.thread_idx()[0])
+        dest_slot = Int64(0) if cutlass.const_expr(self.broadcast_dest) else slot
+        w_slot = Int64(0) if cutlass.const_expr(self.broadcast_weight) else slot
+        dest_base = (dest_slot * Int64(rows) + row) * Int64(self.hidden)
+        msg_base = (slot * Int64(rows) + row) * Int64(self.hidden)
+        fg_base = (slot * Int64(rows) + row) * Int64(2 * self.hidden)
+        w_base = w_slot * Int64(self.hidden)
+        storage = utils.SmemAllocator().allocate(_reduction_storage(1, self.threads // 32))
+        sums = storage.sums.get_tensor(
+            cute.make_layout((1, self.threads // 32), stride=(self.threads // 32, 1)))
+        values = cute.make_rmem_tensor((self.hidden // self.threads,), Float32)
+        square = Float32(0)
+        for j in cutlass.range_constexpr(self.hidden // self.threads):
+            col = tid + Int64(j * self.threads)
+            forget = cute.math.tanh(Float32(forget_gain[fg_base + col]), fastmath=False)
+            gain = cute.math.tanh(Float32(forget_gain[fg_base + Int64(self.hidden) + col]), fastmath=False)
+            dv = Float32(dest[dest_base + col])
+            mv = Float32(msg[msg_base + col])
+            blended = (Float32(1.0) - forget) * dv + gain * mv
+            values[j] = blended
+            square = square + blended * blended
+        total = _block_sum(square, sums, Int32(0), self.threads // 32)
+        inv = _rsqrt(div_rn_f32(total, Float32(self.hidden)) + Float32(self.eps))
+        for j in cutlass.range_constexpr(self.hidden // self.threads):
+            col = tid + Int64(j * self.threads)
+            out[msg_base + col] = BFloat16(values[j] * inv * Float32(weight[w_base + col]))
+
+
+def _validate_common(hidden: int, slots: int, eps: float, max_rows: int) -> None:
+    if (type(hidden) is not int or hidden <= 0 or hidden % 256
+            or type(slots) is not int or slots not in (1, 3)
+            or not math.isfinite(eps) or eps <= 0
+            or type(max_rows) is not int or not 1 <= max_rows <= 2**31 - 1):
+        raise ValueError("invalid Inkling loop controller geometry/capacity")
+
+
+def compile_inkling2_loop_pair_norm_aot(
+    *, hidden: int = 2304, slots: int = 1, broadcast_dest: bool = False,
+    eps: float = 1e-6, max_rows: int = 4096,
+):
+    """Unweighted F32 RMSNorm of (dest, msg) concatenated into BF16 [slots, rows, 2*hidden]."""
+    _validate_common(hidden, slots, eps, max_rows)
+    if broadcast_dest and slots == 1:
+        raise ValueError("broadcast_dest requires slots > 1")
+    dest_slots = 1 if broadcast_dest else slots
+    return compile_program(
+        _LoopPairNorm(hidden, slots, broadcast_dest, eps),
+        name="inkling2_loop_pair_norm",
+        operands=(
+            Operand("dest", torch.float32, f"[{dest_slots},rows,{hidden}]"),
+            Operand("msg", torch.float32, f"[{slots},rows,{hidden}]"),
+            Operand("out", torch.bfloat16, f"[{slots},rows,{2 * hidden}]", "out"),
+        ),
+        scalars=(Scalar("rows"),),
+        key=(hidden, slots, broadcast_dest, eps, max_rows),
+        geometry=dict(hidden=hidden, slots=slots, broadcast_dest=broadcast_dest,
+                      eps=eps, max_rows=max_rows),
+        doc=__doc__,
+    )
+
+
+def compile_inkling2_loop_blend_norm_aot(
+    *, hidden: int = 2304, slots: int = 1, broadcast_dest: bool = False,
+    broadcast_weight: bool = False, eps: float = 1e-6, max_rows: int = 4096,
+):
+    """Fused F32 tanh-gated blend (1-tanh(f))*dest + tanh(g)*msg + weighted RMSNorm -> BF16."""
+    _validate_common(hidden, slots, eps, max_rows)
+    if (broadcast_dest or broadcast_weight) and slots == 1:
+        raise ValueError("broadcast flags require slots > 1")
+    dest_slots = 1 if broadcast_dest else slots
+    w_slots = 1 if broadcast_weight else slots
+    return compile_program(
+        _LoopBlendNorm(hidden, slots, broadcast_dest, broadcast_weight, eps),
+        name="inkling2_loop_blend_norm",
+        operands=(
+            Operand("dest", torch.float32, f"[{dest_slots},rows,{hidden}]"),
+            Operand("msg", torch.float32, f"[{slots},rows,{hidden}]"),
+            Operand("forget_gain", torch.float32, f"[{slots},rows,{2 * hidden}]",
+                    note="stacked [forget; gain] F32 pre-tanh logits per row"),
+            Operand("weight", torch.bfloat16, f"[{w_slots},{hidden}]"),
+            Operand("out", torch.bfloat16, f"[{slots},rows,{hidden}]", "out"),
+        ),
+        scalars=(Scalar("rows"),),
+        key=(hidden, slots, broadcast_dest, broadcast_weight, eps, max_rows),
+        geometry=dict(hidden=hidden, slots=slots, broadcast_dest=broadcast_dest,
+                      broadcast_weight=broadcast_weight, eps=eps, max_rows=max_rows),
+        doc=__doc__,
+    )

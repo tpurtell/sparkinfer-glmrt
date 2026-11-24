@@ -51,6 +51,9 @@ __all__ = [
     "GLMFGeometry",
     "KDAGeometry",
     "GLMGeometry",
+    "INKLING2_MINI",
+    "INKLING2_SMALL",
+    "Inkling2Geometry",
     "MIMO_V2_FLASH",
     "MIMO_V26_FLASH",
     "MIMO_V26_PRO",
@@ -330,6 +333,10 @@ class Inkling2Geometry:
 
 
 INKLING2_SMALL = Inkling2Geometry()
+INKLING2_MINI = Inkling2Geometry(
+    name="inkling2_mini", hidden=2304, heads=24, kv_heads=8, head_dim=128,
+    window=1024, rel_extent=1024, ring_rows=1088, page_rows=64,
+)
 
 
 @dataclass(frozen=True)

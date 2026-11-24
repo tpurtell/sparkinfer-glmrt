@@ -63,6 +63,7 @@ from ._common import (  # noqa: F401
     AotProgram,
     DSV4Geometry,
     GLMGeometry,
+    INKLING2_MINI,
     INKLING2_SMALL,
     Inkling2Geometry,
     MIMO_V2_FLASH,

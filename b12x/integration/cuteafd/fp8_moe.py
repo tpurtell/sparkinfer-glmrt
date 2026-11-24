@@ -426,6 +426,13 @@ GEOMETRIES = {
     # route weight applied before the FC2 quantization (``_mxfp8_moe_stream``).
     "inkling2_mxfp8": Fp8MoeGeometry("inkling2_mxfp8", hidden=4608, experts=384, top_k=8, intermediate=2304,
                                      weights="mxfp8", activation="situ", situ_gate_cap=4.0, situ_up_cap=25.0),
+    # Inkling 2 Mini native NVFP4 (layers 0-19) and MXFP8 (layers 20-23): 128 experts,
+    # top-8, hidden 2304, intermediate 1152, SiTU (4 / 25).
+    "inkling2_mini_nvfp4": Fp8MoeGeometry("inkling2_mini_nvfp4", hidden=2304, experts=128, top_k=8, intermediate=1152,
+                                          weights="nvfp4", activations="a4", activation="situ",
+                                          situ_gate_cap=4.0, situ_up_cap=25.0),
+    "inkling2_mini_mxfp8": Fp8MoeGeometry("inkling2_mini_mxfp8", hidden=2304, experts=128, top_k=8, intermediate=1152,
+                                          weights="mxfp8", activation="situ", situ_gate_cap=4.0, situ_up_cap=25.0),
     # MiniMax M3 vendor experts: calibrated W4A4 with the shared OAI epilogue.
     "minimax_nvfp4a4": Fp8MoeGeometry("minimax_nvfp4a4", hidden=6144, experts=128, top_k=4, intermediate=3072,
                                      swiglu_limit=7.0, weights="nvfp4", activations="a4",

@@ -41,6 +41,11 @@ def _round_bf16(value: Float32) -> Float32:
 
 
 class _Mix:
+    def __init__(self, hidden: int = _HIDDEN, taps: int = _TAPS):
+        self.hidden = int(hidden)
+        self.taps = int(taps)
+        self.items = self.hidden // _THREADS
+
     @cute.jit
     def __call__(self, features: cute.Pointer, alpha: cute.Pointer,
                  gamma: cute.Pointer, mixed: cute.Pointer, rows: Int32,
@@ -54,14 +59,14 @@ class _Mix:
                gamma: cute.Pointer, mixed: cute.Pointer, eps: Float32):
         row, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
-        base = Int64(row) * Int64(_TAPS * _HIDDEN)
-        values = cute.make_rmem_tensor(cute.make_layout(18), Float32)
+        base = Int64(row) * Int64(self.taps * self.hidden)
+        values = cute.make_rmem_tensor(cute.make_layout(self.items), Float32)
         squares = Float32(0)
-        for item in cutlass.range_constexpr(18):
+        for item in cutlass.range_constexpr(self.items):
             col = Int32(thread) + Int32(item * _THREADS)
             value = Float32(0)
-            for tap in cutlass.range_constexpr(_TAPS):
-                value += (Float32(features[base + Int64(tap * _HIDDEN) + Int64(col)])
+            for tap in cutlass.range_constexpr(self.taps):
+                value += (Float32(features[base + Int64(tap * self.hidden) + Int64(col)])
                           * Float32(alpha[tap]))
             values[item] = value
             squares += value * value
@@ -70,16 +75,20 @@ class _Mix:
         inverse = allocator.allocate_tensor(Float32, cute.make_layout(1), byte_alignment=4)
         total = block_reduce(warp_reduce(squares, _add), _add, scratch, Float32(0))
         if thread == 0:
-            inverse[0] = cute.math.rsqrt(total / Float32(_HIDDEN) + eps, fastmath=True)
+            inverse[0] = cute.math.rsqrt(total / Float32(self.hidden) + eps, fastmath=True)
         cute.arch.sync_threads()
         inv = inverse[0]
-        for item in cutlass.range_constexpr(18):
+        for item in cutlass.range_constexpr(self.items):
             col = Int32(thread) + Int32(item * _THREADS)
-            mixed[Int64(row) * Int64(_HIDDEN) + Int64(col)] = BFloat16(
+            mixed[Int64(row) * Int64(self.hidden) + Int64(col)] = BFloat16(
                 values[item] * inv * Float32(gamma[col]))
 
 
 class _MaskInit:
+    def __init__(self, hidden: int = _HIDDEN):
+        self.hidden = int(hidden)
+        self.items = self.hidden // _THREADS
+
     @cute.jit
     def __call__(self, normalized_anchors: cute.Pointer, mask: cute.Pointer,
                  block: cute.Pointer, sequences: Int32, stream: cuda.CUstream):
@@ -92,12 +101,12 @@ class _MaskInit:
                block: cute.Pointer):
         seq, pos, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
-        for item in cutlass.range_constexpr(18):
+        for item in cutlass.range_constexpr(self.items):
             col = Int64(thread) + Int64(item * _THREADS)
             value = mask[col]
             if pos == 0:
-                value = normalized_anchors[Int64(seq) * Int64(_HIDDEN) + col]
-            block[(Int64(seq) * Int64(8) + Int64(pos)) * Int64(_HIDDEN) + col] = value
+                value = normalized_anchors[Int64(seq) * Int64(self.hidden) + col]
+            block[(Int64(seq) * Int64(8) + Int64(pos)) * Int64(self.hidden) + col] = value
 
 
 class _Gate:
@@ -127,25 +136,29 @@ class _Gate:
         latent[index] = BFloat16(cute.math.tanh(out, fastmath=False))
 
 
-def compile_inkling_dflare_mix_aot():
+def compile_inkling_dflare_mix_aot(*, hidden: int = _HIDDEN, taps: int = _TAPS):
     """(features, alpha, gamma, mixed, rows:i32, eps:f32, stream)."""
-    return compile_program(_Mix(), name="inkling_dflare_mix", operands=(
-        Operand("features", torch.bfloat16, "[rows,8,4608]"),
-        Operand("alpha", torch.bfloat16, "[8]"),
-        Operand("gamma", torch.bfloat16, "[4608]"),
-        Operand("mixed", torch.bfloat16, "[rows,4608]", "out"),
+    if type(hidden) is not int or hidden <= 0 or hidden % _THREADS or type(taps) is not int or taps <= 0:
+        raise ValueError("Inkling dflare_mix requires hidden % 256 == 0 and positive taps")
+    return compile_program(_Mix(hidden, taps), name="inkling_dflare_mix", operands=(
+        Operand("features", torch.bfloat16, f"[rows,{taps},{hidden}]"),
+        Operand("alpha", torch.bfloat16, f"[{taps}]"),
+        Operand("gamma", torch.bfloat16, f"[{hidden}]"),
+        Operand("mixed", torch.bfloat16, f"[rows,{hidden}]", "out"),
     ), scalars=(Scalar("rows"), Scalar("eps", "float32")),
-        key=(_HIDDEN, _TAPS), geometry={"hidden": _HIDDEN, "taps": _TAPS}, doc=__doc__)
+        key=(hidden, taps), geometry={"hidden": hidden, "taps": taps}, doc=__doc__)
 
 
-def compile_inkling_mask_init_aot():
+def compile_inkling_mask_init_aot(*, hidden: int = _HIDDEN):
     """(normalized_anchors, mask, block, sequences:i32, stream)."""
-    return compile_program(_MaskInit(), name="inkling_mask_init", operands=(
-        Operand("normalized_anchors", torch.bfloat16, "[sequences,4608]"),
-        Operand("mask", torch.bfloat16, "[4608]"),
-        Operand("block", torch.bfloat16, "[sequences,8,4608]", "out"),
-    ), scalars=(Scalar("sequences"),), key=(_HIDDEN, 8),
-        geometry={"hidden": _HIDDEN, "block": 8}, doc=__doc__)
+    if type(hidden) is not int or hidden <= 0 or hidden % _THREADS:
+        raise ValueError("Inkling mask_init requires hidden % 256 == 0")
+    return compile_program(_MaskInit(hidden), name="inkling_mask_init", operands=(
+        Operand("normalized_anchors", torch.bfloat16, f"[sequences,{hidden}]"),
+        Operand("mask", torch.bfloat16, f"[{hidden}]"),
+        Operand("block", torch.bfloat16, f"[sequences,8,{hidden}]", "out"),
+    ), scalars=(Scalar("sequences"),), key=(hidden, 8),
+        geometry={"hidden": hidden, "block": 8}, doc=__doc__)
 
 
 def compile_inkling_recurrent_gate_aot():
@@ -169,6 +182,10 @@ def _narrow_double(value: Float64, *, loc=None, ip=None) -> Float32:
 
 
 class _HeadFold:
+    def __init__(self, hidden: int = _HIDDEN):
+        self.hidden = int(hidden)
+        self.k_tiles = self.hidden // 64
+
     @cute.jit
     def __call__(self, lm_head: cute.Pointer, hidden_out: cute.Pointer,
                  hidden_bias: cute.Pointer, folded_weight: cute.Pointer,
@@ -193,13 +210,13 @@ class _HeadFold:
         bias_sum = Float64(0)
         # A 4x64 head tile is shared across all rank columns. FP64 products
         # of BF16 inputs are exact; the only output narrowing is after K.
-        for k_tile in range(72):
+        for k_tile in range(self.k_tiles):
             local_r = Int32(thread) // 64
             k = Int32(k_tile) * 64 + Int32(thread) % 64
             relative = Int32(tile) * 4 + local_r
             value = BFloat16(0)
             if relative < rows:
-                value = lm_head[(Int64(first_row) + Int64(relative)) * 4608 + Int64(k)]
+                value = lm_head[(Int64(first_row) + Int64(relative)) * Int64(self.hidden) + Int64(k)]
             head[local_r, Int32(thread) % 64] = value
             cute.arch.sync_threads()
             for inner in cutlass.range_constexpr(64):
@@ -242,16 +259,18 @@ class _LogitFinish:
                 div_rn_f32(value, Float32(30)), fastmath=False))
 
 
-def compile_inkling_head_fold_aot():
+def compile_inkling_head_fold_aot(*, hidden: int = _HIDDEN):
     """FP64 startup fold, absolute output rows; zero device scratch, 512B/CTA SMEM."""
-    return compile_program(_HeadFold(), name="inkling_head_fold", operands=(
-        Operand("lm_head", torch.bfloat16, "[201024,4608]"),
-        Operand("hidden_out", torch.bfloat16, "[4608,256]"),
-        Operand("hidden_bias", torch.bfloat16, "[4608]"),
+    if type(hidden) is not int or hidden <= 0 or hidden % 64:
+        raise ValueError("Inkling head_fold requires hidden % 64 == 0")
+    return compile_program(_HeadFold(hidden), name="inkling_head_fold", operands=(
+        Operand("lm_head", torch.bfloat16, f"[201024,{hidden}]"),
+        Operand("hidden_out", torch.bfloat16, f"[{hidden},256]"),
+        Operand("hidden_bias", torch.bfloat16, f"[{hidden}]"),
         Operand("folded_weight", torch.bfloat16, "[201024,256]", "out"),
         Operand("folded_bias", torch.bfloat16, "[201024]", "out"),
-    ), scalars=(Scalar("first_row"), Scalar("rows")), key=(201024, 4608, 256),
-        geometry={"vocab": 201024, "hidden": 4608, "rank": 256}, doc=__doc__)
+    ), scalars=(Scalar("first_row"), Scalar("rows")), key=(201024, hidden, 256),
+        geometry={"vocab": 201024, "hidden": hidden, "rank": 256}, doc=__doc__)
 
 
 def compile_inkling_logit_finish_aot():
@@ -265,6 +284,10 @@ def compile_inkling_logit_finish_aot():
 
 
 class _ResidualNorm:
+    def __init__(self, hidden: int = _HIDDEN):
+        self.hidden = int(hidden)
+        self.items = self.hidden // 256
+
     @cute.jit
     def __call__(self, residual: cute.Pointer, delta: cute.Pointer,
                  gamma: cute.Pointer, residual_out: cute.Pointer,
@@ -280,11 +303,11 @@ class _ResidualNorm:
                norm_out: cute.Pointer, eps: Float32):
         row, _, _ = cute.arch.block_idx()
         thread, _, _ = cute.arch.thread_idx()
-        values = cute.make_rmem_tensor(cute.make_layout(18), Float32)
+        values = cute.make_rmem_tensor(cute.make_layout(self.items), Float32)
         squares = Float32(0)
-        for item in cutlass.range_constexpr(18):
+        for item in cutlass.range_constexpr(self.items):
             column = Int64(thread) + Int64(item * 256)
-            index = Int64(row) * 4608 + column
+            index = Int64(row) * Int64(self.hidden) + column
             value = Float32(residual[index]) + Float32(delta[index])
             values[item] = value
             residual_out[index] = BFloat16(value)
@@ -294,11 +317,11 @@ class _ResidualNorm:
         inverse = allocator.allocate_tensor(Float32, cute.make_layout(1), byte_alignment=4)
         total = block_reduce(warp_reduce(squares, _add), _add, scratch, Float32(0))
         if thread == 0:
-            inverse[0] = cute.math.rsqrt(total / Float32(4608) + eps, fastmath=True)
+            inverse[0] = cute.math.rsqrt(total / Float32(self.hidden) + eps, fastmath=True)
         cute.arch.sync_threads()
-        for item in cutlass.range_constexpr(18):
+        for item in cutlass.range_constexpr(self.items):
             column = Int64(thread) + Int64(item * 256)
-            norm_out[Int64(row) * 4608 + column] = BFloat16(
+            norm_out[Int64(row) * Int64(self.hidden) + column] = BFloat16(
                 values[item] * inverse[0] * Float32(gamma[column]))
 
 
@@ -365,20 +388,22 @@ class _QKNormRope:
             v_out[offset] = qkv[source]
 
 
-def compile_inkling_residual_norm_aot():
-    return compile_program(_ResidualNorm(), name="inkling_residual_norm", operands=(
-        Operand("residual", torch.bfloat16, "[rows,4608]"),
-        Operand("delta", torch.bfloat16, "[rows,4608]"),
-        Operand("gamma", torch.bfloat16, "[4608]"),
-        Operand("residual_out", torch.bfloat16, "[rows,4608]", "out"),
-        Operand("norm_out", torch.bfloat16, "[rows,4608]", "out"),
-    ), scalars=(Scalar("rows"), Scalar("eps", "float32")), key=(4608,),
-        geometry={"hidden": 4608}, doc=__doc__)
+def compile_inkling_residual_norm_aot(*, hidden: int = _HIDDEN):
+    if type(hidden) is not int or hidden <= 0 or hidden % 256:
+        raise ValueError("Inkling residual_norm requires hidden % 256 == 0")
+    return compile_program(_ResidualNorm(hidden), name="inkling_residual_norm", operands=(
+        Operand("residual", torch.bfloat16, f"[rows,{hidden}]"),
+        Operand("delta", torch.bfloat16, f"[rows,{hidden}]"),
+        Operand("gamma", torch.bfloat16, f"[{hidden}]"),
+        Operand("residual_out", torch.bfloat16, f"[rows,{hidden}]", "out"),
+        Operand("norm_out", torch.bfloat16, f"[rows,{hidden}]", "out"),
+    ), scalars=(Scalar("rows"), Scalar("eps", "float32")), key=(hidden,),
+        geometry={"hidden": hidden}, doc=__doc__)
 
 
 def compile_inkling_qk_norm_rope_aot(*, q_heads=48, kv_heads=8):
-    if (q_heads, kv_heads) not in ((48, 8), (24, 4), (0, 8), (0, 4)):
-        raise ValueError("Inkling Q/K heads require TP1, TP2 or context-only geometry")
+    if (q_heads, kv_heads) not in ((48, 8), (24, 8), (24, 4), (0, 8), (0, 4)):
+        raise ValueError("Inkling Q/K heads require Small/Mini TP1, TP2 or context-only geometry")
     return compile_program(_QKNormRope(q_heads, kv_heads), name="inkling_qk_norm_rope", operands=(
         Operand("qkv", torch.bfloat16, f"[rows,{(q_heads+2*kv_heads)*128}]"),
         Operand("q_gamma", torch.bfloat16, "[128]"),
