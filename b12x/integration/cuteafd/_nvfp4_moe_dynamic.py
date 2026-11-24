@@ -301,7 +301,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_dyn", 2, *super().key()[2:])
+        return ("stream_linear_nvfp4_dyn", 3, *super().key()[2:])
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
@@ -332,9 +332,12 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
                 w_off = Int64(e) * Int64(self.n) + Int64(n0)
                 w_rows = Int64(w.toint()) + w_off * Int64(self.k // 2)
                 s_rows = Int64(s.toint()) + w_off * Int64(self.k // 16)
-                # Expert factor: w_amax_e / (1536 * denominator); the row's amax multiplies in the epilogue.
-                expert_factor = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
-                    * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)))
+                # Expert factor: w_amax_e / (1536 * denominator) via IEEE div.rn (hoisted once per CTA;
+                # vendor uses correctly rounded rcp_rn at vLLM a0c1f162 ops/moe.py:352, activation.py:171).
+                expert_factor = div_rn_f32(
+                    _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                    Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)),
+                )
                 self._load(0, ring, a_rows, as_rows, w_rows, s_rows, live, tidx)
                 if const_expr(self.blocks > 1):
                     self._load(1, ring, a_rows, as_rows, w_rows, s_rows, live, tidx)
@@ -398,7 +401,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
         self.parts = _ceil(self.inter, self.half_n)
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_dyn", 3, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_dyn", 4, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     @cute.jit
@@ -459,8 +462,10 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                 warp_m = warp_id // Int32(2)
                 warp_n = warp_id % Int32(2)
                 sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
-                expert_factor = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
-                    * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)))
+                expert_factor = div_rn_f32(
+                    _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                    Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)),
+                )
                 active = warp_m * Int32(self.warp_rows) < live
                 q = lane // Int32(4)
                 c = lane % Int32(4)
@@ -1031,7 +1036,7 @@ class GateUpSmallDyn:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
 
     def key(self) -> tuple:
-        return ("gate_up_small_dyn", 3, self.inter, self.hidden, self.experts, self.w_ring,
+        return ("gate_up_small_dyn", 4, self.inter, self.hidden, self.experts, self.w_ring,
                 self.gate_cap, self.up_cap, self.max_live)
 
     def _w_layout(self):
@@ -1152,8 +1157,10 @@ class GateUpSmallDyn:
             sp = cutlass.select_(side == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
-            expert_factor = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
-                * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)))
+            expert_factor = div_rn_f32(
+                _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)),
+            )
             policy = create_l2_evict_first_policy()
             m_chunks = (live + Int32(15)) // Int32(16)
             for m_chunk in cutlass.range(m_chunks, unroll=1):
@@ -1355,7 +1362,7 @@ class DownSmallDyn:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("down_small_dyn", 3, self.n, self.k, self.experts, self.tile_n, self.max_live)
+        return ("down_small_dyn", 4, self.n, self.k, self.experts, self.tile_n, self.max_live)
 
     def _storage(self):
         class Storage:
@@ -1441,8 +1448,10 @@ class DownSmallDyn:
             sfb0 = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
             sfb1 = ld_global_nc_u32_l2hint(s_row + Int64(16) + Int64(c) * Int64(4), policy)
             sfb2 = ld_global_nc_u32_l2hint(s_row + Int64(32), policy)
-            expert_factor = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
-                * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)))
+            expert_factor = div_rn_f32(
+                _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)),
+            )
 
             w_ldm_row = sw + (warp_id * Int32(8) + mrow) * Int32(self.row_bytes) + mat * Int32(16)
             w_smem_row = sw + (warp_id * Int32(8) + q) * Int32(self.row_bytes) + c * Int32(4)
@@ -1596,7 +1605,7 @@ class GateUpSmallDynReg:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
 
     def key(self) -> tuple:
-        return ("gate_up_small_dyn_reg", 1, self.inter, self.hidden, self.experts,
+        return ("gate_up_small_dyn_reg", 2, self.inter, self.hidden, self.experts,
                 self.gate_cap, self.up_cap, self.max_live)
 
     def _storage(self):
@@ -1674,8 +1683,10 @@ class GateUpSmallDynReg:
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
             w_row = wp + w_row_idx * Int64(self.row_bytes)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
-            expert_factor = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
-                * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)))
+            expert_factor = div_rn_f32(
+                _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)),
+            )
             xch = shared_ptr_to_u32(storage.xch.data_ptr())
             policy = create_l2_evict_first_policy()
 
@@ -1822,7 +1833,7 @@ class DownSmallDynReg:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("down_small_dyn_reg", 1, self.n, self.k, self.experts, self.tile_n, self.max_live)
+        return ("down_small_dyn_reg", 2, self.n, self.k, self.experts, self.tile_n, self.max_live)
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer,
@@ -1885,8 +1896,10 @@ class DownSmallDynReg:
             w_idx = Int64(e) * Int64(self.n) + Int64(n0 + q)
             w_row = Int64(w.toint()) + w_idx * Int64(self.row_bytes)
             s_row = Int64(s.toint()) + w_idx * Int64(self.scale_bytes)
-            expert_factor = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)) \
-                * cute.arch.rcp_approx(Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)))
+            expert_factor = div_rn_f32(
+                _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)),
+            )
             policy = create_l2_evict_first_policy()
 
             # Preload all 9 naturally 4-byte aligned s2 scale words (ABI align=4).

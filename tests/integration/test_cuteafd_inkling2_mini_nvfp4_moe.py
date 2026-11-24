@@ -354,7 +354,9 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
 
     # Vendor-order exact-decode oracle on expert 0's row 0 (matches StreamNvfp4GateUpDyn):
     # 1. Exact dyadic (e2m1 * e4m3) grid dot product summed in F64 and verified exact in F32.
-    # 2. Epilogue folded in F32: acc * (x_amax * (w_amax / (1536 * DENOM))), then single BF16 round.
+    # 2. Epilogue folded in F32 with IEEE div.rn (matching vendor's tldevice.rcp_rn at
+    #    vLLM a0c1f162 ops/moe.py:347-353 and ops/activation.py:156,171):
+    #    acc * (x_amax * (w_amax / (1536 * DENOM))), then single BF16 round.
     x_q_ref, x_s_ref, x_amax_ref, x_recon_ref = _reference_quantize_nvfp4_exact(x[:1].float())
     x_grid_ref = x_recon_ref.double() * (1536.0 / x_amax_ref.double()[:, None])
     w1_grid, _ = small_nvfp4._grid_expert(m1, 0, "cuda")
