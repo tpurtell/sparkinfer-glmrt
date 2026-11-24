@@ -145,8 +145,8 @@ class ScaledBilinearPosition:
         if cutlass.const_expr(self.contraction == "unfused"):
             src = _sub(_mul(rscale, _add(Float32(dst), Float32(0.5))), Float32(0.5))
         src = cute.math.max(src, Float32(0.0))
-        low = Int64(Int32(src))
-        step = Int64(1) if low < Int64(length - 1) else Int64(0)
+        low = Int64(src)
+        step = cute.math.min(low + Int64(1), Int64(length - 1)) - low
         lam1 = _sub(src, Float32(low))
         lam0 = _sub(Float32(1.0), lam1)
         return low, step, lam0, lam1
