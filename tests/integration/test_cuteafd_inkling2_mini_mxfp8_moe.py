@@ -215,6 +215,40 @@ def test_inkling2_mini_mxfp8_exact_ue8m0_and_block_amax():
           f"extreme UE8M0=1*E4M3(2^-9) exact max|out|={expected.float().abs().max().item():.4e} vs BF16-expanded 0.0")
 
 
+@pytest.mark.parametrize("expected_m", [1, 80])
+def test_inkling2_mini_mxfp8_wire_rows_quant_2304(expected_m):
+    """Verify H=2304 (2376-byte 8B-aligned stride) wire-row MXFP8 quantizer on odd/even rows."""
+    import cutlass
+    import cutlass.cute as cute
+    from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot, mxfp8_rows_quant_aot_grid
+    from b12x._lib.utils import current_cuda_stream, make_ptr
+
+    h = 2304
+    row_bytes = h + h // 32
+    assert row_bytes == 2376 and row_bytes % 16 == 8
+    raw = compile_mxfp8_rows_quant_aot(size_k=h, expected_m=expected_m, wire_rows=True)
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    gen = torch.Generator(device="cuda").manual_seed(2304 + expected_m)
+    dummy_mma = torch.empty(1024, dtype=torch.uint8, device="cuda")
+    for rows in (1, 17):
+        x = (torch.randn((rows, h), generator=gen, device="cuda") * 2.0).bfloat16().contiguous()
+        wire = torch.full((rows, row_bytes), 0xEE, dtype=torch.uint8, device="cuda")
+        grid_x = mxfp8_rows_quant_aot_grid(size_k=h, rows=rows, expected_m=expected_m, sm_count=sm_count)
+        raw(
+            make_ptr(cutlass.BFloat16, x.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint32, wire.data_ptr(), cute.AddressSpace.gmem, assumed_align=8),
+            make_ptr(cutlass.Uint8, wire.data_ptr() + h, cute.AddressSpace.gmem, assumed_align=8),
+            make_ptr(cutlass.Uint8, dummy_mma.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
+            rows,
+            grid_x,
+            current_cuda_stream(),
+        )
+        torch.cuda.synchronize()
+        ref_q, ref_s, _ = small_mxfp8._mxfp8(x.float())
+        assert torch.equal(wire[:, :h], ref_q.view(torch.uint8)), f"payload mismatch (expected_m={expected_m}, rows={rows})"
+        assert torch.equal(wire[:, h:], ref_s), f"scale mismatch (expected_m={expected_m}, rows={rows})"
+
+
 def test_inkling2_mini_mxfp8_geometry():
     g = _geometry()
     assert (g.hidden, g.intermediate, g.slice, g.experts, g.top_k) == (2304, 1152, 1152, 128, 8)

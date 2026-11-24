@@ -110,7 +110,9 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
 
     def key(self) -> tuple:
         return ("stream_gate_up_mxfp8", 1, self.inter, self.hidden, self.experts, self.a_ring, self.w_ring,
-                self.gate_cap, self.up_cap, self.act_row_bytes) + (("row_addresses",) if self.row_addresses else ())
+                self.gate_cap, self.up_cap, self.act_row_bytes) + (
+                    ("row_addresses",) if self.row_addresses else ()) + (
+                    ("wire_align8",) if self.row_bytes % 16 else ())
 
     def _storage(self, w_layout):
         class Storage:

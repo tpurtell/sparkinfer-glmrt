@@ -103,8 +103,9 @@ if cute is not None:
         @cute.kernel
         def kernel(self, x: cute.Pointer, packed: cute.Pointer, scales: cute.Pointer,
                    amax_out: cute.Pointer, rows: Int32, blocks_per_row: Int32):
-            from b12x._lib.intrinsics import cvt_f32_to_e4m3, fabs_f32, fmax_f32, fmin_f32, fp8_e4m3_to_f32
-            from b12x._lib.quant.nvfp4_e2m1 import max_abs_16
+            from b12x._lib.intrinsics import (
+                cvt_f32_to_e4m3, fabs_f32, fmax_f32, fmin_f32, fp8_e4m3_to_f32, max_abs_16,
+            )
             from b12x.integration.cuteafd._nvfp4_moe_dynamic import (
                 _candidate_fast, _quantize_row16_dyn, _row_factors, st_global_u64, st_global_u8,
             )
@@ -279,14 +280,14 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
          disagrees with the BF16-corrupted path).
     """
     from b12x.integration.cuteafd._fp8_moe_stream import STREAM_TILE_M
+    from b12x.integration.cuteafd.fp8_moe import meta_words, stream_max_tiles
 
     g = _geometry()
     e, k, h, i = g.experts, g.top_k, g.hidden, g.slice
     DENOM = 2688.0
     capacity, rows = 16, 4
     pairs = rows * k
-    groups = min(pairs, e)
-    mt = (pairs + STREAM_TILE_M - 1) // STREAM_TILE_M + groups
+    mt = stream_max_tiles(e, pairs)
     P = mt * STREAM_TILE_M
 
     # Deterministic power-of-two activations so F32 dot products have zero accumulation ambiguity:
@@ -324,9 +325,9 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     w2, s2, m2 = make_packed(exact_amax, h, i, torch.full((h,), 2, dtype=torch.uint8, device="cuda"))
 
     prog = small_nvfp4._stage_program(g, capacity)
-    meta = torch.empty(16 + 2 * e + 2 * mt, dtype=torch.int32, device="cuda")
-    pair_row = torch.empty(pairs, dtype=torch.int32, device="cuda")
-    pair_pos = torch.empty(pairs, dtype=torch.int32, device="cuda")
+    meta = torch.zeros(meta_words(e, mt), dtype=torch.int32, device="cuda")
+    pair_row = torch.full((pairs,), -7, dtype=torch.int32, device="cuda")
+    pair_pos = torch.full((pairs,), -7, dtype=torch.int32, device="cuda")
     xq = torch.empty((P, h // 2), dtype=torch.uint8, device="cuda")
     xs = torch.empty((P, h // 16), dtype=torch.uint8, device="cuda")
     xamax = torch.empty(P, dtype=torch.float32, device="cuda")
@@ -339,7 +340,7 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     y = torch.empty((pairs, h), dtype=torch.bfloat16, device="cuda")
     out = torch.empty((rows, h), dtype=torch.bfloat16, device="cuda")
     exch = torch.empty((P, 2 * i), dtype=torch.bfloat16, device="cuda")
-    exch_rows = torch.empty((P, 4), dtype=torch.int32, device="cuda")
+    exch_rows = torch.full((P, 4), -1, dtype=torch.int32, device="cuda")
     lin_g = torch.empty((pairs, i), dtype=torch.bfloat16, device="cuda")
     lin_u = torch.empty((pairs, i), dtype=torch.bfloat16, device="cuda")
 
@@ -367,10 +368,17 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     act_bug = small_nvfp4._situ(gate_bug, up_bug, torch.ones(1, device="cuda"), g.situ_gate_cap, g.situ_up_cap)
     aq_bug, as_bug, _, _ = _reference_quantize_nvfp4_exact(act_bug.float())
 
-    # Locate expert 0's first live tile row in the kernel's packed buffers.
-    live_mask = (exch_rows[:, 0] == 0) & (exch_rows[:, 1] == 0)
-    assert live_mask.any(), "expert 0 row 0 missing from stage dump"
-    slot_idx = int(live_mask.nonzero(as_tuple=False)[0, 0].item())
+    # Locate expert 0's first live tile row (pair 0 = row 0, slot 0 -> expert 0) in the packed buffers.
+    meta_c = meta.cpu().tolist()
+    offsets = meta_c[4 + e : 4 + 2 * e]
+    tiles = meta_c[4 + 3 * e : 4 + 3 * e + meta_c[1]]
+    tile_of = {((c & 0xFFFF), c >> 16): tt for tt, c in enumerate(tiles)}
+    pos0 = int(pair_pos[0].item())
+    local0 = pos0 - offsets[0]
+    slot_idx = tile_of[(0, local0 // STREAM_TILE_M)] * STREAM_TILE_M + local0 % STREAM_TILE_M
+    assert int(exch_rows[slot_idx, 2].item()) == pos0 and int(exch_rows[slot_idx, 3].item()) == 0, (
+        f"expert 0 row 0 misaddressed in stage dump: exch_rows={exch_rows[slot_idx].tolist()}"
+    )
     kernel_gate = exch[slot_idx, :i]
     kernel_up = exch[slot_idx, i:]
     kernel_aq = aq[slot_idx : slot_idx + 1]
