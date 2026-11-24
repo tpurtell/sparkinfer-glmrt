@@ -61,6 +61,7 @@ class Hy4MlaGeometry:
     page_rows: int = 64
     window_size: int | None = None
     kv_cache: str = "bf16"
+    mrope_section: tuple = (12, 10, 10)
 
     def __post_init__(self) -> None:
         if self.kv_cache not in ("bf16", "fp8"):
@@ -72,6 +73,7 @@ class Hy4MlaGeometry:
             raise ValueError("unsupported Hy4 MLA dimensions")
         if self.window_size not in (None, 512):
             raise ValueError("Hy4 MLA window_size must be None (DSA) or 512 (SWA)")
+        _validate_mrope(self.mrope_section, self.qk_rope_dim // 2)
 
     @property
     def record_bytes(self) -> int:
@@ -80,6 +82,28 @@ class Hy4MlaGeometry:
     @property
     def softmax_scale(self) -> float:
         return 256.0 ** -0.5
+
+
+def _validate_mrope(section, pairs):
+    if (not isinstance(section, tuple) or len(section) != 3
+            or any(not isinstance(s, int) or s < 0 for s in section) or sum(section) != pairs):
+        raise ValueError(f"Hy4 mrope_section must be three non-negative ints summing to {pairs}")
+
+
+@cute.jit
+def _mrope_position(positions: cute.Pointer, row: Int64, pair: Int64, s1: cutlass.Constexpr, s2: cutlass.Constexpr):
+    """Interleaved M-RoPE: pair p reads H when p%3==1 and p<3*s1, W when p%3==2
+    and p<3*s2, otherwise T, from ``positions[row, 3]``. Equal axes (text rows)
+    give exactly the scalar-position angle."""
+    axis = Int64(0)
+    remainder = pair % Int64(3)
+    if remainder == Int64(1):
+        if pair < Int64(3 * s1):
+            axis = Int64(1)
+    if remainder == Int64(2):
+        if pair < Int64(3 * s2):
+            axis = Int64(2)
+    return Float32(positions[row * Int64(3) + axis])
 
 
 def _align(n: int) -> int:
@@ -218,7 +242,7 @@ class _Hy4RankNormPack:
                         scales[tid // Int32(32)] = scale
                 if tid < Int32(32):
                     pair = Int64(tid)
-                    angle = Float32(positions[row]) * Float32(inv_freq[pair])
+                    angle = _mrope_position(positions, row, pair, self.g.mrope_section[1], self.g.mrope_section[2]) * Float32(inv_freq[pair])
                     c = cute.math.cos(angle, fastmath=False)
                     s = cute.math.sin(angle, fastmath=False)
                     x0 = Float32(kv_a[row * Int64(576) + Int64(512) + pair * Int64(2)])
@@ -232,7 +256,7 @@ class _Hy4RankNormPack:
                     cache[slot * Int64(576) + d] = (kv[j] * ki * Float32(kv_norm[d])).to(BFloat16)
                 if tid < Int32(32):
                     pair = Int64(tid)
-                    angle = Float32(positions[row]) * Float32(inv_freq[pair])
+                    angle = _mrope_position(positions, row, pair, self.g.mrope_section[1], self.g.mrope_section[2]) * Float32(inv_freq[pair])
                     c = cute.math.cos(angle, fastmath=False)
                     s = cute.math.sin(angle, fastmath=False)
                     x0 = Float32(kv_a[row * Int64(576) + Int64(512) + pair * Int64(2)])
@@ -242,10 +266,11 @@ class _Hy4RankNormPack:
 
 
 class _Hy4QueryTailRope:
-    """Interleaved RoPE-64 on q_rope [rows, H, 192..256] -> query [rows, H, 512..576]."""
+    """Interleaved M-RoPE-64 on q_rope [rows, H, 192..256] -> query [rows, H, 512..576]."""
 
-    def __init__(self, heads: int):
+    def __init__(self, heads: int, mrope_section: tuple = (12, 10, 10)):
         self.heads = heads
+        self.mrope_section = mrope_section
 
     @cute.jit
     def __call__(
@@ -265,7 +290,7 @@ class _Hy4QueryTailRope:
     def kernel(self, q_raw: cute.Pointer, positions: cute.Pointer, inv_freq: cute.Pointer, query: cute.Pointer):
         row, head, _ = cute.arch.block_idx()
         pair = Int64(cute.arch.thread_idx()[0])
-        angle = Float32(positions[Int64(row)]) * Float32(inv_freq[pair])
+        angle = _mrope_position(positions, Int64(row), pair, self.mrope_section[1], self.mrope_section[2]) * Float32(inv_freq[pair])
         c = cute.math.cos(angle, fastmath=False)
         s = cute.math.sin(angle, fastmath=False)
         h = Int64(row) * Int64(self.heads) + Int64(head)
@@ -284,7 +309,7 @@ class _Hy4QAbsorb:
             a_row=g.heads * 256, a_batch=256,
             o_row=g.heads * 576, o_batch=576,
         )
-        self.tail = _Hy4QueryTailRope(g.heads)
+        self.tail = _Hy4QueryTailRope(g.heads, g.mrope_section)
 
     @cute.jit
     def __call__(
@@ -673,7 +698,7 @@ def compile_hy4_mla_rank_norm_pack_aot(g: Hy4MlaGeometry):
         Operand("q_norm", torch.bfloat16, "[1024]"),
         Operand("kv_norm", torch.bfloat16, "[512]"),
         Operand("slots", torch.int64, "[rows]", align=8),
-        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows,3]", align=8, note="M-RoPE (T,H,W) rotary positions"),
         Operand("inv_freq", torch.float32, "[32]", align=4),
         Operand("q_resid", torch.bfloat16, "[rows,1024]", "out"),
         Operand(
@@ -688,8 +713,9 @@ def compile_hy4_mla_rank_norm_pack_aot(g: Hy4MlaGeometry):
         name=f"hy4_mla_rank_norm_pack_{g.kv_cache}",
         operands=operands,
         scalars=(Scalar("rows"),),
-        key=(g.kv_cache, g.norm_eps, "rank_norm_pack"),
-        geometry={"kv_cache": g.kv_cache, "norm_eps": g.norm_eps, "record_bytes": g.record_bytes},
+        key=(g.kv_cache, g.norm_eps, "rank_norm_pack", g.mrope_section),
+        geometry={"kv_cache": g.kv_cache, "norm_eps": g.norm_eps, "record_bytes": g.record_bytes,
+                  "mrope_section": list(g.mrope_section)},
         doc=__doc__,
     )
 
@@ -698,7 +724,7 @@ def compile_hy4_mla_q_absorb_aot(g: Hy4MlaGeometry):
     operands = (
         Operand("q_raw", torch.bfloat16, f"[rows,{g.heads},256]"),
         Operand("w_uk", torch.bfloat16, f"[{g.heads},512,192]"),
-        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows,3]", align=8, note="M-RoPE (T,H,W) rotary positions"),
         Operand("inv_freq", torch.float32, "[32]", align=4),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
     )
@@ -707,8 +733,9 @@ def compile_hy4_mla_q_absorb_aot(g: Hy4MlaGeometry):
         name=f"hy4_mla_q_absorb_h{g.heads}",
         operands=operands,
         scalars=(Scalar("rows"),),
-        key=(g.heads, "q_absorb"),
-        geometry={"heads": g.heads, "qk_nope_dim": 192, "qk_rope_dim": 64},
+        key=(g.heads, "q_absorb", g.mrope_section),
+        geometry={"heads": g.heads, "qk_nope_dim": 192, "qk_rope_dim": 64,
+                  "mrope_section": list(g.mrope_section)},
         doc=__doc__,
     )
 

@@ -68,6 +68,9 @@ _GROUPS_PER_PAGE = 16      # 64 tokens / compress_ratio 4
 _PAGE_BYTES = _GROUPS_PER_PAGE * _GROUP_RECORD_BYTES  # 2112
 
 
+from .hy4_mla import _mrope_position, _validate_mrope
+
+
 @dataclass(frozen=True)
 class Hy4IndexerGeometry:
     heads: int = 16
@@ -78,11 +81,13 @@ class Hy4IndexerGeometry:
     candidate_topk: int = 2048
     page_rows: int = 64
     norm_eps: float = 1e-5
+    mrope_section: tuple = (12, 10, 10)
 
     def __post_init__(self) -> None:
         if (self.heads, self.head_dim, self.rope_dim, self.compress_ratio,
                 self.group_topk, self.candidate_topk, self.page_rows) != (16, 128, 64, 4, 512, 2048, 64):
             raise ValueError("unsupported Hy4 compressed indexer geometry")
+        _validate_mrope(self.mrope_section, self.rope_dim // 2)
 
     @property
     def weight_scale(self) -> float:
@@ -94,6 +99,8 @@ class Hy4IndexerGeometry:
 
 
 HY4_FLASH_INDEXER = Hy4IndexerGeometry()
+
+
 
 
 @cute.jit
@@ -134,6 +141,7 @@ class _Hy4IndexerQueryRope:
     def __init__(self, g: Hy4IndexerGeometry):
         self.heads = g.heads
         self.weight_scale = float(g.weight_scale)
+        self.mrope_section = g.mrope_section
 
     @cute.jit
     def __call__(
@@ -169,7 +177,7 @@ class _Hy4IndexerQueryRope:
         q_out[base + tid] = q_raw[base + tid]
         # Tail 64 dims rotated in 32 interleaved pairs by threads 0..31.
         if tid < Int64(32):
-            angle = Float32(positions[row]) * Float32(inv_freq[tid])
+            angle = _mrope_position(positions, row, tid, self.mrope_section[1], self.mrope_section[2]) * Float32(inv_freq[tid])
             c = cute.math.cos(angle, fastmath=False)
             s = cute.math.sin(angle, fastmath=False)
             off = base + Int64(64) + tid * Int64(2)
@@ -192,6 +200,7 @@ class _Hy4IndexerPoolGroup:
 
     def __init__(self, g: Hy4IndexerGeometry):
         self.eps = float(g.norm_eps)
+        self.mrope_section = g.mrope_section
 
     def _storage(self):
         class Storage:
@@ -294,7 +303,7 @@ class _Hy4IndexerPoolGroup:
         # Interleaved tail-64 RoPE on dims 64..128 in place in shared memory.
         if d < Int32(32):
             pair = Int64(d)
-            angle = Float32(group_positions[gid]) * Float32(inv_freq[pair])
+            angle = _mrope_position(group_positions, gid, pair, self.mrope_section[1], self.mrope_section[2]) * Float32(inv_freq[pair])
             c = cute.math.cos(angle, fastmath=False)
             s = cute.math.sin(angle, fastmath=False)
             i0 = Int32(64) + d * Int32(2)
@@ -521,7 +530,7 @@ def compile_hy4_indexer_query_rope_aot(g: Hy4IndexerGeometry = HY4_FLASH_INDEXER
     operands = (
         Operand("q_raw", torch.bfloat16, "[rows,16,128]"),
         Operand("w_raw", torch.bfloat16, "[rows,16]"),
-        Operand("positions", torch.int64, "[rows]", align=8),
+        Operand("positions", torch.int64, "[rows,3]", align=8, note="M-RoPE (T,H,W) rotary positions"),
         Operand("inv_freq", torch.float32, "[32]", align=4),
         Operand("q_out", torch.bfloat16, "[rows,16,128]", "out"),
         Operand("w_out", torch.float32, "[rows,16]", "out", align=4),
@@ -544,7 +553,8 @@ def compile_hy4_indexer_pool_group_aot(g: Hy4IndexerGeometry = HY4_FLASH_INDEXER
         Operand("w_kg", torch.float32, "[128,128]"),
         Operand("ape", torch.float32, "[4,128]"),
         Operand("key_norm", torch.float32, "[128]"),
-        Operand("group_positions", torch.int64, "[groups]", align=8),
+        Operand("group_positions", torch.int64, "[groups,3]", align=8,
+                note="M-RoPE (T,H,W) of each group's first token"),
         Operand("group_slots", torch.int64, "[groups]", align=8),
         Operand("inv_freq", torch.float32, "[32]", align=4),
         Operand("group_cache", torch.uint8, f"[pages,{_PAGE_BYTES}]", "inout"),
