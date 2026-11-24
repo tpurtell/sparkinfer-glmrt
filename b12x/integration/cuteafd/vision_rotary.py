@@ -34,39 +34,35 @@ class VisionQkvRotary:
             local = column % Int64(self.dim)
             base = row * Int64(3) * width + column
             v[at] = qkv[base + Int64(2) * width]
-            if cutlass.const_expr(self.rotated == 0):
-                # Unrotated towers (Hy4 SigLIP2): an exact fused-QKV split copy.
-                q[at], k[at] = qkv[base], qkv[base + width]
-            else:
-                if local < Int64(self.rotated):
-                    if cutlass.const_expr(self.adjacent):
-                        pair = column - local + (local ^ Int64(1))
-                        table = row * Int64(self.rotated // 2) + local // Int64(2)
-                        negative = local % Int64(2) == Int64(0)
-                    else:
-                        half = Int64(self.rotated // 2)
-                        pair = column - local + (local + half) % Int64(self.rotated)
-                        table = row * Int64(self.rotated // 2) + local % half
-                        negative = local < half
-                    c, s = Float32(cos[table]), Float32(sin[table])
-                    for offset, out in ((Int64(0), q), (width, k)):
-                        value = Float32(qkv[base + offset])
-                        partner = Float32(qkv[row * Int64(3) * width + pair + offset])
-                        second = _mul(partner, s)
-                        if cutlass.const_expr(self.adjacent):
-                            # Installed ATen complex64 mul SASS: FMUL(b,d)/FMUL(a,d),
-                            # then FFMA(a,c,-bd)/FFMA(b,c,ad), one BF16 cast afterward.
-                            if negative:
-                                second = -second
-                            result = _fma(value, c, second)
-                        else:
-                            first = _mul(value, c)
-                            result = _add(first, second)
-                            if negative:
-                                result = _sub(first, second)
-                        out[at] = result.to(BFloat16)
+            if local < Int64(self.rotated):
+                if cutlass.const_expr(self.adjacent):
+                    pair = column - local + (local ^ Int64(1))
+                    table = row * Int64(self.rotated // 2) + local // Int64(2)
+                    negative = local % Int64(2) == Int64(0)
                 else:
-                    q[at], k[at] = qkv[base], qkv[base + width]
+                    half = Int64(self.rotated // 2)
+                    pair = column - local + (local + half) % Int64(self.rotated)
+                    table = row * Int64(self.rotated // 2) + local % half
+                    negative = local < half
+                c, s = Float32(cos[table]), Float32(sin[table])
+                for offset, out in ((Int64(0), q), (width, k)):
+                    value = Float32(qkv[base + offset])
+                    partner = Float32(qkv[row * Int64(3) * width + pair + offset])
+                    second = _mul(partner, s)
+                    if cutlass.const_expr(self.adjacent):
+                        # Installed ATen complex64 mul SASS: FMUL(b,d)/FMUL(a,d),
+                        # then FFMA(a,c,-bd)/FFMA(b,c,ad), one BF16 cast afterward.
+                        if negative:
+                            second = -second
+                        result = _fma(value, c, second)
+                    else:
+                        first = _mul(value, c)
+                        result = _add(first, second)
+                        if negative:
+                            result = _sub(first, second)
+                    out[at] = result.to(BFloat16)
+            else:
+                q[at], k[at] = qkv[base], qkv[base + width]
 
 
 def compile_vision_qkv_rotary_aot(*, heads, dim, rotated, adjacent=False):
@@ -76,10 +72,8 @@ def compile_vision_qkv_rotary_aot(*, heads, dim, rotated, adjacent=False):
     MiniMax (78 of 80 dims); its two unrotated tail values are copied exactly.
     Outputs must not alias the fused source. No live quantity enters the key.
     """
-    if heads <= 0 or dim <= 0 or rotated < 0 or rotated > dim or rotated % 2:
+    if heads <= 0 or dim <= 0 or rotated <= 0 or rotated > dim or rotated % 2:
         raise ValueError("invalid vision QKV rotary geometry")
-    if rotated == 0 and adjacent:
-        raise ValueError("an unrotated QKV split has no rotary pairing")
     if adjacent and rotated != dim:
         raise ValueError("adjacent-pair vision rotary requires the complete head")
     return compile_program(VisionQkvRotary(heads, dim, rotated, bool(adjacent)),

@@ -58,6 +58,11 @@ def _rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     return (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)) * w.float()
 
 
+def _thw(pos: torch.Tensor) -> torch.Tensor:
+    """Text rows: all three M-RoPE axes carry the same position, int64 [rows,3]."""
+    return pos.to(torch.int64).unsqueeze(-1).expand(*pos.shape, 3).contiguous()
+
+
 def _interleaved_rope(x: torch.Tensor, pos: torch.Tensor, theta: float) -> torch.Tensor:
     width = x.shape[-1]
     inv = 1.0 / (theta ** (torch.arange(0, width, 2, dtype=torch.float32, device=x.device) / width))
@@ -211,7 +216,7 @@ def test_hy4_mla_long_dsa_dynamic_splits(active_splits: int):
     cache = torch.zeros(6, 64, 656, dtype=torch.uint8, device=dev)
     q_resid = torch.empty(seq_len, 1024, dtype=torch.bfloat16, device=dev)
     compile_hy4_mla_rank_norm_pack_aot(g).launch(
-        q_a, kv_a, q_norm, kv_norm, slots, positions, inv_freq, q_resid, cache, scalars=(seq_len,)
+        q_a, kv_a, q_norm, kv_norm, slots, _thw(positions), inv_freq, q_resid, cache, scalars=(seq_len,)
     )
     prog = compile_hy4_mla_attention_aot(g, max_rows=16, max_context=2048, mode="decode", page_size=1)
     scratch = torch.empty(max(1024, hy4_attention_layout(g, 16, max_context=2048, mode="decode")["scratch_bytes"]),
@@ -259,11 +264,11 @@ def test_hy4_mla_end_to_end_oracle(kv_cache: str, heads: int, window: int | None
                         dtype=torch.uint8 if kv_cache == "fp8" else torch.bfloat16, device=dev)
     q_resid = torch.empty(seq_len, 1024, dtype=torch.bfloat16, device=dev)
     compile_hy4_mla_rank_norm_pack_aot(g).launch(
-        q_a, kv_a, q_norm, kv_norm, slots, positions, inv_freq, q_resid, cache, scalars=(seq_len,)
+        q_a, kv_a, q_norm, kv_norm, slots, _thw(positions), inv_freq, q_resid, cache, scalars=(seq_len,)
     )
 
     query = torch.empty(seq_len, heads, 576, dtype=torch.bfloat16, device=dev)
-    compile_hy4_mla_q_absorb_aot(g).launch(q_raw, w_uk, positions, inv_freq, query, scalars=(seq_len,))
+    compile_hy4_mla_q_absorb_aot(g).launch(q_raw, w_uk, _thw(positions), inv_freq, query, scalars=(seq_len,))
 
     # Attention: page_size=64 for SWA, page_size=1 selected-token gather for DSA
     ps = 64 if window is not None else 1
@@ -331,7 +336,7 @@ def test_hy4_indexer_oracle():
     cache = torch.zeros(4, g.page_bytes, dtype=torch.uint8, device=dev)
 
     compile_hy4_indexer_pool_group_aot(g).launch(
-        tokens, w_kv, w_kg, ape, key_norm, g_pos, g_slots, inv_freq, cache, scalars=(groups,)
+        tokens, w_kv, w_kg, ape, key_norm, _thw(g_pos), g_slots, inv_freq, cache, scalars=(groups,)
     )
 
     rows = 8
@@ -340,7 +345,7 @@ def test_hy4_indexer_oracle():
     positions = torch.tensor([16, 20, 40, 63, 64, 90, 120, 127], dtype=torch.int64, device=dev)
     q_rot = torch.empty_like(q_raw)
     w_out = torch.empty(rows, 16, dtype=torch.float32, device=dev)
-    compile_hy4_indexer_query_rope_aot(g).launch(q_raw, w_raw, positions, inv_freq, q_rot, w_out, scalars=(rows,))
+    compile_hy4_indexer_query_rope_aot(g).launch(q_raw, w_raw, _thw(positions), inv_freq, q_rot, w_out, scalars=(rows,))
 
     pt = torch.tensor([[0, 1, 2, 3]] * rows, dtype=torch.int32, device=dev)
     limits = (positions // 4).to(torch.int32)
@@ -408,10 +413,10 @@ def test_hy4_mla_swa_extend_clips_window(kv_cache: str, heads: int):
     )
     q_resid = torch.empty(seq_len, 1024, dtype=torch.bfloat16, device=dev)
     compile_hy4_mla_rank_norm_pack_aot(g).launch(
-        q_a, kv_a, q_norm, kv_norm, slots, positions, inv_freq, q_resid, cache, scalars=(seq_len,)
+        q_a, kv_a, q_norm, kv_norm, slots, _thw(positions), inv_freq, q_resid, cache, scalars=(seq_len,)
     )
     query = torch.empty(seq_len, heads, 576, dtype=torch.bfloat16, device=dev)
-    compile_hy4_mla_q_absorb_aot(g).launch(q_raw, w_uk, positions, inv_freq, query, scalars=(seq_len,))
+    compile_hy4_mla_q_absorb_aot(g).launch(q_raw, w_uk, _thw(positions), inv_freq, query, scalars=(seq_len,))
 
     prog_attn = compile_hy4_mla_attention_aot(g, max_rows=seq_len, max_context=2048, mode="extend", page_size=64)
     scratch = torch.empty(
@@ -573,9 +578,9 @@ def test_hy4_mla_dsa_context_split_oracle(kv_cache: str, active_splits: int):
     )
     q_resid = torch.empty(total_tokens, 1024, dtype=torch.bfloat16, device=dev)
     pack_prog = compile_hy4_mla_rank_norm_pack_aot(g32)
-    pack_prog.launch(q_a_dummy, kv_a, q_norm, kv_norm, slots_full, kv_pos, inv_freq, q_resid, cache_full, scalars=(total_tokens,))
-    pack_prog.launch(q_a_dummy, kv_a, q_norm, kv_norm, slots_r0, kv_pos, inv_freq, q_resid, cache_r0, scalars=(total_tokens,))
-    pack_prog.launch(q_a_dummy, kv_a, q_norm, kv_norm, slots_r1, kv_pos, inv_freq, q_resid, cache_r1, scalars=(total_tokens,))
+    pack_prog.launch(q_a_dummy, kv_a, q_norm, kv_norm, slots_full, _thw(kv_pos), inv_freq, q_resid, cache_full, scalars=(total_tokens,))
+    pack_prog.launch(q_a_dummy, kv_a, q_norm, kv_norm, slots_r0, _thw(kv_pos), inv_freq, q_resid, cache_r0, scalars=(total_tokens,))
+    pack_prog.launch(q_a_dummy, kv_a, q_norm, kv_norm, slots_r1, _thw(kv_pos), inv_freq, q_resid, cache_r1, scalars=(total_tokens,))
 
     # Diverse rows: empty rank 1, empty rank 0, unbalanced, balanced, full 2048-token union, both-empty.
     row_token_lists: list[list[int]] = [
@@ -598,7 +603,7 @@ def test_hy4_mla_dsa_context_split_oracle(kv_cache: str, active_splits: int):
     sink = torch.randn(32, dtype=torch.float32, device=dev) * 0.5
     q_pos = torch.arange(100, 100 + rows, dtype=torch.int64, device=dev)
     query = torch.empty(rows, 32, 576, dtype=torch.bfloat16, device=dev)
-    compile_hy4_mla_q_absorb_aot(g32).launch(q_raw, w_uk, q_pos, inv_freq, query, scalars=(rows,))
+    compile_hy4_mla_q_absorb_aot(g32).launch(q_raw, w_uk, _thw(q_pos), inv_freq, query, scalars=(rows,))
 
     pt_full = torch.full((rows, 2048), -1, dtype=torch.int32, device=dev)
     pt_r0 = torch.full((rows, 2048), -1, dtype=torch.int32, device=dev)
@@ -732,9 +737,9 @@ def test_hy4_mla_dsa_partial_chunking(kv_cache: str, rows: int):
     s_r1 = torch.where((lpage % 2) == 1, (lpage // 2) * 64 + (kv_pos % 64), torch.full_like(kv_pos, -1))
     q_resid = torch.empty(total_tokens, 1024, dtype=torch.bfloat16, device=dev)
     pack = compile_hy4_mla_rank_norm_pack_aot(g32)
-    pack.launch(q_a_dummy, kv_a, q_norm, kv_norm, kv_pos, kv_pos, inv_freq, q_resid, cache_full, scalars=(total_tokens,))
-    pack.launch(q_a_dummy, kv_a, q_norm, kv_norm, s_r0, kv_pos, inv_freq, q_resid, cache_r0, scalars=(total_tokens,))
-    pack.launch(q_a_dummy, kv_a, q_norm, kv_norm, s_r1, kv_pos, inv_freq, q_resid, cache_r1, scalars=(total_tokens,))
+    pack.launch(q_a_dummy, kv_a, q_norm, kv_norm, kv_pos, _thw(kv_pos), inv_freq, q_resid, cache_full, scalars=(total_tokens,))
+    pack.launch(q_a_dummy, kv_a, q_norm, kv_norm, s_r0, _thw(kv_pos), inv_freq, q_resid, cache_r0, scalars=(total_tokens,))
+    pack.launch(q_a_dummy, kv_a, q_norm, kv_norm, s_r1, _thw(kv_pos), inv_freq, q_resid, cache_r1, scalars=(total_tokens,))
 
     query = torch.randn(rows, 32, 576, dtype=torch.bfloat16, device=dev) * 0.2
     sink = torch.randn(32, dtype=torch.float32, device=dev) * 0.4
@@ -955,16 +960,16 @@ def test_hy4_indexer_context_split_oracle():
     gs_full = g_lpage * 16 + g_off
     gs_r0 = torch.where((g_lpage % 2) == 0, (g_lpage // 2) * 16 + g_off, torch.full_like(g_lpage, -1))
     gs_r1 = torch.where((g_lpage % 2) == 1, (g_lpage // 2) * 16 + g_off, torch.full_like(g_lpage, -1))
-    pool_prog.launch(tokens, w_kv, w_kg, ape, key_norm, g_pos, gs_full, inv_freq, gcache_full, scalars=(n_groups,))
-    pool_prog.launch(tokens, w_kv, w_kg, ape, key_norm, g_pos, gs_r0, inv_freq, gcache_r0, scalars=(n_groups,))
-    pool_prog.launch(tokens, w_kv, w_kg, ape, key_norm, g_pos, gs_r1, inv_freq, gcache_r1, scalars=(n_groups,))
+    pool_prog.launch(tokens, w_kv, w_kg, ape, key_norm, _thw(g_pos), gs_full, inv_freq, gcache_full, scalars=(n_groups,))
+    pool_prog.launch(tokens, w_kv, w_kg, ape, key_norm, _thw(g_pos), gs_r0, inv_freq, gcache_r0, scalars=(n_groups,))
+    pool_prog.launch(tokens, w_kv, w_kg, ape, key_norm, _thw(g_pos), gs_r1, inv_freq, gcache_r1, scalars=(n_groups,))
 
     q_raw = torch.randn(4, 16, 128, dtype=torch.bfloat16, device=dev) * 0.3
     w_raw = torch.randn(4, 16, dtype=torch.bfloat16, device=dev) * 0.3
     q_pos = torch.tensor([120, 2047, 2049, 5118], dtype=torch.int64, device=dev)
     q_rot = torch.empty_like(q_raw)
     w_out = torch.empty(4, 16, dtype=torch.float32, device=dev)
-    compile_hy4_indexer_query_rope_aot(g).launch(q_raw, w_raw, q_pos, inv_freq, q_rot, w_out, scalars=(4,))
+    compile_hy4_indexer_query_rope_aot(g).launch(q_raw, w_raw, _thw(q_pos), inv_freq, q_rot, w_out, scalars=(4,))
 
     sg = compile_hy4_indexer_score_groups_aot(g)
     pt80 = torch.arange(80, dtype=torch.int32, device=dev).unsqueeze(0).expand(4, 80).contiguous()
@@ -1109,3 +1114,133 @@ def test_hy4_context_split_draft_dual_gather_oracle(kv_cache: str):
         torch.cuda.synchronize()
         assert torch.equal(staging_dual[:recall_len], staging_single[:recall_len]), f"row {r}: dual gather mismatch"
         assert torch.equal(staging_dual[recall_len:], staging_single[recall_len:])
+
+
+# ---------------------------------------------------------------------------
+# M-RoPE positions: text rows stay bitwise identical; image rows follow the
+# interleaved (12,10,10) T/H/W layout of HYV4FlashRotaryEmbedding.
+# ---------------------------------------------------------------------------
+
+
+def _mrope_angles(pos3: torch.Tensor, inv: torch.Tensor, section=(12, 10, 10)) -> torch.Tensor:
+    """HF recomposition_frequencies: start from T, overwrite H/W interleaved slots."""
+    freq = pos3.float().unsqueeze(-1) * inv  # [rows, 3, 32]
+    out = freq[:, 0].clone()
+    for axis, offset in ((1, 1), (2, 2)):
+        idx = slice(offset, section[axis] * 3, 3)
+        out[:, idx] = freq[:, axis, idx]
+    return out
+
+
+def _mrope_rotate(x: torch.Tensor, pos3: torch.Tensor, theta: float) -> torch.Tensor:
+    inv = 1.0 / (theta ** (torch.arange(0, 64, 2, dtype=torch.float32, device=x.device) / 64))
+    angle = _mrope_angles(pos3, inv)
+    cos, sin = torch.cos(angle).repeat_interleave(2, -1), torch.sin(angle).repeat_interleave(2, -1)
+    while cos.ndim < x.ndim:
+        cos, sin = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    xf = x.float()
+    alt = torch.stack((-xf[..., 1::2], xf[..., ::2]), dim=-1).flatten(-2)
+    return xf * cos + alt * sin
+
+
+def _image_positions(rows: int, dev) -> torch.Tensor:
+    # A text prefix, then an image of 7 merged rows x (9+1) columns, then text.
+    t = torch.arange(rows, dtype=torch.int64)
+    pos = torch.stack([t, t, t], -1).clone()
+    start, h, w = 5, 7, 10
+    for r in range(h):
+        for c in range(w):
+            i = start + r * w + c
+            if i < rows:
+                pos[i] = torch.tensor([start, start + r, start + c])
+    tail = start + h * w
+    if tail < rows:
+        nxt = start + max(h, w)
+        pos[tail:] = (torch.arange(rows - tail, dtype=torch.int64) + nxt).unsqueeze(-1)
+    return pos.to(dev)
+
+
+@pytest.mark.parametrize("kv_cache", ["bf16", "fp8"])
+def test_hy4_mrope_text_rows_bitwise_match_scalar_math_and_image_rows_match_reference(kv_cache):
+    """The [rows,3] kernels on equal axes equal the scalar-position oracle used
+    before M-RoPE (pinned by every existing text test); image rows rotate their
+    H/W slots by the interleaved section and match an F32 M-RoPE reference."""
+    dev = require_b12x()
+    torch.manual_seed(31)
+    rows, theta = 96, 10_000_000.0
+    g = Hy4MlaGeometry(heads=32, window_size=None, kv_cache=kv_cache)
+    inv_freq = (1.0 / (theta ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+    q_a = torch.randn(rows, 1024, dtype=torch.bfloat16, device=dev) * 0.3
+    kv_a = torch.randn(rows, 576, dtype=torch.bfloat16, device=dev) * 0.3
+    q_norm = torch.ones(1024, dtype=torch.bfloat16, device=dev)
+    kv_norm = torch.ones(512, dtype=torch.bfloat16, device=dev)
+    q_raw = torch.randn(rows, 32, 256, dtype=torch.bfloat16, device=dev) * 0.3
+    w_uk = torch.randn(32, 512, 192, dtype=torch.bfloat16, device=dev) * 0.05
+    slots = torch.arange(rows, dtype=torch.int64, device=dev)
+    pack = compile_hy4_mla_rank_norm_pack_aot(g)
+    absorb = compile_hy4_mla_q_absorb_aot(g)
+    shape = (rows, 64, 656) if kv_cache == "fp8" else (2, 64, 576)
+    dtype = torch.uint8 if kv_cache == "fp8" else torch.bfloat16
+
+    def run(pos3):
+        cache = torch.zeros(*shape, dtype=dtype, device=dev)
+        q_resid = torch.empty(rows, 1024, dtype=torch.bfloat16, device=dev)
+        query = torch.empty(rows, 32, 576, dtype=torch.bfloat16, device=dev)
+        pack.launch(q_a, kv_a, q_norm, kv_norm, slots, pos3, inv_freq, q_resid, cache, scalars=(rows,))
+        absorb.launch(q_raw, w_uk, pos3, inv_freq, query, scalars=(rows,))
+        torch.cuda.synchronize()
+        if kv_cache == "fp8":
+            tail = cache.reshape(-1, 656)[:rows, 528:656].contiguous().view(torch.bfloat16)
+        else:
+            tail = cache.reshape(-1, 576)[:rows, 512:]
+        return tail, query[:, :, 512:]
+
+    text = torch.arange(rows, dtype=torch.int64, device=dev)
+    tail_text, q_text = run(_thw(text))
+    # Permuting the H/W values of a text row must not matter when they are equal:
+    # every axis reads the same position, so this equals scalar rotation exactly.
+    scalar_tail = _interleaved_rope(kv_a[:, 512:], text, theta).bfloat16()
+    scalar_q = _interleaved_rope(q_raw[:, :, 192:], text, theta).bfloat16()
+    assert (tail_text.float() - scalar_tail.float()).abs().max().item() <= 2 ** -6
+    assert (q_text.float() - scalar_q.float()).abs().max().item() <= 2 ** -6
+
+    image = _image_positions(rows, dev)
+    tail_img, q_img = run(image)
+    ref_tail = _mrope_rotate(kv_a[:, 512:], image, theta).bfloat16()
+    ref_q = _mrope_rotate(q_raw[:, :, 192:], image, theta).bfloat16()
+    assert (tail_img.float() - ref_tail.float()).abs().max().item() <= 2 ** -6
+    assert (q_img.float() - ref_q.float()).abs().max().item() <= 2 ** -6
+    is_image = ~((image[:, 0] == image[:, 1]) & (image[:, 1] == image[:, 2]))
+    assert not torch.equal(q_img[is_image], q_text[is_image])
+
+
+def _axis_of_pair(section=(12, 10, 10)):
+    return [1 if p % 3 == 1 and p < 3 * section[1] else 2 if p % 3 == 2 and p < 3 * section[2] else 0
+            for p in range(32)]
+
+
+def test_hy4_mrope_axis_selection_is_bitwise_per_pair():
+    """An image row's rotated pair p equals, bitwise, the same program run on a
+    text row at that pair's selected axis position: the kernel changes only
+    which position feeds each pair, never the rotation arithmetic."""
+    dev = require_b12x()
+    torch.manual_seed(5)
+    rows, theta = 64, 10_000_000.0
+    inv_freq = (1.0 / (theta ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+    q_raw = torch.randn(rows, 16, 128, dtype=torch.bfloat16, device=dev) * 0.4
+    w_raw = torch.randn(rows, 16, dtype=torch.bfloat16, device=dev) * 0.4
+    prog = compile_hy4_indexer_query_rope_aot(HY4_FLASH_INDEXER)
+    pos3 = torch.randint(0, 1 << 20, (rows, 3), dtype=torch.int64, device=dev)
+
+    def run(p):
+        out, w = torch.empty_like(q_raw), torch.empty(rows, 16, dtype=torch.float32, device=dev)
+        prog.launch(q_raw, w_raw, p.contiguous(), inv_freq, out, w, scalars=(rows,))
+        torch.cuda.synchronize()
+        return out
+    mixed = run(pos3)
+    per_axis = [run(pos3[:, a:a + 1].expand(rows, 3)) for a in range(3)]
+    expected = per_axis[0].clone()
+    for pair, axis in enumerate(_axis_of_pair()):
+        cols = [64 + 2 * pair, 65 + 2 * pair]
+        expected[:, :, cols] = per_axis[axis][:, :, cols]
+    assert torch.equal(mixed, expected)
