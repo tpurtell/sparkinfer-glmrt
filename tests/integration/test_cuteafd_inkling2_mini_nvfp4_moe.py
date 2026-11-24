@@ -299,10 +299,10 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
 
     # Pack exact checkpoint weights with varied E2M1 codes and normal E4M3 scales on cols 0..32
     # (zero elsewhere) and non-BF16 F32 w_amax = 1.0 + 3 * 2^-10 on experts 0..k-1. Because x[:, :32] = 1.0
-    # and all other columns are 0, the 32-column MMA dot product is exact in F32 (matching F64 bit-for-bit
-    # at seed=24), while BF16-rounding w_amax / expanding weights to BF16 flips dozens of down-projection
-    # NVFP4 activation codes (aq) and scales (a_s).
-    gen = torch.Generator().manual_seed(24)
+    # and all other columns are 0, the 32-column MMA dot product is exact in F32 (at seed=20 every gate/up
+    # channel has >=1e-5 relative margin from all BF16 midpoints, so F32 and F64 agree bit-for-bit), while
+    # BF16-rounding w_amax / expanding weights to BF16 flips 22 packed code bytes and 4 scale bytes.
+    gen = torch.Generator().manual_seed(20)
 
     def make_packed(amax_vec: torch.Tensor, rows_w: int, cols_w: int):
         packed = torch.zeros((e, rows_w, cols_w // 2), dtype=torch.uint8)
