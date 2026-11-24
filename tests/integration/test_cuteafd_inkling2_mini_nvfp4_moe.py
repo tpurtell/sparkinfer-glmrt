@@ -354,9 +354,9 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
 
     # Vendor-order exact-decode oracle on expert 0's row 0 (matches StreamNvfp4GateUpDyn):
     # 1. Exact dyadic (e2m1 * e4m3) grid dot product summed in F64 and verified exact in F32.
-    # 2. Epilogue folded in F32 with IEEE div.rn (matching vendor's tldevice.rcp_rn at
-    #    vLLM a0c1f162 ops/moe.py:347-353 and ops/activation.py:156,171):
-    #    acc * (x_amax * (w_amax / (1536 * DENOM))), then single BF16 round.
+    # 2. Epilogue folded in exact vendor association (vLLM d664cd1e/a0c1f162 ops/moe.py:347-353,
+    #    ops/activation.py:155-171; SGLang ec5e7ff5 nvfp4.py:256-257):
+    #    acc * ((x_amax * w_amax) * rcp_rn(1536 * DENOM)), then single BF16 round.
     x_q_ref, x_s_ref, x_amax_ref, x_recon_ref = _reference_quantize_nvfp4_exact(x[:1].float())
     x_grid_ref = x_recon_ref.double() * (1536.0 / x_amax_ref.double()[:, None])
     w1_grid, _ = small_nvfp4._grid_expert(m1, 0, "cuda")
@@ -368,8 +368,8 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     assert torch.equal(acc_gate_f32.double(), acc_gate_f64) and torch.equal(acc_up_f32.double(), acc_up_f64), (
         "32-column dyadic NVFP4 grid accumulation must be exact in F32"
     )
-    expert_factor = exact_amax[0] / torch.tensor(1536.0 * DENOM, dtype=torch.float32, device="cuda")
-    row_factor = x_amax_ref * expert_factor
+    rcp_denom = torch.reciprocal(torch.tensor(1536.0 * DENOM, dtype=torch.float32, device="cuda"))
+    row_factor = (x_amax_ref * exact_amax[0]) * rcp_denom
     gate_exact = (acc_gate_f32 * row_factor[:, None]).bfloat16()
     up_exact = (acc_up_f32 * row_factor[:, None]).bfloat16()
     act_exact = small_nvfp4._situ(gate_exact, up_exact, torch.ones(1, device="cuda"), g.situ_gate_cap, g.situ_up_cap)
