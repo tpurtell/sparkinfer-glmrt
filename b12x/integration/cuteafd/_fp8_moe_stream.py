@@ -56,6 +56,7 @@ from b12x._lib.intrinsics import (
     bf16_mma_m16n8k16_f32,
     cp_async4_shared_global,
     cp_async_u32_shared_global,
+    cp_async_u64_shared_global,
     div_rn_f32,
     ld_shared_f32,
     ld_shared_u32,
@@ -157,7 +158,9 @@ class StreamFp8GateUp:
 
     def key(self) -> tuple:
         return ("stream_gate_up", 4, self.inter, self.hidden, self.experts, self.limit, self.a_ring, self.w_ring,
-                self.qmma) + (("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (("row_addresses",) if self.row_addresses else ())
+                self.qmma) + (("silu_post_clamp_fp32_product",) if self.post_silu else ()) + (
+                    ("row_addresses",) if self.row_addresses else ()) + (
+                    ("wire_align8",) if self.row_bytes % 16 else ())
 
     @cute.jit
     def row_address(self, x: cute.Pointer, row: Int32) -> Int64:
@@ -455,8 +458,15 @@ class StreamFp8GateUp:
         for q in cutlass.range_constexpr(4):
             if src[q] >= Int64(0):
                 row = r_base + Int32(32 * q)
-                cp_async4_shared_global(a_stage + row * Int32(self.k_step) + ((ch ^ (row % Int32(8))) * Int32(16)),
-                                        src[q] + k_off)
+                dst = a_stage + row * Int32(self.k_step) + ((ch ^ (row % Int32(8))) * Int32(16))
+                if cutlass.const_expr(self.row_bytes % 16 == 0):
+                    cp_async4_shared_global(dst, src[q] + k_off)
+                elif cutlass.const_expr(self.row_bytes % 8 == 0):
+                    cp_async_u64_shared_global(dst, src[q] + k_off)
+                    cp_async_u64_shared_global(dst + Int32(8), src[q] + k_off + Int64(8))
+                else:
+                    for w in cutlass.range_constexpr(4):
+                        cp_async_u32_shared_global(dst + Int32(4 * w), src[q] + k_off + Int64(4 * w))
         if s_src >= Int64(0):
             cp_async_u32_shared_global(ss + stage * Int32(self.s_bytes) + tidx * Int32(4),
                                        s_src + Int64(step) * Int64(4))

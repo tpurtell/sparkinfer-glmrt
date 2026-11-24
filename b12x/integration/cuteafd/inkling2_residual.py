@@ -3,7 +3,8 @@
 #1915 attn_res: every candidate is RMS-normalized in F32; the F32 query is
 scaled by hidden**-0.5; a softmax over candidate dot products weights those
 normalized values. No BF16 intermediate and no post-mix layer norm. Supports
-one (local/MLP/head) or three (global Q/K/V) queries. The caller appends a
+one (local/MLP/head), three (global Q/K/V), or four (looped cross-pass
+attn/K/V/MLP) queries. The caller appends a
 completed six-layer partial block and updates partial state outside this pure
 mix. Existing Kimi raw-value/BF16/update semantics are deliberately unchanged.
 
@@ -106,7 +107,7 @@ def compile_inkling2_residual_aot(*, hidden: int = 4608, queries: int = 1,
                                  eps: float = 1e-6, max_rows: int = 4096):
     import math
     if (type(hidden) is not int or hidden <= 0 or hidden % 256
-            or queries not in (1, 3) or not 1 <= max_candidates <= 9
+            or queries not in (1, 3, 4) or not 1 <= max_candidates <= 9
             or not math.isfinite(eps) or eps <= 0
             or type(max_rows) is not int or not 1 <= max_rows <= 2**31 - 1):
         raise ValueError("invalid Inkling residual geometry/capacity")

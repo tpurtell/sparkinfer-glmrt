@@ -488,12 +488,13 @@ def _get_compiled_mxfp8_rows_quant(
         target=launch,
         cache_key=cache_key,
     )
+    val_align = 8 if (wire_rows and (k + k // 32) % 16 != 0) else 16
     with torch.cuda.device(device_ordinal):
         raw = b12x_compile(
             launch,
             make_ptr(source_type, 16, cute.AddressSpace.gmem, assumed_align=16),
-            make_ptr(cutlass.Uint32, 16, cute.AddressSpace.gmem, assumed_align=16),
-            make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
+            make_ptr(cutlass.Uint32, val_align, cute.AddressSpace.gmem, assumed_align=val_align),
+            make_ptr(cutlass.Uint8, val_align, cute.AddressSpace.gmem, assumed_align=val_align),
             make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
             1,
             *(() if fixed_source_width else (1,)),
@@ -526,13 +527,13 @@ def _get_compiled_mxfp8_rows_quant(
                 cutlass.Uint32,
                 values.data_ptr(),
                 cute.AddressSpace.gmem,
-                assumed_align=16,
+                assumed_align=val_align,
             ),
             make_ptr(
                 cutlass.Uint8,
                 scale_rows.data_ptr(),
                 cute.AddressSpace.gmem,
-                assumed_align=16,
+                assumed_align=val_align,
             ),
             make_ptr(
                 cutlass.Uint8,
