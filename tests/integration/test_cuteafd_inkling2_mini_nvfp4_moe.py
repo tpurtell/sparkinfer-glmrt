@@ -396,17 +396,42 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     )
     assert gate_bug_max > 0.0, "negative control expected nonzero FC1 divergence from BF16 rounding"
 
-    assert torch.equal(kernel_gate, gate_exact[0]), "kernel FC1 gate must match exact F32 decode bit-for-bit"
-    assert torch.equal(kernel_up, up_exact[0]), "kernel FC1 up must match exact F32 decode bit-for-bit"
-    assert torch.equal(kernel_aamax, aamax_exact), "kernel act amax must match exact-decode reference"
-    assert torch.equal(kernel_as, as_exact), "kernel act E4M3 scales must match exact-decode reference"
-    assert torch.equal(kernel_aq, aq_exact), "kernel act E2M1 codes must match exact-decode reference"
+    def _diff_summary(label: str, actual: torch.Tensor, expected: torch.Tensor) -> str:
+        mask = actual != expected
+        n_diff = int(mask.sum().item())
+        max_abs = float((actual.float() - expected.float()).abs().max().item())
+        sample = []
+        for idx in mask.nonzero(as_tuple=False)[:5].tolist():
+            t = tuple(idx)
+            sample.append((t, float(actual[t].float().item()), float(expected[t].float().item())))
+        return f"{label}: n_diff={n_diff}/{actual.numel()} max_abs={max_abs:.6e} sample={sample}"
+
+    gate_diff_n = int((kernel_gate != gate_exact[0]).sum().item())
+    gate_diff_max = float((kernel_gate.float() - gate_exact[0].float()).abs().max().item())
+    up_diff_n = int((kernel_up != up_exact[0]).sum().item())
+    up_diff_max = float((kernel_up.float() - up_exact[0].float()).abs().max().item())
+    assert torch.equal(xamax[slot_idx : slot_idx + 1], x_amax_ref), _diff_summary("xamax", xamax[slot_idx : slot_idx + 1], x_amax_ref)
+    assert torch.equal(xs[slot_idx], x_s_ref[0]), _diff_summary("xs", xs[slot_idx], x_s_ref[0])
+    assert torch.equal(xq[slot_idx], x_q_ref[0]), _diff_summary("xq", xq[slot_idx], x_q_ref[0])
+    assert torch.equal(kernel_gate, lin_g[pos0]), _diff_summary("exch_gate vs lin_g", kernel_gate, lin_g[pos0])
+    assert torch.equal(kernel_gate, gate_exact[0]), (
+        f"kernel FC1 gate must match exact F32 decode bit-for-bit ({_diff_summary('kernel_gate vs gate_exact', kernel_gate, gate_exact[0])}; "
+        f"vs gate_bug: {_diff_summary('kernel_gate vs gate_bug', kernel_gate, gate_bug[0])})"
+    )
+    assert torch.equal(kernel_up, up_exact[0]), (
+        f"kernel FC1 up must match exact F32 decode bit-for-bit ({_diff_summary('kernel_up vs up_exact', kernel_up, up_exact[0])})"
+    )
+    assert torch.equal(kernel_aamax, aamax_exact), _diff_summary("aamax", kernel_aamax, aamax_exact)
+    assert torch.equal(kernel_as, as_exact), _diff_summary("a_s", kernel_as, as_exact)
+    assert torch.equal(kernel_aq, aq_exact), _diff_summary("aq", kernel_aq, aq_exact)
     assert not torch.equal(kernel_aq, aq_bug) or not torch.equal(kernel_as, as_bug), (
         "kernel unexpectedly matched BF16-rounded path"
     )
     print(f"inkling2_mini nvfp4 exact-decode negative control PASSED: "
-          f"kernel vs exact-decode = 0/0 diffs; BF16-rounded negative control flipped "
-          f"{flipped_bug_codes} packed code bytes / {flipped_bug_scales} scale bytes (max|d_fc1|={gate_bug_max:.4e})")
+          f"kernel vs exact-decode gate={gate_diff_n}/{i} diffs (max|d|={gate_diff_max:.4e}), "
+          f"up={up_diff_n}/{i} diffs (max|d|={up_diff_max:.4e}), aq/as=0/0 diffs; "
+          f"BF16-rounded negative control flipped {flipped_bug_codes} packed code bytes / "
+          f"{flipped_bug_scales} scale bytes (max|d_fc1|={gate_bug_max:.4e})")
 
 
 def test_inkling2_mini_nvfp4_geometry():
