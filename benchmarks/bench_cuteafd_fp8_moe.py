@@ -1364,7 +1364,7 @@ def main() -> None:
 
                     ref = cached_ref.get('mxfp8')
                     if ref is None:
-                        ref = cached_ref['mxfp8'] = mxfp8_reference(x_exact, ids, weights, *w, g)
+                        ref = cached_ref['mxfp8'] = mxfp8_reference(x_exact.float(), ids, weights, *w, g)
                 elif g.weights == "bf16":
                     from tests.integration.test_cuteafd_expert_contract import bf16_reference
 

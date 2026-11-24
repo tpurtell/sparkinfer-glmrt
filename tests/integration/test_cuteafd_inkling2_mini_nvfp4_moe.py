@@ -297,32 +297,35 @@ def test_inkling2_mini_nvfp4_exact_decode_negative_control():
     ids = torch.arange(k, dtype=torch.int32, device="cuda").unsqueeze(0).expand(rows, k).contiguous()
     weights = torch.ones((rows, k), dtype=torch.float32, device="cuda")
 
-    # Pack exact checkpoint weights: constant E2M1=1.0 (code 2 -> byte 0x22), E4M3 scale=256.0 (0x78)
-    # on columns 0..32 (zero elsewhere), and non-BF16 F32 w1_amax = 1.0 + 3 * 2^-10 on experts 0..k-1.
-    # For each expert, exact dequant on cols 0..32 is 1.0 * 256.0 * (w_amax / 2688.0), so the 32-element
-    # sum is 32 * 256 * w_amax / 2688 = (64/21) * w_amax. We vary row/column codes slightly so the
-    # BF16-rounded w1_amax crosses E2M1 midpoints and flips down-projection NVFP4 activation codes.
-    def make_packed(amax_vec: torch.Tensor, rows_w: int, cols_w: int, col_pattern: torch.Tensor):
-        packed = torch.zeros((e, rows_w, cols_w // 2), dtype=torch.uint8, device="cuda")
-        scales = torch.zeros((e, rows_w, cols_w // 16), dtype=torch.uint8, device="cuda")
-        # E4M3 256.0 = 0x78, 128.0 = 0x70; E2M1 codes from col_pattern [rows_w] in {2 (1.0), 4 (2.0), 5 (3.0), 6 (4.0)}.
-        pat = (col_pattern.to(torch.uint8) | (col_pattern.to(torch.uint8) << 4))[:, None]
-        packed[:k, :, :16] = pat.expand(k, rows_w, 16)
-        scales[:k, :, :2] = 0x78  # E4M3 256.0
+    # Pack exact checkpoint weights with varied E2M1 codes and normal E4M3 scales on cols 0..32
+    # (zero elsewhere) and non-BF16 F32 w_amax = 1.0 + 3 * 2^-10 on experts 0..k-1. Because x[:, :32] = 1.0
+    # and all other columns are 0, the 32-column MMA dot product is exact in F32 (matching F64 bit-for-bit
+    # at seed=24), while BF16-rounding w_amax / expanding weights to BF16 flips dozens of down-projection
+    # NVFP4 activation codes (aq) and scales (a_s).
+    gen = torch.Generator().manual_seed(24)
+
+    def make_packed(amax_vec: torch.Tensor, rows_w: int, cols_w: int):
+        packed = torch.zeros((e, rows_w, cols_w // 2), dtype=torch.uint8)
+        scales = torch.zeros((e, rows_w, cols_w // 16), dtype=torch.uint8)
+        lo = torch.randint(0, 16, (1, rows_w, 16), generator=gen, dtype=torch.uint8)
+        hi = torch.randint(0, 16, (1, rows_w, 16), generator=gen, dtype=torch.uint8)
+        packed[:k, :, :16] = (lo | (hi << 4)).expand(k, rows_w, 16)
+        sc = torch.randint(0x48, 0x79, (1, rows_w, 2), generator=gen, dtype=torch.uint8)
+        scales[:k, :, :2] = sc.expand(k, rows_w, 2)
+        packed_g = packed.to("cuda").contiguous()
+        scales_g = scales.to("cuda").contiguous()
         denom_t = torch.tensor([DENOM], dtype=torch.float32, device="cuda")
-        s_flat = torch.cat([scales.flatten(), amax_vec.view(torch.uint8), denom_t.view(torch.uint8)]).contiguous()
-        return packed.contiguous(), s_flat, (packed, scales, amax_vec, DENOM)
+        s_flat = torch.cat([scales_g.flatten(), amax_vec.view(torch.uint8), denom_t.view(torch.uint8)]).contiguous()
+        return packed_g, s_flat, (packed_g, scales_g, amax_vec, DENOM)
 
     # Exact F32 amax whose lower mantissa bits vanish under BF16 rounding (1.0 + 3*2^-10 -> BF16 1.0).
     exact_amax = torch.full((e,), float(1.0 + 3.0 * (2.0 ** -10)), dtype=torch.float32, device="cuda")
     bf16_amax = exact_amax.bfloat16().float()
     assert not torch.equal(exact_amax, bf16_amax), "test setup requires non-BF16 exact_amax"
 
-    # Vary row codes across the intermediate dimension so act rows span E2M1 rounding boundaries.
-    row_pat = torch.tensor([2, 3, 4, 5, 6, 7, 1, 2], dtype=torch.uint8, device="cuda").repeat(i // 8)
-    w1, s1, m1 = make_packed(exact_amax, i, h, row_pat)
-    w3, s3, m3 = make_packed(exact_amax, i, h, torch.full((i,), 4, dtype=torch.uint8, device="cuda"))
-    w2, s2, m2 = make_packed(exact_amax, h, i, torch.full((h,), 2, dtype=torch.uint8, device="cuda"))
+    w1, s1, m1 = make_packed(exact_amax, i, h)
+    w3, s3, m3 = make_packed(exact_amax, i, h)
+    w2, s2, m2 = make_packed(exact_amax, h, i)
 
     prog = small_nvfp4._stage_program(g, capacity)
     meta = torch.zeros(meta_words(e, mt), dtype=torch.int32, device="cuda")
