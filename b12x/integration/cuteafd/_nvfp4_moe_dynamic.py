@@ -463,6 +463,8 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                 warp_m = warp_id // Int32(2)
                 warp_n = warp_id % Int32(2)
                 sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
+                # Vendor epilogue scale: (row_amax * w_amax) * rcp_rn(1536 * denom)
+                # (vLLM ops/moe.py:347-353, activation.py:155-171; SGLang nvfp4.py:256-257).
                 w_amax = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4))
                 rcp_denom = div_rn_f32(
                     Float32(1.0),
@@ -1159,6 +1161,8 @@ class GateUpSmallDyn:
             sp = cutlass.select_(side == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
+            # Vendor epilogue scale: (row_amax * w_amax) * rcp_rn(1536 * denom)
+            # (vLLM ops/moe.py:347-353, activation.py:155-171; SGLang nvfp4.py:256-257).
             w_amax = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4))
             rcp_denom = div_rn_f32(
                 Float32(1.0),
@@ -1451,6 +1455,8 @@ class DownSmallDyn:
             sfb0 = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
             sfb1 = ld_global_nc_u32_l2hint(s_row + Int64(16) + Int64(c) * Int64(4), policy)
             sfb2 = ld_global_nc_u32_l2hint(s_row + Int64(32), policy)
+            # Vendor epilogue scale: (row_amax * w_amax) * rcp_rn(1536 * denom)
+            # (vLLM ops/moe.py:347-353, activation.py:155-171; SGLang nvfp4.py:256-257).
             w_amax = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4))
             rcp_denom = div_rn_f32(
                 Float32(1.0),
@@ -1687,6 +1693,8 @@ class GateUpSmallDynReg:
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
             w_row = wp + w_row_idx * Int64(self.row_bytes)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
+            # Vendor epilogue scale: (row_amax * w_amax) * rcp_rn(1536 * denom)
+            # (vLLM ops/moe.py:347-353, activation.py:155-171; SGLang nvfp4.py:256-257).
             w_amax = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4))
             rcp_denom = div_rn_f32(
                 Float32(1.0),
@@ -1901,6 +1909,8 @@ class DownSmallDynReg:
             w_idx = Int64(e) * Int64(self.n) + Int64(n0 + q)
             w_row = Int64(w.toint()) + w_idx * Int64(self.row_bytes)
             s_row = Int64(s.toint()) + w_idx * Int64(self.scale_bytes)
+            # Vendor epilogue scale: (row_amax * w_amax) * rcp_rn(1536 * denom)
+            # (vLLM ops/moe.py:347-353, activation.py:155-171; SGLang nvfp4.py:256-257).
             w_amax = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4))
             rcp_denom = div_rn_f32(
                 Float32(1.0),
