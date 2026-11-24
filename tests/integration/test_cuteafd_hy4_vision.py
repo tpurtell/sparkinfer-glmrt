@@ -27,7 +27,7 @@ def _rscale(size):
     return float(torch.tensor(1.0 / ((size + 0.1) / 128), dtype=torch.float32))
 
 
-GRIDS = [(h, w) for h in (2, 4, 8, 16, 18, 32, 46, 64, 66, 96, 126, 128) for w in (2, 6, 32, 64, 90, 128)]
+GRIDS = [(h, w) for h in (2, 4, 8, 16, 18, 32, 46, 64, 66, 96, 126, 128) for w in (2, 6, 32, 64, 90, 126, 128)]
 
 
 def test_scaled_bilinear_position_matches_official_interpolate():

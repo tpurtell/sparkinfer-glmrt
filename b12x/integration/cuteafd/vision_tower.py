@@ -126,6 +126,7 @@ class ScaledBilinearPosition:
     source index ``rscale*(dst+0.5)-0.5`` clamped at 0, truncating cast,
     ``+1`` neighbour only inside the table, then ``h0*(w0*a+w1*b)+h1*(w0*c+w1*d)``
     on F32-widened BF16 values, one BF16 store (the caller's ``.bfloat16()``).
+    When both output extents equal the table's, ATen copies the input instead.
     """
     def __init__(self, channels, table_height, table_width, contraction="aten"):
         self.channels = channels
@@ -136,7 +137,7 @@ class ScaledBilinearPosition:
     def __call__(self, table: cute.Pointer, out: cute.Pointer, height: Int32, width: Int32,
                  scale_h: Float32, scale_w: Float32, stream: cuda.CUstream):
         count = Int64(height) * Int64(width) * Int64(self.channels)
-        self.kernel(table, out, width, scale_h, scale_w, count).launch(
+        self.kernel(table, out, height, width, scale_h, scale_w, count).launch(
             grid=((count + Int64(255)) // Int64(256), 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.jit
@@ -152,33 +153,37 @@ class ScaledBilinearPosition:
         return low, step, lam0, lam1
 
     @cute.kernel
-    def kernel(self, table: cute.Pointer, out: cute.Pointer, width: Int32,
+    def kernel(self, table: cute.Pointer, out: cute.Pointer, height: Int32, width: Int32,
                scale_h: Float32, scale_w: Float32, count: Int64):
         table, out = _view(table), _view(out)
         at = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
         if at < count:
-            channel = at % Int64(self.channels)
-            pixel = at // Int64(self.channels)
-            y, x = pixel // Int64(width), pixel % Int64(width)
-            y0, dy, h0, h1 = self._source(scale_h, y, self.table_height)
-            x0, dx, w0, w1 = self._source(scale_w, x, self.table_width)
-            row = Int64(self.table_width * self.channels)
-            base = (y0 * Int64(self.table_width) + x0) * Int64(self.channels) + channel
-            a = Float32(table[base])
-            b = Float32(table[base + dx * Int64(self.channels)])
-            c = Float32(table[base + dy * row])
-            d = Float32(table[base + dy * row + dx * Int64(self.channels)])
-            if cutlass.const_expr(self.contraction == "unfused"):
-                top = _add(_mul(w0, a), _mul(w1, b))
-                bottom = _add(_mul(w0, c), _mul(w1, d))
-                value = _add(_mul(h0, top), _mul(h1, bottom))
+            if height == Int32(self.table_height) and width == Int32(self.table_width):
+                # ATen's special case: equal input/output extents copy the table.
+                out[at] = table[at]
             else:
-                # nvcc -fmad contraction of ATen's expression: the left product
-                # of each sum folds into an FMA with the right product.
-                top = _fma(w0, a, _mul(w1, b))
-                bottom = _fma(w0, c, _mul(w1, d))
-                value = _fma(h0, top, _mul(h1, bottom))
-            out[at] = value.to(BFloat16)
+                channel = at % Int64(self.channels)
+                pixel = at // Int64(self.channels)
+                y, x = pixel // Int64(width), pixel % Int64(width)
+                y0, dy, h0, h1 = self._source(scale_h, y, self.table_height)
+                x0, dx, w0, w1 = self._source(scale_w, x, self.table_width)
+                row = Int64(self.table_width * self.channels)
+                base = (y0 * Int64(self.table_width) + x0) * Int64(self.channels) + channel
+                a = Float32(table[base])
+                b = Float32(table[base + dx * Int64(self.channels)])
+                c = Float32(table[base + dy * row])
+                d = Float32(table[base + dy * row + dx * Int64(self.channels)])
+                if cutlass.const_expr(self.contraction == "unfused"):
+                    top = _add(_mul(w0, a), _mul(w1, b))
+                    bottom = _add(_mul(w0, c), _mul(w1, d))
+                    value = _add(_mul(h0, top), _mul(h1, bottom))
+                else:
+                    # nvcc -fmad contraction of ATen's expression: the left product
+                    # of each sum folds into an FMA with the right product.
+                    top = _fma(w0, a, _mul(w1, b))
+                    bottom = _fma(w0, c, _mul(w1, d))
+                    value = _fma(h0, top, _mul(h1, bottom))
+                out[at] = value.to(BFloat16)
 
 
 def compile_scaled_bilinear_position_aot(*, channels=1152, table_height=128, table_width=128,
