@@ -301,7 +301,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_dyn", 3, *super().key()[2:])
+        return ("stream_linear_nvfp4_dyn", 4, *super().key()[2:])
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
@@ -332,10 +332,11 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
                 w_off = Int64(e) * Int64(self.n) + Int64(n0)
                 w_rows = Int64(w.toint()) + w_off * Int64(self.k // 2)
                 s_rows = Int64(s.toint()) + w_off * Int64(self.k // 16)
-                # Expert factor: w_amax_e / (1536 * denominator) via IEEE div.rn (hoisted once per CTA;
-                # vendor uses correctly rounded rcp_rn at vLLM a0c1f162 ops/moe.py:352, activation.py:171).
-                expert_factor = div_rn_f32(
-                    _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                # Vendor epilogue scale association: (row_amax * w_amax) * rcp_rn(1536 * denominator)
+                # (vLLM d664cd1e/a0c1f162 ops/moe.py:347-353, activation.py:155-171; SGLang ec5e7ff5 nvfp4.py:256-257).
+                w_amax = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4))
+                rcp_denom = div_rn_f32(
+                    Float32(1.0),
                     Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)),
                 )
                 self._load(0, ring, a_rows, as_rows, w_rows, s_rows, live, tidx)
@@ -369,7 +370,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
                         for half in cutlass.range_constexpr(2):
                             row = warp_m * Int32(self.warp_rows) + Int32(16 * mt + 8 * half) + q
                             if row < live:
-                                factor = _ld_f32(amax_t + Int64(row) * Int64(4)) * expert_factor
+                                factor = (_ld_f32(amax_t + Int64(row) * Int64(4)) * w_amax) * rcp_denom
                                 for nt in cutlass.range_constexpr(self.n_tiles):
                                     f = 4 * (self.n_tiles * mt + nt) + 2 * half
                                     col = n0 + warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
@@ -401,7 +402,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
         self.parts = _ceil(self.inter, self.half_n)
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_dyn", 4, self.inter, self.k, self.experts, self.k_block, self.stages,
+        return ("stream_gate_up_nvfp4_dyn", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
 
     @cute.jit
@@ -462,8 +463,9 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                 warp_m = warp_id // Int32(2)
                 warp_n = warp_id % Int32(2)
                 sp = cutlass.select_(warp_n == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
-                expert_factor = div_rn_f32(
-                    _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+                w_amax = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4))
+                rcp_denom = div_rn_f32(
+                    Float32(1.0),
                     Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)),
                 )
                 active = warp_m * Int32(self.warp_rows) < live
@@ -495,7 +497,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                             row = warp_m * Int32(self.warp_rows) + Int32(16 * mt + 8 * half) + q
                             factor = Float32(0.0)
                             if row < live:
-                                factor = _ld_f32(amax_t + Int64(row) * Int64(4)) * expert_factor
+                                factor = (_ld_f32(amax_t + Int64(row) * Int64(4)) * w_amax) * rcp_denom
                             for nt in cutlass.range_constexpr(self.n_tiles):
                                 f = 4 * (self.n_tiles * mt + nt) + 2 * half
                                 col = warp_n * Int32(self.warp_cols) + Int32(8 * nt) + Int32(2) * c
@@ -1036,7 +1038,7 @@ class GateUpSmallDyn:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
 
     def key(self) -> tuple:
-        return ("gate_up_small_dyn", 4, self.inter, self.hidden, self.experts, self.w_ring,
+        return ("gate_up_small_dyn", 5, self.inter, self.hidden, self.experts, self.w_ring,
                 self.gate_cap, self.up_cap, self.max_live)
 
     def _w_layout(self):
@@ -1157,8 +1159,9 @@ class GateUpSmallDyn:
             sp = cutlass.select_(side == Int32(0), Int64(s1.toint()), Int64(s3.toint()))
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
-            expert_factor = div_rn_f32(
-                _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+            w_amax = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4))
+            rcp_denom = div_rn_f32(
+                Float32(1.0),
                 Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)),
             )
             policy = create_l2_evict_first_policy()
@@ -1231,12 +1234,12 @@ class GateUpSmallDyn:
                 cute.arch.sync_threads()
                 col_xch = side * Int32(16) + sub_n * Int32(8) + Int32(2) * c
                 if q < chunk_live:
-                    factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(src_lo) * Int64(4)) * expert_factor
+                    factor_lo = (_ld_f32(Int64(row_amax.toint()) + Int64(src_lo) * Int64(4)) * w_amax) * rcp_denom
                     st_shared_u32(sw + q * Int32(self.x_stride) + col_xch * Int32(2),
                                   pack_f32x2_to_bfloat2(acc[0] * factor_lo, acc[1] * factor_lo))
                 if const_expr(self.max_live > 8):
                     if q + Int32(8) < chunk_live:
-                        factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(src_hi) * Int64(4)) * expert_factor
+                        factor_hi = (_ld_f32(Int64(row_amax.toint()) + Int64(src_hi) * Int64(4)) * w_amax) * rcp_denom
                         st_shared_u32(sw + (q + Int32(8)) * Int32(self.x_stride) + col_xch * Int32(2),
                                       pack_f32x2_to_bfloat2(acc[2] * factor_hi, acc[3] * factor_hi))
                 cute.arch.sync_threads()
@@ -1362,7 +1365,7 @@ class DownSmallDyn:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("down_small_dyn", 4, self.n, self.k, self.experts, self.tile_n, self.max_live)
+        return ("down_small_dyn", 5, self.n, self.k, self.experts, self.tile_n, self.max_live)
 
     def _storage(self):
         class Storage:
@@ -1448,8 +1451,9 @@ class DownSmallDyn:
             sfb0 = ld_global_nc_u32_l2hint(s_row + Int64(c) * Int64(4), policy)
             sfb1 = ld_global_nc_u32_l2hint(s_row + Int64(16) + Int64(c) * Int64(4), policy)
             sfb2 = ld_global_nc_u32_l2hint(s_row + Int64(32), policy)
-            expert_factor = div_rn_f32(
-                _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+            w_amax = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4))
+            rcp_denom = div_rn_f32(
+                Float32(1.0),
                 Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)),
             )
 
@@ -1520,12 +1524,12 @@ class DownSmallDyn:
 
                 # Epilogue: coalesced BF16 stores directly to y [pairs, n].
                 if q < chunk_live:
-                    factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(p_lo) * Int64(4)) * expert_factor
+                    factor_lo = (_ld_f32(Int64(row_amax.toint()) + Int64(p_lo) * Int64(4)) * w_amax) * rcp_denom
                     y_lo = Int64(y.toint()) + (Int64(p_lo) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
                     st_global_u32(y_lo, pack_f32x2_to_bfloat2(d0 * factor_lo, d1 * factor_lo))
                 if const_expr(self.max_live > 8):
                     if q + Int32(8) < chunk_live:
-                        factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(p_hi) * Int64(4)) * expert_factor
+                        factor_hi = (_ld_f32(Int64(row_amax.toint()) + Int64(p_hi) * Int64(4)) * w_amax) * rcp_denom
                         y_hi = Int64(y.toint()) + (Int64(p_hi) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
                         st_global_u32(y_hi, pack_f32x2_to_bfloat2(d2 * factor_hi, d3 * factor_hi))
 
@@ -1605,7 +1609,7 @@ class GateUpSmallDynReg:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.hidden)
 
     def key(self) -> tuple:
-        return ("gate_up_small_dyn_reg", 2, self.inter, self.hidden, self.experts,
+        return ("gate_up_small_dyn_reg", 3, self.inter, self.hidden, self.experts,
                 self.gate_cap, self.up_cap, self.max_live)
 
     def _storage(self):
@@ -1683,8 +1687,9 @@ class GateUpSmallDynReg:
             w_row_idx = Int64(e) * Int64(self.inter) + Int64(n0 + sub_n * Int32(8) + q)
             w_row = wp + w_row_idx * Int64(self.row_bytes)
             s_row = sp + w_row_idx * Int64(self.scale_bytes)
-            expert_factor = div_rn_f32(
-                _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+            w_amax = _ld_f32(sp + Int64(self.amax_offset) + Int64(e) * Int64(4))
+            rcp_denom = div_rn_f32(
+                Float32(1.0),
                 Float32(1536.0) * _ld_f32(sp + Int64(self.denominator_offset)),
             )
             xch = shared_ptr_to_u32(storage.xch.data_ptr())
@@ -1776,12 +1781,12 @@ class GateUpSmallDynReg:
                 # Epilogue: exchange BF16 gate/up via 1,152 B SMEM, compute SiTU x gamma and group amax.
                 col_xch = side * Int32(16) + sub_n * Int32(8) + Int32(2) * c
                 if q < chunk_live:
-                    factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(src_lo) * Int64(4)) * expert_factor
+                    factor_lo = (_ld_f32(Int64(row_amax.toint()) + Int64(src_lo) * Int64(4)) * w_amax) * rcp_denom
                     st_shared_u32(xch + q * Int32(self.x_stride) + col_xch * Int32(2),
                                   pack_f32x2_to_bfloat2(acc[0] * factor_lo, acc[1] * factor_lo))
                 if const_expr(self.max_live > 8):
                     if q + Int32(8) < chunk_live:
-                        factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(src_hi) * Int64(4)) * expert_factor
+                        factor_hi = (_ld_f32(Int64(row_amax.toint()) + Int64(src_hi) * Int64(4)) * w_amax) * rcp_denom
                         st_shared_u32(xch + (q + Int32(8)) * Int32(self.x_stride) + col_xch * Int32(2),
                                       pack_f32x2_to_bfloat2(acc[2] * factor_hi, acc[3] * factor_hi))
                 cute.arch.sync_threads()
@@ -1833,7 +1838,7 @@ class DownSmallDynReg:
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("down_small_dyn_reg", 2, self.n, self.k, self.experts, self.tile_n, self.max_live)
+        return ("down_small_dyn_reg", 3, self.n, self.k, self.experts, self.tile_n, self.max_live)
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer,
@@ -1896,8 +1901,9 @@ class DownSmallDynReg:
             w_idx = Int64(e) * Int64(self.n) + Int64(n0 + q)
             w_row = Int64(w.toint()) + w_idx * Int64(self.row_bytes)
             s_row = Int64(s.toint()) + w_idx * Int64(self.scale_bytes)
-            expert_factor = div_rn_f32(
-                _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4)),
+            w_amax = _ld_f32(Int64(s.toint()) + Int64(self.amax_offset) + Int64(e) * Int64(4))
+            rcp_denom = div_rn_f32(
+                Float32(1.0),
                 Float32(1536.0) * _ld_f32(Int64(s.toint()) + Int64(self.denominator_offset)),
             )
             policy = create_l2_evict_first_policy()
@@ -1979,12 +1985,12 @@ class DownSmallDynReg:
 
                 # Epilogue: coalesced BF16 stores directly to y [pairs, n].
                 if q < chunk_live:
-                    factor_lo = _ld_f32(Int64(row_amax.toint()) + Int64(p_lo) * Int64(4)) * expert_factor
+                    factor_lo = (_ld_f32(Int64(row_amax.toint()) + Int64(p_lo) * Int64(4)) * w_amax) * rcp_denom
                     y_lo = Int64(y.toint()) + (Int64(p_lo) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
                     st_global_u32(y_lo, pack_f32x2_to_bfloat2(d0 * factor_lo, d1 * factor_lo))
                 if const_expr(self.max_live > 8):
                     if q + Int32(8) < chunk_live:
-                        factor_hi = _ld_f32(Int64(row_amax.toint()) + Int64(p_hi) * Int64(4)) * expert_factor
+                        factor_hi = (_ld_f32(Int64(row_amax.toint()) + Int64(p_hi) * Int64(4)) * w_amax) * rcp_denom
                         y_hi = Int64(y.toint()) + (Int64(p_hi) * Int64(self.n) + Int64(n0) + Int64(2) * Int64(c)) * Int64(2)
                         st_global_u32(y_hi, pack_f32x2_to_bfloat2(d2 * factor_hi, d3 * factor_hi))
 
