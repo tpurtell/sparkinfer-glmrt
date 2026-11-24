@@ -264,16 +264,43 @@ def compile_gelu_aot(*, width):
         scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))
 
 
+class ElementwiseBf16Add:
+    """``out = bf16(f32(a) + f32(b))`` elementwise; identical arithmetic to Qwen4Add."""
+
+    def __init__(self, width: int):
+        self.width = int(width)
+
+    @cute.jit
+    def __call__(self, a: cute.Pointer, b: cute.Pointer, out: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        count = Int64(rows) * Int64(self.width)
+        self.kernel(a, b, out, count).launch(
+            grid=((count + Int64(255)) // Int64(256), 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, a: cute.Pointer, b: cute.Pointer, out: cute.Pointer, count: Int64):
+        a, b, out = _view(a), _view(b), _view(out)
+        at = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
+        if at < count:
+            out[at] = _add(Float32(a[at]), Float32(b[at])).to(BFloat16)
+
+
 def compile_bf16_residual_add_aot(*, width):
-    """Reuse the vectorized BF16 add, preserving its single BF16 store."""
+    """Reuse the vectorized BF16 add, preserving its single BF16 store.
+
+    Widths the vector kernel cannot tile (e.g. 1152) use an elementwise kernel
+    with the same F32 add and one BF16 store; vector widths keep their key.
+    """
     from ._qwen4_kernels import Qwen4Add
-    if width <= 0 or width % 256 or width > 8192:
-        raise ValueError("BF16 residual width must be a multiple of 256 in 256..8192")
-    return compile_program(Qwen4Add(width), name="media_residual_add_bf16", operands=(
-        Operand("a", torch.bfloat16, f"[rows,{width}]"),
-        Operand("b", torch.bfloat16, f"[rows,{width}]"),
-        Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
-        scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))
+    if width <= 0 or width > 8192:
+        raise ValueError("BF16 residual width must be in 1..8192")
+    operands = (Operand("a", torch.bfloat16, f"[rows,{width}]"),
+                Operand("b", torch.bfloat16, f"[rows,{width}]"),
+                Operand("out", torch.bfloat16, f"[rows,{width}]", "out"))
+    if width % 256 == 0:
+        return compile_program(Qwen4Add(width), name="media_residual_add_bf16", operands=operands,
+            scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))
+    return compile_program(ElementwiseBf16Add(width), name="media_residual_add_bf16", operands=operands,
+        scalars=(Scalar("rows"),), key=(width, "elementwise"), geometry=dict(width=width, vectorized=False))
 
 
 class SpatialMerge:

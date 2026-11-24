@@ -40,8 +40,9 @@ class StillPatches:
 
 
 def compile_still_patches_aot(*,patch=14,temporal=1,group_major=False):
-    if patch!=14 or temporal not in (1,2) or group_major!=(temporal==2):
-        raise ValueError("still patch layout requires raster14/t1 or group-major14/t2")
+    if not ((patch==14 and temporal in (1,2) and group_major==(temporal==2))
+            or (patch==16 and temporal==1 and not group_major)):
+        raise ValueError("still patch layout requires raster14/t1, group-major14/t2 or raster16/t1")
     return compile_program(StillPatches(patch,temporal,bool(group_major)),name="vision_still_patches",
         operands=(Operand("rgb",torch.uint8,"[height,width,3]"),Operand("lut",torch.float32,"[3,256]"),
                   Operand("out",torch.bfloat16,f"[height*width/{patch*patch},{3*temporal*patch*patch}]","out")),
@@ -50,7 +51,8 @@ def compile_still_patches_aot(*,patch=14,temporal=1,group_major=False):
 
 
 class SpatialGroup:
-    def __init__(self,channels,group_major):self.channels,self.group_major=channels,group_major
+    def __init__(self,channels,group_major,channel_major=False):
+        self.channels,self.group_major,self.channel_major=channels,group_major,channel_major
 
     @cute.jit
     def __call__(self,x:cute.Pointer,out:cute.Pointer,height:Int32,width:Int32,stream:cuda.CUstream):
@@ -64,6 +66,13 @@ class SpatialGroup:
         if at<count:
             if cutlass.const_expr(self.group_major):
                 out[at]=x[at]
+            elif cutlass.const_expr(self.channel_major):
+                # Conv2d(kernel=2,stride=2) weight order [O,C,ky,kx]: feature c*4+ky*2+kx.
+                unit,feature=at//Int64(4*self.channels),at%Int64(4*self.channels)
+                channel,local=feature//Int64(4),feature%Int64(4)
+                y=unit//Int64(width//2)*Int64(2)+local//Int64(2)
+                xx=unit%Int64(width//2)*Int64(2)+local%Int64(2)
+                out[at]=x[(y*Int64(width)+xx)*Int64(self.channels)+channel]
             else:
                 unit,feature=at//Int64(4*self.channels),at%Int64(4*self.channels)
                 local,channel=feature//Int64(self.channels),feature%Int64(self.channels)
@@ -72,10 +81,19 @@ class SpatialGroup:
                 out[at]=x[(y*Int64(width)+xx)*Int64(self.channels)+channel]
 
 
-def compile_spatial_group_aot(*,channels,group_major=False):
+def compile_spatial_group_aot(*,channels,group_major=False,channel_major=False):
+    """Raster patch rows to merged 2x2 units.
+
+    Default feature order is (ky,kx) major then channel. ``channel_major`` gives
+    channel then (ky,kx), so a 2x2 stride-2 Conv2d weight [O,C,2,2] flattens to
+    a plain [O,4C] projection. Existing keys are unchanged.
+    """
     if channels<=0:raise ValueError("spatial grouping channels must be positive")
-    return compile_program(SpatialGroup(channels,bool(group_major)),name="vision_spatial_group",
+    if channel_major and group_major:raise ValueError("channel-major grouping needs raster input")
+    key=(channels,bool(group_major)) if not channel_major else (channels,False,"channel_major")
+    geometry=dict(channels=channels,merge=2,input_group_major=bool(group_major))
+    if channel_major:geometry["feature_order"]="channel_then_ky_kx"
+    return compile_program(SpatialGroup(channels,bool(group_major),bool(channel_major)),name="vision_spatial_group",
         operands=(Operand("x",torch.bfloat16,f"[height*width,{channels}]"),
                   Operand("out",torch.bfloat16,f"[height*width/4,{4*channels}]","out")),
-        scalars=(Scalar("height"),Scalar("width")),key=(channels,bool(group_major)),
-        geometry=dict(channels=channels,merge=2,input_group_major=bool(group_major)))
+        scalars=(Scalar("height"),Scalar("width")),key=key,geometry=geometry)

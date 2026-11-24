@@ -39,7 +39,7 @@ def test_spatial_group_matches_official_concat_order(group_major):
     assert torch.equal(out,expected)
 
 
-@pytest.mark.parametrize("kwargs",[dict(patch=16),dict(temporal=3),dict(temporal=1,group_major=True)])
+@pytest.mark.parametrize("kwargs",[dict(patch=16,temporal=2,group_major=True),dict(patch=12),dict(temporal=3),dict(temporal=1,group_major=True)])
 def test_invalid_still_layout(kwargs):
     from b12x.integration.cuteafd.vision_still import compile_still_patches_aot
     with pytest.raises(ValueError):compile_still_patches_aot(**kwargs)

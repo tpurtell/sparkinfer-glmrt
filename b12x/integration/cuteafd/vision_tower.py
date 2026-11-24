@@ -10,7 +10,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ._common import Operand, Scalar, compile_program
-from .pointwise import _add, _sub, _fma, _view
+from .pointwise import _add, _sub, _mul, _fma, _view
 
 
 @dsl_user_op
@@ -114,3 +114,133 @@ def compile_position_axis_probe_aot(*, table_length=64):
         operands=(Operand("floats", torch.float32, "[length,3]", "out"),
                   Operand("indices", torch.int64, "[length,2]", "out")),
         scalars=(Scalar("length"),), key=(table_length,), geometry=dict(table_length=table_length))
+
+
+class ScaledBilinearPosition:
+    """PyTorch CUDA ``upsample_bilinear2d`` with an explicit ``scale_factor``.
+
+    Hy4's SigLIP2 tower resizes its learned 128x128 grid with
+    ``scale_factor=((h+0.1)/128, (w+0.1)/128)`` and ``align_corners=False``.
+    The caller passes ATen's ``area_pixel_compute_scale`` result,
+    ``float(1/scale_factor)``, per axis. The kernel mirrors ATen's NHWC frame:
+    source index ``rscale*(dst+0.5)-0.5`` clamped at 0, truncating cast,
+    ``+1`` neighbour only inside the table, then ``h0*(w0*a+w1*b)+h1*(w0*c+w1*d)``
+    on F32-widened BF16 values, one BF16 store (the caller's ``.bfloat16()``).
+    When both output extents equal the table's, ATen copies the input instead.
+    """
+    def __init__(self, channels, table_height, table_width, contraction="aten"):
+        self.channels = channels
+        self.table_height, self.table_width = table_height, table_width
+        self.contraction = contraction
+
+    @cute.jit
+    def __call__(self, table: cute.Pointer, out: cute.Pointer, height: Int32, width: Int32,
+                 scale_h: Float32, scale_w: Float32, stream: cuda.CUstream):
+        count = Int64(height) * Int64(width) * Int64(self.channels)
+        self.kernel(table, out, height, width, scale_h, scale_w, count).launch(
+            grid=((count + Int64(255)) // Int64(256), 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.jit
+    def _source(self, rscale: Float32, dst: Int64, length: int):
+        src = _fma(rscale, _add(Float32(dst), Float32(0.5)), Float32(-0.5))
+        if cutlass.const_expr(self.contraction == "unfused"):
+            src = _sub(_mul(rscale, _add(Float32(dst), Float32(0.5))), Float32(0.5))
+        src = cute.math.max(src, Float32(0.0))
+        low = Int64(src)
+        step = cute.math.min(low + Int64(1), Int64(length - 1)) - low
+        lam1 = _sub(src, Float32(low))
+        lam0 = _sub(Float32(1.0), lam1)
+        return low, step, lam0, lam1
+
+    @cute.kernel
+    def kernel(self, table: cute.Pointer, out: cute.Pointer, height: Int32, width: Int32,
+               scale_h: Float32, scale_w: Float32, count: Int64):
+        table, out = _view(table), _view(out)
+        at = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
+        if at < count:
+            if height == Int32(self.table_height) and width == Int32(self.table_width):
+                # ATen's special case: equal input/output extents copy the table.
+                out[at] = table[at]
+            else:
+                channel = at % Int64(self.channels)
+                pixel = at // Int64(self.channels)
+                y, x = pixel // Int64(width), pixel % Int64(width)
+                y0, dy, h0, h1 = self._source(scale_h, y, self.table_height)
+                x0, dx, w0, w1 = self._source(scale_w, x, self.table_width)
+                row = Int64(self.table_width * self.channels)
+                base = (y0 * Int64(self.table_width) + x0) * Int64(self.channels) + channel
+                a = Float32(table[base])
+                b = Float32(table[base + dx * Int64(self.channels)])
+                c = Float32(table[base + dy * row])
+                d = Float32(table[base + dy * row + dx * Int64(self.channels)])
+                if cutlass.const_expr(self.contraction == "unfused"):
+                    top = _add(_mul(w0, a), _mul(w1, b))
+                    bottom = _add(_mul(w0, c), _mul(w1, d))
+                    value = _add(_mul(h0, top), _mul(h1, bottom))
+                else:
+                    # nvcc -fmad contraction of ATen's expression: the left product
+                    # of each sum folds into an FMA with the right product.
+                    top = _fma(w0, a, _mul(w1, b))
+                    bottom = _fma(w0, c, _mul(w1, d))
+                    value = _fma(h0, top, _mul(h1, bottom))
+                out[at] = value.to(BFloat16)
+
+
+def compile_scaled_bilinear_position_aot(*, channels=1152, table_height=128, table_width=128,
+                                         contraction="aten"):
+    """Static table geometry only; output H/W and both scales are launch data.
+
+    ``table`` is the learned grid without its class row (callers pass the row-1
+    offset), BF16 ``[table_height, table_width, channels]``.
+    """
+    if min(channels, table_height, table_width) <= 0:
+        raise ValueError("position table geometry must be positive")
+    if contraction not in ("aten", "unfused"):
+        raise ValueError("unknown bilinear contraction")
+    key = (channels, table_height, table_width) + ((contraction,) if contraction != "aten" else ())
+    return compile_program(ScaledBilinearPosition(channels, table_height, table_width, contraction),
+        name="vision_tower_scaled_bilinear_position", operands=(
+            Operand("table", torch.bfloat16, f"[{table_height},{table_width},{channels}]"),
+            Operand("out", torch.bfloat16, f"[height*width,{channels}]", "out")),
+        scalars=(Scalar("height"), Scalar("width"), Scalar("scale_h", "float32"), Scalar("scale_w", "float32")),
+        key=key,
+        geometry=dict(channels=channels, table_height=table_height, table_width=table_width,
+                      interpolation="aten_upsample_bilinear2d_scale_factor", contraction=contraction))
+
+
+class RowMarkers:
+    """Append one checkpoint marker row after every merged grid row."""
+    def __init__(self, width):
+        self.width = width
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, marker: cute.Pointer, out: cute.Pointer,
+                 height: Int32, width: Int32, stream: cuda.CUstream):
+        count = Int64(height) * Int64(width + Int32(1)) * Int64(self.width)
+        self.kernel(x, marker, out, width, count).launch(
+            grid=((count + Int64(255)) // Int64(256), 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, marker: cute.Pointer, out: cute.Pointer, width: Int32, count: Int64):
+        x, marker, out = _view(x), _view(marker), _view(out)
+        at = Int64(cute.arch.block_idx()[0]) * Int64(256) + Int64(cute.arch.thread_idx()[0])
+        if at < count:
+            channel = at % Int64(self.width)
+            slot = at // Int64(self.width)
+            columns = Int64(width) + Int64(1)
+            row, column = slot // columns, slot % columns
+            if column == Int64(width):
+                out[at] = marker[channel]
+            else:
+                out[at] = x[(row * Int64(width) + column) * Int64(self.width) + channel]
+
+
+def compile_row_markers_aot(*, width):
+    """[h*w,width] merged rows to [h*(w+1),width] with a marker closing each row."""
+    if width <= 0:
+        raise ValueError("row marker width must be positive")
+    return compile_program(RowMarkers(width), name="vision_tower_row_markers", operands=(
+            Operand("x", torch.bfloat16, f"[height*width,{width}]"),
+            Operand("marker", torch.bfloat16, f"[{width}]"),
+            Operand("out", torch.bfloat16, f"[height*(width+1),{width}]", "out")),
+        scalars=(Scalar("height"), Scalar("width")), key=(width,), geometry=dict(width=width))
