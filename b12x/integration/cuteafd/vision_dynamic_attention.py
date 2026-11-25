@@ -58,7 +58,10 @@ def compile_dynamic_vision_attention_aot(*, heads, dim, segments=1):
     geometry=dict(heads=heads,dim=dim,rows="runtime",causal=False)
     if segments>1:
         geometry["segments"]=segments
-    return compile_program(DynamicVisionAttention(heads,dim,segments),name="dynamic_vision_attention",
+    from ._hy4_vision_kernels import Hy4DynamicVisionAttention
+    launch = (Hy4DynamicVisionAttention() if (heads,dim,segments)==(16,72,8)
+              else DynamicVisionAttention(heads,dim,segments))
+    return compile_program(launch,name="dynamic_vision_attention",
         operands=(Operand("q",torch.bfloat16,f"[rows,{heads},{dim}]"),
                   Operand("k",torch.bfloat16,f"[rows,{heads},{dim}]"),
                   Operand("v",torch.bfloat16,f"[rows,{heads},{dim}]"),

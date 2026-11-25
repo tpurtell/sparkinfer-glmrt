@@ -209,7 +209,10 @@ def compile_biased_projection_aot(*, width, outputs):
     """
     if min(width, outputs) <= 0:
         raise ValueError("projection dimensions must be positive")
-    return compile_program(BiasedProjection(width, outputs), name="media_biased_projection",
+    from ._hy4_vision_kernels import HY4_BIASED_SHAPES, Hy4RoutedBiasedProjection
+    launch = (Hy4RoutedBiasedProjection(width, outputs)
+              if (width, outputs) in HY4_BIASED_SHAPES else BiasedProjection(width, outputs))
+    return compile_program(launch, name="media_biased_projection",
         operands=(Operand("x", torch.bfloat16, f"[rows,{width}]"),
                   Operand("weight", torch.bfloat16, f"[{outputs},{width}]"),
                   Operand("bias", torch.bfloat16, f"[{outputs}]"),
@@ -258,7 +261,9 @@ def compile_gelu_aot(*, width):
     """ABI adapter to the existing BF16 erf GELU, not a second implementation."""
     if width <= 0:
         raise ValueError("GELU width must be positive")
-    return compile_program(Gelu(width), name="media_gelu",
+    from ._hy4_vision_kernels import HY4_GELU_WIDTHS, Hy4ExactGelu
+    launch = Hy4ExactGelu(width) if width in HY4_GELU_WIDTHS else Gelu(width)
+    return compile_program(launch, name="media_gelu",
         operands=(Operand("x", torch.bfloat16, f"[rows,{width}]"),
                   Operand("out", torch.bfloat16, f"[rows,{width}]", "out")),
         scalars=(Scalar("rows"),), key=(width,), geometry=dict(width=width))

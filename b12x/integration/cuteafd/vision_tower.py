@@ -198,7 +198,11 @@ def compile_scaled_bilinear_position_aot(*, channels=1152, table_height=128, tab
     if contraction not in ("aten", "unfused"):
         raise ValueError("unknown bilinear contraction")
     key = (channels, table_height, table_width) + ((contraction,) if contraction != "aten" else ())
-    return compile_program(ScaledBilinearPosition(channels, table_height, table_width, contraction),
+    from ._hy4_vision_kernels import Hy4ScaledBilinearPosition
+    launch = (Hy4ScaledBilinearPosition()
+              if (channels, table_height, table_width, contraction) == (1152, 128, 128, "aten")
+              else ScaledBilinearPosition(channels, table_height, table_width, contraction))
+    return compile_program(launch,
         name="vision_tower_scaled_bilinear_position", operands=(
             Operand("table", torch.bfloat16, f"[{table_height},{table_width},{channels}]"),
             Operand("out", torch.bfloat16, f"[height*width,{channels}]", "out")),
