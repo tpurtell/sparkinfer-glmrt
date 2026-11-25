@@ -212,8 +212,10 @@ class Hy4MlaGeometry:
             raise ValueError("Hy4 MLA kv_cache must be 'bf16' or 'fp8'")
         if self.heads not in (16, 32, 64):
             raise ValueError(f"Hy4 MLA heads must be 16, 32, or 64; got {self.heads}")
-        if (self.q_lora_rank, self.kv_lora_rank, self.qk_nope_dim, self.qk_rope_dim,
-                self.v_head_dim, self.page_rows) != (1024, 512, 192, 64, 256, 64):
+        if self.q_lora_rank not in (1024, 2048):
+            raise ValueError(f"Hy4 MLA q_lora_rank must be 1024 or 2048; got {self.q_lora_rank}")
+        if (self.kv_lora_rank, self.qk_nope_dim, self.qk_rope_dim,
+                self.v_head_dim, self.page_rows) != (512, 192, 64, 256, 64):
             raise ValueError("unsupported Hy4 MLA dimensions")
         if self.window_size not in (None, 512):
             raise ValueError("Hy4 MLA window_size must be None (DSA) or 512 (SWA)")
@@ -251,7 +253,10 @@ def _mrope_position(positions: cute.Pointer, row: Int64, pair: Int64, s1: cutlas
 
 
 def _is_tp1(g: Hy4MlaGeometry) -> bool:
-    # TP1 has 32 DSA heads and 64 SWA heads; keep the TP2 routes unchanged.
+    # Hy4-flash (q_lora_rank=1024): TP1 has 32 DSA heads and 64 SWA heads; keep TP2 routes unchanged.
+    # Hy4 (q_lora_rank=2048): fast fused Q-absorb, sink-gate-UV, and FP8 MLA on both TP1 (64H) and TP2 (32H).
+    if g.q_lora_rank == 2048:
+        return g.heads in (32, 64)
     return g.heads == (32 if g.window_size is None else 64)
 
 
@@ -307,10 +312,12 @@ def hy4_dsa_partial_scratch_bytes(
 
 
 class _Hy4RankNormPack:
-    """RMSNorm q_a (1024) + kv_a (512), interleaved RoPE-64 on k_rope, write KV cache."""
+    """RMSNorm q_a (1024 or 2048) + kv_a (512), interleaved RoPE-64 on k_rope, write KV cache."""
 
     def __init__(self, g: Hy4MlaGeometry):
         self.g = g
+        self.q_rank = int(g.q_lora_rank)
+        self.q_iters = self.q_rank // 256
 
     @cute.jit
     def __call__(
@@ -349,24 +356,24 @@ class _Hy4RankNormPack:
         storage = utils.SmemAllocator().allocate(_reduction_storage(2, 8))
         sums = storage.sums.get_tensor(cute.make_layout((2, 8), stride=(8, 1)))
 
-        q = cute.make_rmem_tensor((4,), Float32)
+        q = cute.make_rmem_tensor((self.q_iters,), Float32)
         kv = cute.make_rmem_tensor((2,), Float32)
         qs, ks = Float32(0.0), Float32(0.0)
-        for j in cutlass.range_constexpr(4):
+        for j in cutlass.range_constexpr(self.q_iters):
             d = Int64(j * 256) + Int64(tid)
-            q[j] = Float32(q_a[row * Int64(1024) + d])
+            q[j] = Float32(q_a[row * Int64(self.q_rank) + d])
             qs += q[j] * q[j]
         for j in cutlass.range_constexpr(2):
             d = Int64(j * 256) + Int64(tid)
             kv[j] = Float32(kv_a[row * Int64(576) + d])
             ks += kv[j] * kv[j]
 
-        qi = _rsqrt(_block_sum(qs, sums, Int32(0), 8) / Float32(1024.0) + Float32(self.g.norm_eps))
+        qi = _rsqrt(_block_sum(qs, sums, Int32(0), 8) / Float32(float(self.q_rank)) + Float32(self.g.norm_eps))
         ki = _rsqrt(_block_sum(ks, sums, Int32(1), 8) / Float32(512.0) + Float32(self.g.norm_eps))
 
-        for j in cutlass.range_constexpr(4):
+        for j in cutlass.range_constexpr(self.q_iters):
             d = Int64(j * 256) + Int64(tid)
-            q_resid[row * Int64(1024) + d] = (q[j] * qi * Float32(q_norm[d])).to(BFloat16)
+            q_resid[row * Int64(self.q_rank) + d] = (q[j] * qi * Float32(q_norm[d])).to(BFloat16)
 
         slot = Int64(slots[row])
         if slot >= Int64(0):
@@ -3559,14 +3566,14 @@ class _Hy4Attention:
 
 def compile_hy4_mla_rank_norm_pack_aot(g: Hy4MlaGeometry):
     operands = (
-        Operand("q_a", torch.bfloat16, "[rows,1024]"),
+        Operand("q_a", torch.bfloat16, f"[rows,{g.q_lora_rank}]"),
         Operand("kv_a", torch.bfloat16, "[rows,576]"),
-        Operand("q_norm", torch.bfloat16, "[1024]"),
+        Operand("q_norm", torch.bfloat16, f"[{g.q_lora_rank}]"),
         Operand("kv_norm", torch.bfloat16, "[512]"),
         Operand("slots", torch.int64, "[rows]", align=8),
         Operand("positions", torch.int64, "[rows,3]", align=8, note="M-RoPE (T,H,W) rotary positions"),
         Operand("inv_freq", torch.float32, "[32]", align=4),
-        Operand("q_resid", torch.bfloat16, "[rows,1024]", "out"),
+        Operand("q_resid", torch.bfloat16, f"[rows,{g.q_lora_rank}]", "out"),
         Operand(
             "kv_cache",
             torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,
@@ -3574,14 +3581,25 @@ def compile_hy4_mla_rank_norm_pack_aot(g: Hy4MlaGeometry):
             "inout",
         ),
     )
+    key = (
+        (g.kv_cache, g.norm_eps, "rank_norm_pack", g.mrope_section)
+        if g.q_lora_rank == 1024
+        else (g.q_lora_rank, g.kv_cache, g.norm_eps, "rank_norm_pack", g.mrope_section)
+    )
+    geometry = {
+        "kv_cache": g.kv_cache,
+        "norm_eps": g.norm_eps,
+        "record_bytes": g.record_bytes,
+        "mrope_section": list(g.mrope_section),
+        **({"q_lora_rank": g.q_lora_rank} if g.q_lora_rank != 1024 else {}),
+    }
     return compile_program(
         _Hy4RankNormPack(g),
         name=f"hy4_mla_rank_norm_pack_{g.kv_cache}",
         operands=operands,
         scalars=(Scalar("rows"),),
-        key=(g.kv_cache, g.norm_eps, "rank_norm_pack", g.mrope_section),
-        geometry={"kv_cache": g.kv_cache, "norm_eps": g.norm_eps, "record_bytes": g.record_bytes,
-                  "mrope_section": list(g.mrope_section)},
+        key=key,
+        geometry=geometry,
         doc=__doc__,
     )
 
@@ -3594,12 +3612,18 @@ def compile_hy4_mla_q_absorb_aot(g: Hy4MlaGeometry):
         Operand("inv_freq", torch.float32, "[32]", align=4),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
     )
+    fast = _is_tp1(g)
+    key = (
+        (g.heads, "q_absorb", g.mrope_section)
+        if g.q_lora_rank == 1024
+        else (g.heads, "q_absorb", g.mrope_section, fast)
+    )
     return compile_program(
-        _Hy4Tp1QAbsorb(g) if _is_tp1(g) else _Hy4QAbsorb(g),
+        _Hy4Tp1QAbsorb(g) if fast else _Hy4QAbsorb(g),
         name=f"hy4_mla_q_absorb_h{g.heads}",
         operands=operands,
         scalars=(Scalar("rows"),),
-        key=(g.heads, "q_absorb", g.mrope_section),
+        key=key,
         geometry={"heads": g.heads, "qk_nope_dim": 192, "qk_rope_dim": 64,
                   "mrope_section": list(g.mrope_section)},
         doc=__doc__,
@@ -3615,12 +3639,18 @@ def compile_hy4_mla_sink_gate_uv_aot(g: Hy4MlaGeometry):
         Operand("sink", torch.float32, f"[{g.heads}]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{g.heads},256]", "out"),
     )
+    fast = _is_tp1(g)
+    key = (
+        (g.heads, "sink_gate_uv")
+        if g.q_lora_rank == 1024
+        else (g.heads, "sink_gate_uv", fast)
+    )
     return compile_program(
-        _Hy4Tp1SinkGateUv(g) if _is_tp1(g) else _Hy4SinkGateUv(g),
+        _Hy4Tp1SinkGateUv(g) if fast else _Hy4SinkGateUv(g),
         name=f"hy4_mla_sink_gate_uv_h{g.heads}",
         operands=operands,
         scalars=(Scalar("rows"),),
-        key=(g.heads, "sink_gate_uv"),
+        key=key,
         geometry={"heads": g.heads, "v_head_dim": 256, "kv_lora_rank": 512},
         doc=__doc__,
     )
@@ -3661,10 +3691,11 @@ def compile_hy4_mla_dsa_partial_aot(
     ``active_splits`` is clamped to ``[2, num_splits]`` at launch so base-2 partial LSE is always
     emitted. Empty rows (``cache_seqlens[r] == 0``) produce zero output and ``-inf`` LSE.
     """
-    if g.heads != 32 or g.window_size is not None:
-        raise ValueError("Hy4 DSA partial requires 32-head full-context DSA geometry")
-    if head_begin not in (0, 16) or head_count != 16:
-        raise ValueError("Hy4 DSA partial requires head_begin in (0, 16) and head_count == 16")
+    if g.heads not in (32, 64) or g.window_size is not None:
+        raise ValueError("Hy4 DSA partial requires 32-head or 64-head full-context DSA geometry")
+    half = g.heads // 2
+    if head_begin not in (0, half) or head_count != half:
+        raise ValueError(f"Hy4 DSA partial requires head_begin in (0, {half}) and head_count == {half}")
     if num_splits != 16:
         raise ValueError("Hy4 DSA partial requires num_splits == 16")
     if not 1 <= int(max_rows) <= 4096 or not 1 <= int(row_chunk_size) <= 4096:
@@ -3678,7 +3709,7 @@ def compile_hy4_mla_dsa_partial_aot(
         row_chunk_size=int(row_chunk_size),
     )
     operands = (
-        Operand("query", torch.bfloat16, "[rows,32,576]"),
+        Operand("query", torch.bfloat16, f"[rows,{g.heads},576]"),
         Operand(
             "kv_cache",
             torch.uint8 if g.kv_cache == "fp8" else torch.bfloat16,

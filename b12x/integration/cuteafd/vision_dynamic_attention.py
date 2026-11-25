@@ -50,8 +50,8 @@ def compile_dynamic_vision_attention_aot(*, heads, dim, segments=1):
     nothing). ``segments`` is a planned capacity, never a live image count.
     One segment keeps the historical compile key and ABI byte-identical.
     """
-    if (heads,dim) not in ((12,128),(16,72),(16,80),(16,128)):
-        raise ValueError("dynamic vision attention requires12x128,16x72,16x80 or shared16x128")
+    if (heads,dim) not in ((12,128),(16,72),(16,80),(16,96),(16,128)):
+        raise ValueError("dynamic vision attention requires12x128,16x72,16x80,16x96 or shared16x128")
     if not isinstance(segments,int) or segments<1 or segments>64:
         raise ValueError("dynamic vision attention segments must be a planned capacity in 1..64")
     key=(heads,dim) if segments==1 else (heads,dim,segments)
