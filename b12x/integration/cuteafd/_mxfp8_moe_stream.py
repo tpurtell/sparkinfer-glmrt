@@ -114,7 +114,7 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
                 self.gate_cap, self.up_cap, self.act_row_bytes) + (
                     ("row_addresses",) if self.row_addresses else ()) + (
                     ("wire_align8",) if self.row_bytes % 16 else ())
-        return base + ("mini_prefill", 2) if self.mini_prefill else base
+        return base + ("mini_prefill", 3) if self.mini_prefill else base
 
     def _storage(self, w_layout):
         class Storage:
@@ -430,7 +430,7 @@ class StreamMxfp8Down:
     def key(self) -> tuple:
         base = ("stream_down_mxfp8", 2, self.hidden, self.inter, self.experts,
                 self.tma_w, self.w_ring, self.a_ring, self.sa_group)
-        return base + ("mini_prefill", 2) if self.mini_prefill else base
+        return base + ("mini_prefill", 3) if self.mini_prefill else base
 
     def _w_layout(self):
         w_atom = warpgroup.make_smem_layout_atom(

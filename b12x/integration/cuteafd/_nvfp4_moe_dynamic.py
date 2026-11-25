@@ -303,7 +303,7 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
 
     def key(self) -> tuple:
         base = ("stream_linear_nvfp4_dyn", 4, *super().key()[2:])
-        return base + ("mini_prefill", 2) if self.mini_prefill else base
+        return base + ("mini_prefill", 3) if self.mini_prefill else base
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
@@ -445,7 +445,7 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
     def key(self) -> tuple:
         base = ("stream_gate_up_nvfp4_dyn", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
-        return base + ("mini_prefill", 2) if self.mini_prefill else base
+        return base + ("mini_prefill", 3) if self.mini_prefill else base
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,

@@ -14,7 +14,8 @@ Round 2 architecture (strictly K-order preserving -> bit-identical to stock):
      eliminating tail-wave stragglers under skewed routing while keeping grid.x=18 fast for
      18x activation L2 sharing.
 2. True warp specialization (8 MMA warps + 1 dedicated TMA DMA warp = 288 threads,
-   setmaxnreg 232/40) on NVFP4 GateUp, NVFP4 Down, and MXFP8 Down:
+   static <=164 regs/thread -> 0 spills and 0 dynamic setmaxnreg reallocation) on
+   NVFP4 GateUp, NVFP4 Down, and MXFP8 Down:
    - Zero __syncthreads() in the K-loop (async full/empty mbarrier ring with 8-warp arrivals).
    - DMA warp streams continuously across chunk boundaries without draining on epilogues.
    - Only 64 accumulator regs/thread (vs 128 in 2-chunk fusion), enabling full ldmatrix
@@ -104,8 +105,6 @@ MINI_EXPERTS = 128
 MINI_MAX_CHUNKS = 4
 MINI_MMA_THREADS = 256
 MINI_WS_THREADS = 288
-MINI_MMA_REGS = 232
-MINI_DMA_REGS = 40
 
 
 def mini_u8_weight(pointer: cute.Pointer, rows, cols: int) -> cute.Tensor:
@@ -453,7 +452,6 @@ def mini_nvfp4_gate_up_body(
         w_tile = e * Int32(MINI_INTER // _NV4_GU_HALF_N) + n_blk
 
         if warp_id == Int32(8):
-            cute.arch.setmaxregister_decrease(MINI_DMA_REGS)
             step_idx = Int32(0)
             for ci in cutlass.range(n_chunks, unroll=1):
                 tile_c = tile0 + ci
@@ -482,7 +480,6 @@ def mini_nvfp4_gate_up_body(
                                       t_sfas[(None, base_slot + Int32(b))], tma_bar_ptr=barrier)
                     step_idx = step_idx + Int32(1)
         else:
-            cute.arch.setmaxregister_increase(MINI_MMA_REGS)
             # Preload all 128 weight scale rows (64 gate + 64 up) x 36 u32 words coalesced ONCE per CTA,
             # overlapping directly with the DMA warp's initial k=0,1 TMA pulls.
             sc_words = _NV4_GU_SC_COLS // 4  # 36
@@ -544,7 +541,7 @@ def mini_nvfp4_gate_up_body(
                             ssc_addr, k_blk, acc, warp_m, warp_n, q, c, mat, mrow)
                         cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
-                    if lane == Int32(0):
+                    with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(empty_mbar + slot)
                     step_idx = step_idx + Int32(1)
 
@@ -761,7 +758,6 @@ def mini_nvfp4_down_body(
         w_tile = e * Int32(MINI_HIDDEN // _NV4_DN_TILE_N) + n_blk
 
         if warp_id == Int32(8):
-            cute.arch.setmaxregister_decrease(MINI_DMA_REGS)
             step_idx = Int32(0)
             for ci in cutlass.range(n_chunks, unroll=1):
                 tile_c = tile0 + ci
@@ -787,7 +783,6 @@ def mini_nvfp4_down_body(
                                       t_as[(None, base_slot + Int32(b))], tma_bar_ptr=barrier)
                     step_idx = step_idx + Int32(1)
         else:
-            cute.arch.setmaxregister_increase(MINI_MMA_REGS)
             # Preload s2 (128 rows x 18 u32 words = 2304 words = 9 * 256) coalesced ONCE per CTA.
             sc_words = _NV4_DN_SC_COLS // 4  # 18
             s2_base = Int64(s2.toint())
@@ -852,7 +847,7 @@ def mini_nvfp4_down_body(
                             ssa_sc_addr, ssb_addr, k_blk, acc, warp_m, warp_n, q, c, mat, mrow)
                         cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
-                    if lane == Int32(0):
+                    with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(empty_mbar + slot)
                     step_idx = step_idx + Int32(1)
 
@@ -1046,7 +1041,6 @@ def mini_mxfp8_down_body(
         w_tile = e * Int32(MINI_HIDDEN // _MX8_DN_TILE_N) + n_blk
 
         if warp_id == Int32(8):
-            cute.arch.setmaxregister_decrease(MINI_DMA_REGS)
             step_idx = Int32(0)
             for ci in cutlass.range(n_chunks, unroll=1):
                 tile_c = tile0 + ci
@@ -1072,7 +1066,6 @@ def mini_mxfp8_down_body(
                                       t_as[(None, base_slot + Int32(b))], tma_bar_ptr=barrier)
                     step_idx = step_idx + Int32(1)
         else:
-            cute.arch.setmaxregister_increase(MINI_MMA_REGS)
             # Preload s2 (128 x 9 u32 words = 1152 words) coalesced ONCE per CTA.
             total_sb = _MX8_DN_TILE_N * _MX8_DN_SC_WORDS  # 1152
             s2_tile_base = Int64(s2.toint()) + (Int64(e) * Int64(MINI_HIDDEN) + Int64(n0)) * Int64(_MX8_DN_SC_STRIDE)
@@ -1132,7 +1125,7 @@ def mini_mxfp8_down_body(
                             ssa_sc_addr, ssb_addr, acc, warp_m, warp_n, lane, g)
                         cute.arch.fence_view_async_shared()
                     cute.arch.sync_warp()
-                    if lane == Int32(0):
+                    with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(empty_mbar + slot)
                     step_idx = step_idx + Int32(1)
 
