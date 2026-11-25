@@ -37,6 +37,7 @@ from ._common import Operand, Scalar, compile_program
 
 __all__ = [
     "HY4_FLASH_IHC",
+    "HY4_IHC",
     "Hy4IhcGeometry",
     "compile_hy4_hc_head_aot",
     "compile_hy4_ihc_post_aot",
@@ -70,6 +71,7 @@ class Hy4IhcGeometry:
 
 
 HY4_FLASH_IHC = Hy4IhcGeometry()
+HY4_IHC = Hy4IhcGeometry(hidden=6144)
 
 
 @cute.jit

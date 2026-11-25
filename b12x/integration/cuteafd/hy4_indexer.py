@@ -69,13 +69,17 @@ from b12x._lib.intrinsics import (
 from b12x._lib.utils import runtime_num_sm
 from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._common import Operand, Scalar, compile_program
-from ._glm_kernels import _fp8_scale
+from ._glm_kernels import _bf16, _fp8_scale, _rsqrt, _warp_max, _warp_sum
 from .context_split import _pair_before, _sort_pairs
 from .hy4_mla import _mrope_position, _validate_mrope
 
 __all__ = [
     "HY4_FLASH_INDEXER",
+    "HY4_INDEXER",
+    "Hy4IndexPost",
     "Hy4IndexerGeometry",
+    "Hy4PerTokenIndexerGeometry",
+    "compile_hy4_index_post_aot",
     "compile_hy4_indexer_expand_slots_aot",
     "compile_hy4_indexer_merge_expand_owned_aot",
     "compile_hy4_indexer_pool_group_aot",
@@ -2070,4 +2074,268 @@ def compile_hy4_indexer_expand_slots_aot(g: Hy4IndexerGeometry = HY4_FLASH_INDEX
         key=(g, "expand_slots"),
         geometry=vars(g),
         doc=__doc__,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hy4 (hy_v4_vl): 32-head per-token DSA indexer epilogue (Hy4IndexPost)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Hy4PerTokenIndexerGeometry:
+    """Per-token 32-head DSA indexer geometry for Hy4 (hy_v4_vl).
+
+    Matches ``python/reference/families/hy4/model.py::dsa_indexer`` and feeds
+    directly into ``compile_glm_index_topk_aot`` / ``compile_scored_index_topk_aot``
+    (8448 B/page: 64 x 128 E4M3 keys followed by 64 FP32 scales).
+    """
+    heads: int = 32
+    head_dim: int = 128
+    rope_dim: int = 64
+    topk: int = 2048
+    page_rows: int = 64
+    norm_eps: float = 1e-5
+    mrope_section: tuple = (12, 10, 10)
+
+    def __post_init__(self) -> None:
+        if (self.heads, self.head_dim, self.rope_dim, self.topk, self.page_rows) != (32, 128, 64, 2048, 64):
+            raise ValueError("unsupported Hy4 per-token indexer geometry")
+        if not (math.isfinite(self.norm_eps) and self.norm_eps > 0):
+            raise ValueError("Hy4 indexer norm_eps must be finite and positive")
+        _validate_mrope(self.mrope_section, self.rope_dim // 2)
+
+    @property
+    def weight_scale(self) -> float:
+        return (self.heads ** -0.5) * (self.head_dim ** -0.5)
+
+    @property
+    def page_bytes(self) -> int:
+        return self.page_rows * (self.head_dim + 4)  # 64 * 132 = 8448
+
+
+HY4_INDEXER = Hy4PerTokenIndexerGeometry()
+
+
+class Hy4IndexPost:
+    """Hy4 per-token DSA indexer query/key epilogue (trailing-64 interleaved M-RoPE).
+
+    ``iq`` BF16 ``[rows, H, 128]`` = ``wq_b(q_resid)``; ``k_raw`` BF16
+    ``[rows, 128]`` = ``wk(x)``; ``w_raw`` BF16 ``[rows, H]`` = ``weights_proj(x)``.
+    Per (row, head): trailing-64 (dims 64..128) interleaved M-RoPE using
+    ``positions [rows, 3]`` and ``inv_freq [32]``, BF16 round, E4M3 with
+    per-(row, head) scale ``amax/448`` into ``q_fp8 [rows, H, 128]``;
+    ``head_weights = bf16(w_raw) * H^-0.5 * 128^-0.5 * q_scale``.
+    Key: ``LayerNorm(k_raw)`` (weight, bias, ``eps=1e-5``), BF16 round,
+    trailing-64 interleaved M-RoPE, BF16 round, E4M3 with per-token FP32 scale
+    into the 8448 B/page index cache at ``slots[row]`` (skipped when ``slot < 0``).
+
+    One warp per (row, head) plus one warp for the key; lane ``l`` owns the
+    four contiguous dims ``4l..4l+3``. Lanes ``0..15`` pass dims ``0..63``
+    through untouched; lanes ``16..31`` rotate adjacent pairs ``(2p, 2p+1)``
+    in-place with zero cross-lane shuffles.
+    """
+
+    def __init__(self, g: Hy4PerTokenIndexerGeometry = HY4_INDEXER):
+        self.heads = int(g.heads)
+        self.eps = float(g.norm_eps)
+        self.weight_scale = float(g.weight_scale)
+        self.page_rows = int(g.page_rows)
+        self.page_bytes = int(g.page_bytes)
+        self.mrope_section = g.mrope_section
+
+    @cute.jit
+    def __call__(
+        self,
+        iq: cute.Pointer,
+        k_raw: cute.Pointer,
+        w_raw: cute.Pointer,
+        positions: cute.Pointer,
+        slots: cute.Pointer,
+        inv_freq: cute.Pointer,
+        k_weight: cute.Pointer,
+        k_bias: cute.Pointer,
+        q_fp8: cute.Pointer,
+        head_weights: cute.Pointer,
+        cache: cute.Pointer,
+        rows: Int32,
+        stream: cuda.CUstream,
+    ):
+        if rows > Int32(0):
+            m = Int64(rows)
+            h = self.heads
+            self.kernel(
+                cute.make_tensor(iq, cute.make_layout((m, h, 128), stride=(h * 128, 128, 1))),
+                cute.make_tensor(k_raw, cute.make_layout((m, 128), stride=(128, 1))),
+                cute.make_tensor(w_raw, cute.make_layout((m, h), stride=(h, 1))),
+                positions,
+                cute.make_tensor(slots, cute.make_layout((m,))),
+                inv_freq,
+                cute.make_tensor(k_weight, cute.make_layout((128,))),
+                cute.make_tensor(k_bias, cute.make_layout((128,))),
+                q_fp8,
+                cute.make_tensor(head_weights, cute.make_layout((m, h), stride=(h, 1))),
+                cache,
+            ).launch(grid=(rows, h + 1, 1), block=(32, 1, 1), stream=stream)
+
+    @cute.jit
+    def _rotate_tail_in_place(
+        self,
+        lane: Int32,
+        token: Int64,
+        positions: cute.Pointer,
+        inv_freq: cute.Pointer,
+        val: cute.Tensor,
+    ):
+        if lane >= Int32(16):
+            pair0 = Int64(2) * Int64(lane - Int32(16))
+            angle0 = (
+                _mrope_position(positions, token, pair0, self.mrope_section[1], self.mrope_section[2])
+                * Float32(inv_freq[pair0])
+            )
+            c0 = cute.math.cos(angle0, fastmath=False)
+            s0 = cute.math.sin(angle0, fastmath=False)
+            x0, x1 = val[0], val[1]
+            val[0] = _bf16(x0 * c0 - x1 * s0)
+            val[1] = _bf16(x1 * c0 + x0 * s0)
+
+            pair1 = pair0 + Int64(1)
+            angle1 = (
+                _mrope_position(positions, token, pair1, self.mrope_section[1], self.mrope_section[2])
+                * Float32(inv_freq[pair1])
+            )
+            c1 = cute.math.cos(angle1, fastmath=False)
+            s1 = cute.math.sin(angle1, fastmath=False)
+            x2, x3 = val[2], val[3]
+            val[2] = _bf16(x2 * c1 - x3 * s1)
+            val[3] = _bf16(x3 * c1 + x2 * s1)
+
+    @cute.kernel
+    def kernel(
+        self,
+        iq: cute.Tensor,
+        k_raw: cute.Tensor,
+        w_raw: cute.Tensor,
+        positions: cute.Pointer,
+        slots: cute.Tensor,
+        inv_freq: cute.Pointer,
+        k_weight: cute.Tensor,
+        k_bias: cute.Tensor,
+        q_fp8: cute.Pointer,
+        head_weights: cute.Tensor,
+        cache: cute.Pointer,
+    ):
+        token = Int64(cute.arch.block_idx()[0])
+        head = Int32(cute.arch.block_idx()[1])
+        lane = Int32(cute.arch.thread_idx()[0])
+        val = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+
+        if head < Int32(self.heads):
+            h64 = Int64(head)
+            for e in cutlass.range_constexpr(4):
+                val[e] = Float32(iq[token, h64, Int64(4) * Int64(lane) + Int64(e)])
+            self._rotate_tail_in_place(lane, token, positions, inv_freq, val)
+            local = fmax_f32(
+                fmax_f32(fabs_f32(val[0]), fabs_f32(val[1])),
+                fmax_f32(fabs_f32(val[2]), fabs_f32(val[3])),
+            )
+            scale = _fp8_scale(_warp_max(local))
+            packed = cvt_f32x4_to_e4m3x4(
+                div_rn_f32(val[0], scale),
+                div_rn_f32(val[1], scale),
+                div_rn_f32(val[2], scale),
+                div_rn_f32(val[3], scale),
+            )
+            words = cute.make_ptr(
+                Uint32,
+                Int64(q_fp8.toint()) + (token * Int64(self.heads) + h64) * Int64(128) + Int64(4) * Int64(lane),
+                cute.AddressSpace.gmem,
+                assumed_align=4,
+            )
+            words[0] = packed
+            if lane == Int32(0):
+                head_weights[token, h64] = Float32(w_raw[token, h64]) * Float32(self.weight_scale) * scale
+        else:
+            raw = cute.make_rmem_tensor(cute.make_layout((4,), stride=(1,)), Float32)
+            total = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                raw[e] = Float32(k_raw[token, Int64(4) * Int64(lane) + Int64(e)])
+                total = total + raw[e]
+            mean = _warp_sum(total) / Float32(128.0)
+            var = Float32(0.0)
+            for e in cutlass.range_constexpr(4):
+                diff = raw[e] - mean
+                var = var + diff * diff
+            rstd = _rsqrt(_warp_sum(var) / Float32(128.0) + Float32(self.eps))
+            for e in cutlass.range_constexpr(4):
+                dk = Int64(4) * Int64(lane) + Int64(e)
+                val[e] = _bf16((raw[e] - mean) * rstd * Float32(k_weight[dk]) + Float32(k_bias[dk]))
+            self._rotate_tail_in_place(lane, token, positions, inv_freq, val)
+            local = fmax_f32(
+                fmax_f32(fabs_f32(val[0]), fabs_f32(val[1])),
+                fmax_f32(fabs_f32(val[2]), fabs_f32(val[3])),
+            )
+            scale = _fp8_scale(_warp_max(local))
+            slot = Int64(slots[token])
+            if slot >= Int64(0):
+                page = slot // Int64(self.page_rows)
+                row = slot - page * Int64(self.page_rows)
+                page_base = Int64(cache.toint()) + page * Int64(self.page_bytes)
+                packed = cvt_f32x4_to_e4m3x4(
+                    div_rn_f32(val[0], scale),
+                    div_rn_f32(val[1], scale),
+                    div_rn_f32(val[2], scale),
+                    div_rn_f32(val[3], scale),
+                )
+                words = cute.make_ptr(
+                    Uint32,
+                    page_base + row * Int64(128) + Int64(4) * Int64(lane),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                )
+                words[0] = packed
+                if lane == Int32(0):
+                    scale_ptr = cute.make_ptr(
+                        Float32,
+                        page_base + Int64(self.page_rows * 128) + row * Int64(4),
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    scale_ptr[0] = scale
+
+
+def compile_hy4_index_post_aot(g: Hy4PerTokenIndexerGeometry = HY4_INDEXER):
+    """Export Hy4 per-token 32-head DSA indexer epilogue (trailing-64 interleaved M-RoPE)."""
+    h, d = g.heads, g.head_dim
+    operands = (
+        Operand("iq", torch.bfloat16, f"[rows,{h},{d}]"),
+        Operand("k_raw", torch.bfloat16, f"[rows,{d}]"),
+        Operand("w_raw", torch.bfloat16, f"[rows,{h}]"),
+        Operand("positions", torch.int64, "[rows,3]", align=8, note="M-RoPE (T,H,W) rotary positions"),
+        Operand("slots", torch.int64, "[rows]", align=8),
+        Operand("inv_freq", torch.float32, "[32]", align=4),
+        Operand("k_weight", torch.bfloat16, f"[{d}]"),
+        Operand("k_bias", torch.bfloat16, f"[{d}]"),
+        Operand("q_fp8", torch.float8_e4m3fn, f"[rows,{h},{d}]", "out"),
+        Operand("head_weights", torch.float32, f"[rows,{h}]", "out", align=4),
+        Operand("cache", torch.uint8, f"[pages,{g.page_bytes}]", "inout"),
+    )
+    return compile_program(
+        Hy4IndexPost(g),
+        name="hy4_index_post",
+        operands=operands,
+        scalars=(Scalar("rows"),),
+        key=(g, "index_post"),
+        geometry={
+            "heads": h,
+            "head_dim": d,
+            "rope_dim": g.rope_dim,
+            "topk": g.topk,
+            "page_rows": g.page_rows,
+            "page_bytes": g.page_bytes,
+            "norm_eps": g.norm_eps,
+            "mrope_section": list(g.mrope_section),
+            "rope_position": "tail_interleaved",
+        },
+        doc=Hy4IndexPost.__doc__,
     )
