@@ -143,7 +143,11 @@ def compile_kda_core_aot(g, *, max_rows=64, decode=True, state_dtype="float32",
     (``_KdaCoreProjected``); the operands, scalars and scratch are unchanged."""
     max_rows = _check_rows(max_rows)
     state_torch = _kda_state(state_dtype, state_rounding)[1]
-    launch = (_KdaCoreProjected if projected else _KdaCore)(g, max_rows, decode, state_dtype, state_rounding)
+    from ._glmf_kda_fast import _GlmfKdaCoreFast, is_glmf_kda_decode
+    if is_glmf_kda_decode(g, max_rows, decode, state_dtype, projected):
+        launch = _GlmfKdaCoreFast(g, max_rows, decode, state_dtype, state_rounding)
+    else:
+        launch = (_KdaCoreProjected if projected else _KdaCore)(g, max_rows, decode, state_dtype, state_rounding)
     h, d, heads = g.hidden, g.kda_width, g.kda_heads
     full = kda_layout(g)["full_rank_gate"]
     operands = (

@@ -159,6 +159,9 @@ def decode_rows(g):
 
 def decode_route_thresholds(g):
     """Actual arithmetic edges below row 64, not a cross-program superset."""
+    from ._glmf_k8 import glmf_k8_route_thresholds, is_glmf_k8_mcg
+    if is_glmf_k8_mcg(g):
+        return glmf_k8_route_thresholds(g)
     bits, k, n, splits = (g[key] for key in ("bits", "input_features", "output_features", "splits"))
     if g.get("groups", 1) == 4:
         edges = [] if bits < 5 else [_GROUPED_DECODE_ROWS, _GROUPED_WIDE2_ROWS, 48]
@@ -990,6 +993,8 @@ class NativeTrellisLinear:
         self.mul1 = g["codebook"] == "mul1"
         self.input_bf16 = g.get("input_dtype", "f16") == "bf16"
         self.decode_rows = decode_rows(g)
+        from ._glmf_k8 import GlmfK8Decode, is_glmf_k8_mcg
+        self.glmf_k8 = GlmfK8Decode(g) if is_glmf_k8_mcg(g) else None
         self.parallel_k128 = _uses_parallel_k128(g)
         self.k6_low_route, self.k6_wide_verify = _k6_selective_routes(g)
         self.compact_head_shard = g.get("compact_head_shard", False)
@@ -1343,6 +1348,17 @@ class NativeTrellisLinear:
                 self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 8)
             else:
                 self._launch_head_tile(inputs, payload, scales, output, rows, rotation_id, cta_limit, stream, 9)
+        elif cutlass.const_expr(self.glmf_k8 is not None):
+            if rows <= Int32(64):
+                if cutlass.const_expr(self.glmf_k8.stock_narrow):
+                    if rows <= Int32(8):
+                        self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                    else:
+                        self.glmf_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+                else:
+                    self.glmf_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
+            else:
+                self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
         elif cutlass.const_expr(self.bits == 8 and not self.e4m3):
             self._decode_k8(inputs, payload, scales, partial, output, rows, rotation_id, cta_limit, stream)
         elif cutlass.const_expr(self.bits == 6):
