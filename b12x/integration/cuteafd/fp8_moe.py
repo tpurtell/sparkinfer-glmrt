@@ -95,8 +95,7 @@ from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, Stre
 from ._nvfp4_moe_dynamic import (ChunkActDyn, ChunkActSmallDyn, ChunkRowsDyn, CombineSmallDyn, DownSmallDyn,
                                  DownSmallDynReg, GateUpSmallDyn, GateUpSmallDynReg, PrepQuantSmallDyn,
                                  StreamNvfp4GateUpDyn, StreamNvfp4LinearDyn, nvfp4_amax_offset)
-from ._inkling2_mini_moe import (MiniMxfp8Down, MiniMxfp8GateUp, MiniNvfp4Down, MiniNvfp4GateUp,
-                                 mini_max_pairs)
+from ._inkling2_mini_moe import mini_max_groups
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
            "prefill_forms", "fp8_moe_segment_scratch_bytes"]
@@ -767,9 +766,9 @@ class _StreamRoute:
         if self.mini_mxfp8:
             if not wire:
                 raise ValueError("MXFP8 W8A8 experts take FP8 K32 wire rows")
-            self.gate_up = MiniMxfp8GateUp(inter=i, hidden=h, experts=e, gate_cap=g.situ_gate_cap,
-                                           up_cap=g.situ_up_cap)
-            self.down = MiniMxfp8Down(hidden=h, inter=i, experts=e)
+            self.gate_up = StreamMxfp8GateUp(inter=i, hidden=h, experts=e, gate_cap=g.situ_gate_cap,
+                                             up_cap=g.situ_up_cap, row_addresses=row_addresses, mini_prefill=True)
+            self.down = StreamMxfp8Down(hidden=h, inter=i, experts=e, mini_prefill=True)
             self.gamma = GroupedGamma(top_k=k)
         elif self.mxfp8:
             if not wire:
@@ -831,10 +830,10 @@ class _StreamRoute:
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
         if cutlass.const_expr(self.mini_mxfp8):
             gamma = ptr(cutlass.Float32, gamma_at)
-            max_pairs = mini_max_pairs(g.experts, pairs)
+            max_groups = mini_max_groups(g.experts, pairs)
             self.gamma(pair_pos, weights, gamma, rows, stream)
-            self.gate_up(rows_x, pair_row, meta, w1, s1, w3, s3, act, max_pairs, stream, grouped_gamma=gamma)
-            self.down(act, meta, w2, s2, y, max_tiles, max_pairs, stream)
+            self.gate_up(rows_x, pair_row, meta, w1, s1, w3, s3, act, max_groups, stream, grouped_gamma=gamma)
+            self.down(act, meta, w2, s2, y, max_tiles, stream, max_groups=max_groups)
         elif cutlass.const_expr(self.mxfp8):
             gamma = ptr(cutlass.Float32, gamma_at)
             self.gamma(pair_pos, weights, gamma, rows, stream)
@@ -985,10 +984,10 @@ class _StreamNvfp4DynRoute:
         caps = dict(gate_cap=g.situ_gate_cap, up_cap=g.situ_up_cap)
         self.mini_prefill = _is_inkling2_mini_prefill(g, max_rows)
         if self.mini_prefill:
-            self.gate_up = MiniNvfp4GateUp(inter=i, hidden=h, experts=e, **caps)
+            self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, mini_prefill=True, **caps)
             self.small_gate = ()
             self.act = ChunkActDyn(inter=i, experts=e, parts=i // 64)
-            self.down = MiniNvfp4Down(hidden=h, inter=i, experts=e)
+            self.down = StreamNvfp4LinearDyn(n=h, k=i, experts=e, mini_prefill=True)
             self.small_down = ()
         else:
             self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, live_min=17, **caps)
@@ -1087,10 +1086,12 @@ class _StreamNvfp4DynRoute:
             self.gamma(pair_pos, weights, gamma, rows, stream)
             self.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
             if cutlass.const_expr(self.mini_prefill):
-                max_pairs = mini_max_pairs(g.experts, pairs)
-                self.gate_up(xq, xs, meta, w1, s1, w3, s3, xamax, gamma, act16, part, max_tiles, max_pairs, stream)
+                dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
+                max_groups = mini_max_groups(g.experts, pairs)
+                self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream,
+                             max_groups=max_groups, **dyn)
                 self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
-                self.down(aq, a_s, meta, w2, s2, y, aamax, max_tiles, max_pairs, stream)
+                self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax, max_groups=max_groups)
             else:
                 dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
                 sms = runtime_num_sm()

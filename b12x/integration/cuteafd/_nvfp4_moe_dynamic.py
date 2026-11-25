@@ -294,23 +294,50 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
     with the per-row factor read from ``row_amax`` and the scale operand's amax tail."""
 
     def __init__(self, *, n: int, k: int, experts: int, tile_m: int = 128, tile_n: int = 128,
-                 live_min: int = 1, live_max: int = 128):
+                 live_min: int = 1, live_max: int = 128, mini_prefill: bool = False):
         super().__init__(n=n, k=k, experts=experts, tile_m=tile_m, tile_n=tile_n, live_min=live_min,
                          live_max=live_max)
+        self.mini_prefill = bool(mini_prefill)
         self.amax_offset = nvfp4_amax_offset(experts, self.n, self.k)
         self.denominator_offset = nvfp4_denominator_offset(experts, self.n, self.k)
 
     def key(self) -> tuple:
-        return ("stream_linear_nvfp4_dyn", 4, *super().key()[2:])
+        base = ("stream_linear_nvfp4_dyn", 4, *super().key()[2:])
+        return base + ("mini_prefill", 2) if self.mini_prefill else base
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
-                 y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream, row_amax: cute.Pointer = None):
+                 y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream, row_amax: cute.Pointer = None,
+                 max_groups: Int32 = None):
         if cutlass.const_expr(row_amax is None):
             raise ValueError("the dynamic NVFP4 linear needs the activation rows' amax")
-        self.kernel_dyn(aq, a_s, meta, w, s, y, row_amax).launch(
-            grid=(_ceil(self.n, self.tile_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
-            min_blocks_per_mp=1)
+        if cutlass.const_expr(self.mini_prefill):
+            from cutlass.cute.nvgpu import cpasync
+            from ._inkling2_mini_moe import (
+                MINI_EXPERTS, MINI_HIDDEN, MINI_INTER, MINI_WS_THREADS,
+                mini_nvfp4_down_layouts, mini_nvfp4_down_storage, mini_u8_weight,
+            )
+            w_layout, a_layout = mini_nvfp4_down_layouts()
+            w_box = cute.slice_(w_layout, (None, None, 0))
+            a_box = cute.slice_(a_layout, (None, None, 0))
+            tma_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mini_u8_weight(w, MINI_EXPERTS * MINI_HIDDEN, MINI_INTER // 2), w_box,
+                (128, 64), num_multicast=1)
+            tma_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mini_u8_weight(aq, max_tiles * Int32(STREAM_TILE_M), MINI_INTER // 2), a_box,
+                (32, 64), num_multicast=1)
+            self.kernel_dyn_mini(
+                a_s, meta, tma_tensor_a, tma_tensor_w, s, y, row_amax,
+                tma_a, tma_w, w_layout, a_layout, mini_nvfp4_down_storage(w_layout, a_layout),
+            ).launch(
+                grid=(MINI_HIDDEN // 128, max_groups, 1),
+                block=(MINI_WS_THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)
+        else:
+            self.kernel_dyn(aq, a_s, meta, w, s, y, row_amax).launch(
+                grid=(_ceil(self.n, self.tile_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
 
     @cute.kernel
     def kernel_dyn(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w: cute.Pointer, s: cute.Pointer,
@@ -378,6 +405,19 @@ class StreamNvfp4LinearDyn(StreamNvfp4LinearA4):
                                         st_global_u32(Int64(y.toint()) + (Int64(first + row) * Int64(self.n) + Int64(col))
                                                       * Int64(2), pack_f32x2_to_bfloat2(acc[f] * factor, acc[f + 1] * factor))
 
+    @cute.kernel
+    def kernel_dyn_mini(self, a_s: cute.Pointer, meta: cute.Pointer, act_t: cute.Tensor,
+                        weight_t: cute.Tensor, s2: cute.Pointer, y: cute.Pointer, row_amax: cute.Pointer,
+                        tma_a: cute.CopyAtom, tma_w: cute.CopyAtom,
+                        w_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout,
+                        Storage: cutlass.Constexpr):
+        from ._inkling2_mini_moe import mini_nvfp4_down_body
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(Storage)
+        mini_nvfp4_down_body(
+            a_s, meta, act_t, weight_t, s2, y, row_amax, tma_a, tma_w,
+            w_layout, a_layout, storage, self.amax_offset, self.denominator_offset)
+
 
 class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
     """Fused W4A4 gate/up + SiTU x gamma + dynamic NVFP4 quantization of the down input.
@@ -393,37 +433,74 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
 
     def __init__(self, *, inter: int, hidden: int, experts: int, gate_cap: float = 4.0, up_cap: float = 25.0,
                  k_block: int | None = None, stages: int = 2, tile_m: int = 128, tile_n: int = 128,
-                 live_min: int = 1, live_max: int = 128):
+                 live_min: int = 1, live_max: int = 128, mini_prefill: bool = False):
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=0.0, k_block=k_block, stages=stages,
                          tile_m=tile_m, tile_n=tile_n, live_min=live_min, live_max=live_max)
+        self.mini_prefill = bool(mini_prefill)
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         self.amax_offset = nvfp4_amax_offset(experts, self.inter, self.k)
         self.denominator_offset = nvfp4_denominator_offset(experts, self.inter, self.k)
         self.parts = _ceil(self.inter, self.half_n)
 
     def key(self) -> tuple:
-        return ("stream_gate_up_nvfp4_dyn", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
+        base = ("stream_gate_up_nvfp4_dyn", 5, self.inter, self.k, self.experts, self.k_block, self.stages,
                 self.gate_cap, self.up_cap, self.tile_m, self.tile_n, self.live_min, self.live_max)
+        return base + ("mini_prefill", 2) if self.mini_prefill else base
 
     @cute.jit
     def __call__(self, aq: cute.Pointer, a_s: cute.Pointer, meta: cute.Pointer, w1: cute.Pointer, s1: cute.Pointer,
                  w3: cute.Pointer, s3: cute.Pointer, s2: cute.Pointer, act: cute.Pointer, act_s: cute.Pointer,
                  max_tiles: Int32, stream: cuda.CUstream, row_amax: cute.Pointer = None,
                  gamma: cute.Pointer = None, act_bf16: cute.Pointer = None, act_amax_part: cute.Pointer = None,
-                 exchange: cute.Pointer = None, exchange_rows: cute.Pointer = None, pair_row: cute.Pointer = None):
+                 exchange: cute.Pointer = None, exchange_rows: cute.Pointer = None, pair_row: cute.Pointer = None,
+                 max_groups: Int32 = None):
         if cutlass.const_expr(row_amax is None or gamma is None or act_bf16 is None or act_amax_part is None):
             raise ValueError("the dynamic NVFP4 gate/up needs row_amax, gamma, act_bf16 and act_amax_part")
-        # Diagnostics: exchange [padded, 2I] BF16 (gate then up columns, post factor, pre SiTU) and
-        # exchange_rows [padded, 4] int32 = (tile, row in chunk, grouped position, source row).
-        dump = exchange is not None
-        if cutlass.const_expr(not dump):
-            exchange = act_bf16
-            exchange_rows = meta
-            pair_row = meta
-        self.fused_dyn(aq, a_s, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16, act_amax_part,
-                       exchange, exchange_rows, pair_row, dump).launch(
-            grid=(_ceil(self.inter, self.half_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
-            min_blocks_per_mp=1)
+        if cutlass.const_expr(self.mini_prefill):
+            from cutlass.cute.nvgpu import cpasync
+            from ._inkling2_mini_moe import (
+                MINI_EXPERTS, MINI_HIDDEN, MINI_INTER, MINI_WS_THREADS,
+                mini_nvfp4_gate_up_layouts, mini_nvfp4_gate_up_storage, mini_u8_weight,
+            )
+            w_layout, a_layout, sfa_layout = mini_nvfp4_gate_up_layouts()
+            rows_w = MINI_EXPERTS * MINI_INTER
+            w_box = cute.slice_(w_layout, (None, None, 0))
+            a_box = cute.slice_(a_layout, (None, None, 0))
+            sfa_box = cute.slice_(sfa_layout, (None, None, 0))
+            tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), mini_u8_weight(w1, rows_w, MINI_HIDDEN // 2), w_box,
+                (64, 128), num_multicast=1)
+            tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), mini_u8_weight(w3, rows_w, MINI_HIDDEN // 2), w_box,
+                (64, 128), num_multicast=1)
+            tma_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mini_u8_weight(aq, max_tiles * Int32(STREAM_TILE_M), MINI_HIDDEN // 2), a_box,
+                (32, 128), num_multicast=1)
+            tma_sfa, tma_tensor_sfa = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mini_u8_weight(a_s, max_tiles * Int32(STREAM_TILE_M), MINI_HIDDEN // 16), sfa_box,
+                (32, 16), num_multicast=1)
+            self.fused_dyn_mini(
+                meta, tma_tensor_a, tma_tensor_sfa, tma_tensor_g, s1, tma_tensor_u, s3,
+                row_amax, gamma, act_bf16, act_amax_part,
+                tma_a, tma_sfa, tma_g, tma_u, w_layout, a_layout, sfa_layout,
+                mini_nvfp4_gate_up_storage(w_layout, a_layout, sfa_layout),
+            ).launch(
+                grid=(MINI_INTER // 64, max_groups, 1),
+                block=(MINI_WS_THREADS, 1, 1), stream=stream, min_blocks_per_mp=1)
+        else:
+            # Diagnostics: exchange [padded, 2I] BF16 (gate then up columns, post factor, pre SiTU) and
+            # exchange_rows [padded, 4] int32 = (tile, row in chunk, grouped position, source row).
+            dump = exchange is not None
+            if cutlass.const_expr(not dump):
+                exchange = act_bf16
+                exchange_rows = meta
+                pair_row = meta
+            self.fused_dyn(aq, a_s, meta, w1, s1, w3, s3, row_amax, gamma, act_bf16, act_amax_part,
+                           exchange, exchange_rows, pair_row, dump).launch(
+                grid=(_ceil(self.inter, self.half_n), max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
 
     @cute.jit
     def _situ(self, gate: Float32, up: Float32, gamma: Float32) -> Float32:
@@ -561,6 +638,23 @@ class StreamNvfp4GateUpDyn(StreamNvfp4GateUpA4):
                         st_global_f32(Int64(act_amax_part.toint())
                                       + (i * Int64(self.inter // 16) + Int64(n0 // Int32(16)) + Int64(grp)) * Int64(4),
                                       local)
+
+    @cute.kernel
+    def fused_dyn_mini(self, meta: cute.Pointer, act_t: cute.Tensor, sfa_t: cute.Tensor,
+                       weight_g: cute.Tensor, s1: cute.Pointer, weight_u: cute.Tensor, s3: cute.Pointer,
+                       row_amax: cute.Pointer, gamma: cute.Pointer, act_bf16: cute.Pointer,
+                       act_amax_part: cute.Pointer, tma_a: cute.CopyAtom, tma_sfa: cute.CopyAtom,
+                       tma_g: cute.CopyAtom, tma_u: cute.CopyAtom,
+                       w_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout, sfa_layout: cute.Layout,
+                       Storage: cutlass.Constexpr):
+        from ._inkling2_mini_moe import mini_nvfp4_gate_up_body
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(Storage)
+        mini_nvfp4_gate_up_body(
+            meta, act_t, sfa_t, weight_g, s1, weight_u, s3,
+            row_amax, gamma, act_bf16, act_amax_part,
+            tma_a, tma_sfa, tma_g, tma_u, w_layout, a_layout, sfa_layout,
+            storage, self.amax_offset, self.denominator_offset, self.gate_cap, self.up_cap)
 
 
 class ChunkActDyn:
