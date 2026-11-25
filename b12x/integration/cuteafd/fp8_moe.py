@@ -95,6 +95,8 @@ from ._nvfp4_moe_a4 import ChunkRowsA4, ChunkSwiGLUA4, StreamNvfp4GateUpA4, Stre
 from ._nvfp4_moe_dynamic import (ChunkActDyn, ChunkActSmallDyn, ChunkRowsDyn, CombineSmallDyn, DownSmallDyn,
                                  DownSmallDynReg, GateUpSmallDyn, GateUpSmallDynReg, PrepQuantSmallDyn,
                                  StreamNvfp4GateUpDyn, StreamNvfp4LinearDyn, nvfp4_amax_offset)
+from ._inkling2_mini_moe import (MiniMxfp8Down, MiniMxfp8GateUp, MiniNvfp4Down, MiniNvfp4GateUp,
+                                 mini_max_pairs)
 
 __all__ = ["Fp8MoeGeometry", "GEOMETRIES", "PREFILL_FORMS", "compile_fp8_moe_aot", "fp8_moe_scratch_bytes",
            "prefill_forms", "fp8_moe_segment_scratch_bytes"]
@@ -728,6 +730,18 @@ class _Route:
             self.combine(xb, pair_pos, weights, out, rows, stream)
 
 
+def _is_inkling2_mini_prefill(g: Fp8MoeGeometry, max_rows: int) -> bool:
+    """Exact geometry gate for Inkling 2 Mini TP1 prefill capacities (max_rows >= 256)."""
+    return (
+        g.hidden == 2304
+        and g.slice == 1152
+        and g.experts == 128
+        and g.top_k == 8
+        and g.activation == "situ"
+        and int(max_rows) >= 256
+    )
+
+
 class _StreamRoute:
     """The ``stream`` route: compact expert groups in 128-row chunks, streaming
     gate/up (FP8 wire rows, SwiGLU fused) and down GEMMs, route combine."""
@@ -739,6 +753,7 @@ class _StreamRoute:
             raise ValueError("segmented streams require FP8/MXFP4/MXFP8 wire input")
         self.mxfp4_down_a8 = bool(mxfp4_down_a8)
         self.mxfp8 = g.weights == "mxfp8"
+        self.mini_mxfp8 = self.mxfp8 and not row_addresses and _is_inkling2_mini_prefill(g, max_rows)
         self.act_bytes = mxfp8_down_row_bytes(g.slice) if (self.mxfp4_down_a8 or self.mxfp8) else 2 * g.slice
         # BF16 input: the rows are first quantized to FP8 K32 wire rows (the
         # coordinator's expert-input rule: UE8M0 per 32, amax floor 1e-4).
@@ -749,7 +764,14 @@ class _StreamRoute:
         self.prep = MoePrep(experts=e, top_k=k, pad=1, max_tiles=self.max_tiles, tile_rows=STREAM_TILE_M,
                             chunked=True)
         self.gamma = None
-        if self.mxfp8:
+        if self.mini_mxfp8:
+            if not wire:
+                raise ValueError("MXFP8 W8A8 experts take FP8 K32 wire rows")
+            self.gate_up = MiniMxfp8GateUp(inter=i, hidden=h, experts=e, gate_cap=g.situ_gate_cap,
+                                           up_cap=g.situ_up_cap)
+            self.down = MiniMxfp8Down(hidden=h, inter=i, experts=e)
+            self.gamma = GroupedGamma(top_k=k)
+        elif self.mxfp8:
             if not wire:
                 raise ValueError("MXFP8 W8A8 experts take FP8 K32 wire rows")
             self.gate_up = StreamMxfp8GateUp(inter=i, hidden=h, experts=e, gate_cap=g.situ_gate_cap,
@@ -807,13 +829,20 @@ class _StreamRoute:
         y = ptr(cutlass.BFloat16, y_at)
         ids_i = cute.make_ptr(cutlass.Int32, Int64(ids.toint()), cute.AddressSpace.gmem, assumed_align=4)
         self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
-        if cutlass.const_expr(self.mxfp8):
+        if cutlass.const_expr(self.mini_mxfp8):
+            gamma = ptr(cutlass.Float32, gamma_at)
+            max_pairs = mini_max_pairs(g.experts, pairs)
+            self.gamma(pair_pos, weights, gamma, rows, stream)
+            self.gate_up(rows_x, pair_row, meta, w1, s1, w3, s3, act, max_pairs, stream, grouped_gamma=gamma)
+            self.down(act, meta, w2, s2, y, max_tiles, max_pairs, stream)
+        elif cutlass.const_expr(self.mxfp8):
             gamma = ptr(cutlass.Float32, gamma_at)
             self.gamma(pair_pos, weights, gamma, rows, stream)
             self.gate_up(rows_x, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream, grouped_gamma=gamma)
+            self.down(act, meta, w2, s2, y, max_tiles, stream)
         else:
             self.gate_up(rows_x, pair_row, meta, w1, s1, w3, s3, act, max_tiles, stream)
-        self.down(act, meta, w2, s2, y, max_tiles, stream)
+            self.down(act, meta, w2, s2, y, max_tiles, stream)
         if cutlass.const_expr(not self.core_only):
             self.combine(y, pair_pos, weights, out, rows, stream)
 
@@ -954,14 +983,22 @@ class _StreamNvfp4DynRoute:
         # (narrowest N whose grid fills the device), chunks of >= 17 the wide 128-row tile. The
         # masks are complementary, so exactly one tile runs per compact expert chunk.
         caps = dict(gate_cap=g.situ_gate_cap, up_cap=g.situ_up_cap)
-        self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, live_min=17, **caps)
-        self.small_gate = tuple(StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, tile_m=16, tile_n=n,
-                                                     live_max=16, stages=SMALL_GATE_STAGES, **caps)
-                                for n in (32, 64, 128))
-        self.act = ChunkActDyn(inter=i, experts=e, parts=i // 64)
-        self.down = StreamNvfp4LinearDyn(n=h, k=i, experts=e, live_min=17)
-        self.small_down = tuple(StreamNvfp4LinearDyn(n=h, k=i, experts=e, tile_m=16, tile_n=n, live_max=16)
-                                for n in (32, 64, 128))
+        self.mini_prefill = _is_inkling2_mini_prefill(g, max_rows)
+        if self.mini_prefill:
+            self.gate_up = MiniNvfp4GateUp(inter=i, hidden=h, experts=e, **caps)
+            self.small_gate = ()
+            self.act = ChunkActDyn(inter=i, experts=e, parts=i // 64)
+            self.down = MiniNvfp4Down(hidden=h, inter=i, experts=e)
+            self.small_down = ()
+        else:
+            self.gate_up = StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, live_min=17, **caps)
+            self.small_gate = tuple(StreamNvfp4GateUpDyn(inter=i, hidden=h, experts=e, tile_m=16, tile_n=n,
+                                                         live_max=16, stages=SMALL_GATE_STAGES, **caps)
+                                    for n in (32, 64, 128))
+            self.act = ChunkActDyn(inter=i, experts=e, parts=i // 64)
+            self.down = StreamNvfp4LinearDyn(n=h, k=i, experts=e, live_min=17)
+            self.small_down = tuple(StreamNvfp4LinearDyn(n=h, k=i, experts=e, tile_m=16, tile_n=n, live_max=16)
+                                    for n in (32, 64, 128))
         self.core_only = False
         self.combine = MoeCombine(hidden=h, top_k=k, unit_weights=True)
         self.fast_small_m = (
@@ -1049,26 +1086,32 @@ class _StreamNvfp4DynRoute:
             self.prep(ids_i, meta, pair_row, pair_pos, rows, pairs, stream)
             self.gamma(pair_pos, weights, gamma, rows, stream)
             self.rows_in(x, pair_row, meta, xq, xs, xamax, pairs, stream)
-            dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
-            sms = runtime_num_sm()
-            target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
-            if Int32(g.top_k * (g.slice // 16)) >= target:
-                self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
-            elif Int32(g.top_k * (g.slice // 32)) >= target:
-                self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+            if cutlass.const_expr(self.mini_prefill):
+                max_pairs = mini_max_pairs(g.experts, pairs)
+                self.gate_up(xq, xs, meta, w1, s1, w3, s3, xamax, gamma, act16, part, max_tiles, max_pairs, stream)
+                self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
+                self.down(aq, a_s, meta, w2, s2, y, aamax, max_tiles, max_pairs, stream)
             else:
-                self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
-            if pairs > Int32(16):
-                self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
-            self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
-            if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
-                self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-            elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
-                self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-            else:
-                self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
-            if pairs > Int32(16):
-                self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+                dyn = dict(row_amax=xamax, gamma=gamma, act_bf16=act16, act_amax_part=part)
+                sms = runtime_num_sm()
+                target = sms * Int32(SMALL_GATE_CTAS_PER_SM)
+                if Int32(g.top_k * (g.slice // 16)) >= target:
+                    self.small_gate[0](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+                elif Int32(g.top_k * (g.slice // 32)) >= target:
+                    self.small_gate[1](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+                else:
+                    self.small_gate[2](xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+                if pairs > Int32(16):
+                    self.gate_up(xq, xs, meta, w1, s1, w3, s3, s2, aq, a_s, max_tiles, stream, **dyn)
+                self.act(act16, part, meta, aq, a_s, aamax, max_tiles, stream)
+                if Int32(g.top_k * (g.hidden // 128)) >= sms * Int32(2):
+                    self.small_down[2](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+                elif Int32(g.top_k * (g.hidden // 64)) >= sms * Int32(2):
+                    self.small_down[1](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+                else:
+                    self.small_down[0](aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
+                if pairs > Int32(16):
+                    self.down(aq, a_s, meta, w2, s2, y, max_tiles, stream, row_amax=aamax)
             if cutlass.const_expr(not self.core_only):
                 self.combine(y, pair_pos, weights, out, rows, stream)
 
