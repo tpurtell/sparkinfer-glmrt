@@ -195,3 +195,85 @@ def compile_inkling2_loop_blend_norm_aot(
                       broadcast_weight=broadcast_weight, eps=eps, max_rows=max_rows),
         doc=__doc__,
     )
+
+
+class _ControllerDownSplitK:
+    """Fixed eight-way K partition, then increasing-part FP32 fold.
+
+    Both row routes run precisely the same K16 MMA segments and split fold.
+    The partial plane is caller-owned and uses live-row stride.
+    """
+    n = 64
+    k = 4608
+    threads = 128
+
+    def __init__(self, *, splits=8, decode_tile=(1, 1, 16, 8, 4, 64), decode_limit=16):
+        from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel
+        self.splits = splits
+        self.decode_limit = decode_limit
+        wm, wn, tm, tn, stages, tk = decode_tile
+        self.decode = Bf16PrefillKernel(self.n, self.k, warp_layout=(wm, wn), tile_m=tm,
+                                        tile_n=tn, tile_k=tk, num_stages=stages,
+                                        compensated=False, split_k=splits)
+        self.prefill = Bf16PrefillKernel(self.n, self.k, compute_warps=4, tile_n=64,
+                                         num_stages=4, compensated=False, split_k=splits)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer,
+                 partial: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
+        wt = cute.make_tensor(w, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
+        pt = cute.make_tensor(partial, cute.make_layout((rows * self.splits, self.n), stride=(self.n, 1)))
+        if rows <= Int32(self.decode_limit):
+            self.decode(xt, wt, pt, rows, stream)
+        else:
+            self.prefill(xt, wt, pt, rows, stream)
+        self.fold(partial, out, rows).launch(
+            grid=((rows * self.n + self.threads - 1) // self.threads, 1, 1),
+            block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def fold(self, partial: cute.Pointer, out: cute.Pointer, rows: Int32):
+        i = Int64(cute.arch.block_idx()[0]) * self.threads + Int64(cute.arch.thread_idx()[0])
+        stride = Int64(rows) * self.n
+        if i < stride:
+            acc = Float32(partial[i])
+            for part in cutlass.range_constexpr(1, self.splits):
+                acc = acc + Float32(partial[i + Int64(part) * stride])
+            out[i] = BFloat16(acc)
+
+
+def compile_inkling2_mini_controller_down_aot(*, max_rows: int = 4096):
+    """Target-only down projection. BF16 rank, fixed K partition at every width."""
+    if not 1 <= max_rows <= 4096:
+        raise ValueError("Mini controller row capacity must be in 1..4096")
+    launch = _ControllerDownSplitK()
+    return compile_program(
+        launch, name="inkling2_mini_controller_down", operands=(
+            Operand("x", torch.bfloat16, "[rows,4608]"),
+            Operand("w", torch.bfloat16, "[64,4608]"),
+            Operand("out", torch.bfloat16, "[rows,64]", "out"),
+            Operand("partial", torch.float32, "[8,rows,64]", "out"),
+        ), scalars=(Scalar("rows"),), key=(max_rows, 8, 16),
+        geometry=dict(width=4608, outputs=64, output_dtype="torch.bfloat16",
+                      reduction="split8_ordered_k16_fold", splits=8),
+        scratch={"partial": lambda rows: 8 * rows * 64 * 4},
+    )
+
+
+def compile_inkling2_mini_controller_up_aot(*, max_rows: int = 4096):
+    """Target-only forget/gain projection, preserving the original K16 order."""
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    if not 1 <= max_rows <= 4096:
+        raise ValueError("Mini controller row capacity must be in 1..4096")
+    tiles = ((16, 1, 4, 16, 64, 6),)
+    launch = TmaBf16Projection(4608, 64, out_dtype=Float32, tiles_by_rows=tiles)
+    return compile_program(
+        launch, name="inkling2_mini_controller_up", operands=(
+            Operand("x", torch.bfloat16, "[rows,64]"),
+            Operand("w", torch.bfloat16, "[4608,64]"),
+            Operand("out", torch.float32, "[rows,4608]", "out"),
+        ), scalars=(Scalar("rows"),), key=(max_rows, launch.key()),
+        geometry=dict(width=64, outputs=4608, output_dtype="torch.float32",
+                      reduction="ordered_k16", tiles_by_rows=tiles),
+    )
