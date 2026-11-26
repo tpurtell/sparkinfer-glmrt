@@ -69,10 +69,33 @@ def test_router_scores_rows_match_single_row_decode(experts, activated):
     expected = torch.cat([run(skinny, x[r:r + 1]) for r in range(max_rows)])
     single = torch.cat([run(compiled, x[r:r + 1]) for r in range(max_rows)])
     assert torch.equal(single.view(torch.int32), expected.view(torch.int32))
+    bias = torch.randn(experts, device="cuda", dtype=torch.float32) * 0.05
+    topk = 6 if experts == 384 else 3
+
+    def route_of(scores):
+        act = scores if activated else torch.sqrt(torch.where(scores > 20.0, scores, torch.log1p(torch.exp(scores))))
+        ids = torch.topk(act + bias, k=topk, dim=-1).indices
+        picked = act.gather(-1, ids)
+        weights = picked / (picked.sum(dim=-1, keepdim=True) + 1e-20)
+        return ids, weights
+
+    single_ids, single_weights = route_of(single)
     widths = list(range(1, 66)) + [80, 96, 127, 128, 129, 160, 192, 255, 256]
     for rows in widths:
         actual = run(compiled, x[:rows])
         assert torch.equal(actual.view(torch.int32), single[:rows].view(torch.int32)), rows
+        ids, weights = route_of(actual)
+        assert torch.equal(ids, single_ids[:rows]), ("route_ids", rows)
+        assert torch.equal(weights.view(torch.int32), single_weights[:rows].view(torch.int32)), ("route_weights", rows)
+    # Explicitly verify the skinny -> MMA boundary at 256 -> 257: rows=257 uses
+    # the unactivated TMA MMA kernel and matches FP32 matmul within tolerance.
+    x_mma = torch.randn(max_rows + 1, hidden, device="cuda").bfloat16()
+    x_mma[:max_rows].copy_(x)
+    out_mma = run(compiled, x_mma)
+    ref_mma = x_mma.float() @ w.float().T
+    assert torch.allclose(out_mma, ref_mma, rtol=1e-4, atol=1e-4), (
+        "mma_boundary_257", (out_mma - ref_mma).abs().max().item()
+    )
     # Also verify CUDA graph capture + 3x replay across the old 64->65 boundary and 128/256.
     for rows in (64, 65, 128, 256):
         gx = x[:rows].contiguous()
