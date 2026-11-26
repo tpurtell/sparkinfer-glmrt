@@ -13,10 +13,10 @@ Execution pipeline inside one unified AOT program:
    per-CTA H128 recomputation.
 2. K8 decode multiply (zero ``input_block_scales`` loads):
    - Narrow/medium shapes (``(N/64)*splits <= 256`` at ``R <= 16``, and
-     ``(N/64)*splits <= 72`` across all ``R = 1..129``): tiled N16-per-CTA K8
+     ``(N/64)*splits <= 96`` across all ``R = 1..129``): tiled N16-per-CTA K8
      decode with 4-way K128 parallelism (128 threads/CTA), keeping all SMs
-     saturated even on narrow ``kv_a``/``rel`` projections with zero
-     ``R=8->12`` route transitions.
+     saturated even on narrow ``kv_a``/``rel``/``shared_down_tp2`` projections
+     with zero ``R=8->12`` or ``R=16->24`` route cliffs.
    - Wide shapes: high-occupancy SMEM-staged N64/N128 K8 decode
      (M16/M32/[M48 for >=768 tiles]/M64), with split-ni N128 on vocabulary
      heads (``N > 65536``) to halve CTA count at M48/M64.
@@ -102,6 +102,7 @@ class FusedK8TrellisDecode:
         self.splits = int(g["splits"])
         self.output_dtype = str(g["output_dtype"])
         self.raw_f32 = self.output_dtype == "raw_f32"
+        self.direct_raw_f32 = self.raw_f32 and self.splits == 1
         self.out_bf16 = self.output_dtype == "bf16"
         self.n_tiles_64 = self.n // 64
         self.n_tiles_128 = self.n // 128
@@ -109,10 +110,11 @@ class FusedK8TrellisDecode:
         # Narrow/medium shapes ((N/64)*splits <= 256): tiled N16-per-CTA with
         # b_sub=4 (128 threads/CTA) saturates all SMs at R <= 16 with zero R=8->12 cliff.
         self.use_n16_low = (self.n_tiles_64 * self.splits) <= 256
-        # Very narrow shapes ((N/64)*splits <= 72, e.g. glmf_kv_a, hy4_kv_a_padded,
-        # mla_kv_a_padded, step5_kv_tp2, inkling_rel_tp2) keep tiled N16-per-CTA
-        # across all R=1..129 to prevent SM underfill and eliminate R=16->24 cliffs.
-        self.use_n16_all = (self.n_tiles_64 * self.splits) <= 72
+        # Very narrow shapes ((N/64)*splits <= 96, e.g. glmf_kv_a, hy4_kv_a_padded,
+        # mla_kv_a_padded, step5_kv_tp2, inkling_rel_tp2, hy4_shared_down_tp2) keep
+        # tiled N16-per-CTA across all R=1..129 to saturate all SMs and eliminate
+        # R=16->24 cliffs.
+        self.use_n16_all = (self.n_tiles_64 * self.splits) <= 96
         self.n16_b_sub = 4
 
         # N128-per-CTA (4 warps x N32) halves SMEM-A traffic for wide shapes at M16/M32
@@ -193,6 +195,7 @@ class FusedK8TrellisDecode:
         self,
         payload: cute.Tensor,
         scratch: cute.Tensor,
+        dst: cute.Tensor,
         rows: Int32,
         b_sub: cutlass.Constexpr,
     ):
@@ -333,7 +336,7 @@ class FusedK8TrellisDecode:
                     (row0.to(Int64) * Int64(self.splits) + split.to(Int64)) * Int64(self.n)
                     + col_base.to(Int64)
                 ) * Int64(4)
-                p_addr = scratch.iterator.toint() + p_off
+                p_addr = dst.iterator.toint() + p_off
                 if row0 < rows:
                     for n in cutlass.range_constexpr(2):
                         st_global_v2_f32(p_addr + Int64(n * 32), total[n, 0], total[n, 1])
@@ -350,6 +353,7 @@ class FusedK8TrellisDecode:
         self,
         payload: cute.Tensor,
         scratch: cute.Tensor,
+        dst: cute.Tensor,
         rows: Int32,
         active: cutlass.Constexpr,
         n16_per_warp: cutlass.Constexpr,
@@ -568,7 +572,7 @@ class FusedK8TrellisDecode:
                     cute.arch.sync_threads()
 
             col_base = n16_base * Int32(16) + (lane & Int32(3)) * Int32(2)
-            p_base = scratch.iterator.toint()
+            p_base = dst.iterator.toint()
             for mb in cutlass.range_constexpr(active):
                 row0 = row_group_base + lane_r + Int32(mb * 16)
                 row1 = row0 + Int32(8)
@@ -664,6 +668,7 @@ class FusedK8TrellisDecode:
         self,
         payload: cute.Tensor,
         scratch: cute.Tensor,
+        dst: cute.Tensor,
         rows: Int32,
         cta_limit: Int32,
         stream: cuda.CUstream,
@@ -675,7 +680,7 @@ class FusedK8TrellisDecode:
         M = 16 * active
         tiles = base_tiles if cutlass.const_expr(active < 4) else ((rows + Int32(M - 1)) // Int32(M)) * base_tiles
         self.multiply_rot_smem(
-            payload, scratch, rows, active, n16_per_warp
+            payload, scratch, dst, rows, active, n16_per_warp
         ).launch(
             grid=(min(tiles, cta_limit), 1, 1),
             block=(128, 1, 1),
@@ -715,10 +720,11 @@ class FusedK8TrellisDecode:
     ):
         if rows > Int32(0) and rows <= Int32(self.max_rows) and cta_limit > Int32(0):
             self._launch_ingress(x, suh, scratch, rows, cta_limit, stream)
+            dst = output if cutlass.const_expr(self.direct_raw_f32) else scratch
             n16_mid = 2 if self.use_smem128_mid else 1
             if cutlass.const_expr(self.use_n16_all):
                 tiles = ((rows + Int32(15)) // Int32(16)) * Int32((self.n // 16) * self.splits)
-                self.multiply_rot_n16_m16(payload, scratch, rows, self.n16_b_sub).launch(
+                self.multiply_rot_n16_m16(payload, scratch, dst, rows, self.n16_b_sub).launch(
                     grid=(min(tiles, cta_limit), 1, 1),
                     block=(32 * self.n16_b_sub, 1, 1),
                     min_blocks_per_mp=2,
@@ -727,23 +733,24 @@ class FusedK8TrellisDecode:
             elif rows <= Int32(16):
                 if cutlass.const_expr(self.use_n16_low):
                     tiles = Int32((self.n // 16) * self.splits)
-                    self.multiply_rot_n16_m16(payload, scratch, rows, self.n16_b_sub).launch(
+                    self.multiply_rot_n16_m16(payload, scratch, dst, rows, self.n16_b_sub).launch(
                         grid=(min(tiles, cta_limit), 1, 1),
                         block=(32 * self.n16_b_sub, 1, 1),
                         min_blocks_per_mp=2,
                         stream=stream,
                     )
                 else:
-                    self._launch_rot_smem(payload, scratch, rows, cta_limit, stream, 1, n16_mid)
+                    self._launch_rot_smem(payload, scratch, dst, rows, cta_limit, stream, 1, n16_mid)
             elif rows <= Int32(32):
-                self._launch_rot_smem(payload, scratch, rows, cta_limit, stream, 2, n16_mid)
+                self._launch_rot_smem(payload, scratch, dst, rows, cta_limit, stream, 2, n16_mid)
             elif rows <= Int32(48):
                 n16_hi = 2 if self.is_vocab_head else 1
                 if cutlass.const_expr(self.use_m48):
-                    self._launch_rot_smem(payload, scratch, rows, cta_limit, stream, 3, n16_hi)
+                    self._launch_rot_smem(payload, scratch, dst, rows, cta_limit, stream, 3, n16_hi)
                 else:
-                    self._launch_rot_smem(payload, scratch, rows, cta_limit, stream, 4, 1)
+                    self._launch_rot_smem(payload, scratch, dst, rows, cta_limit, stream, 4, 1)
             else:
                 n16_hi = 2 if self.is_vocab_head else 1
-                self._launch_rot_smem(payload, scratch, rows, cta_limit, stream, 4, n16_hi)
-            self._launch_reduce(scratch, svh, output, rows, cta_limit, stream)
+                self._launch_rot_smem(payload, scratch, dst, rows, cta_limit, stream, 4, n16_hi)
+            if cutlass.const_expr(not self.direct_raw_f32):
+                self._launch_reduce(scratch, svh, output, rows, cta_limit, stream)
