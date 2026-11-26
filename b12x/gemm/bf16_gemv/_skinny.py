@@ -286,8 +286,9 @@ def narrow_skinny_tiles(n: int, k: int, max_rows: int = 64) -> tuple:
     threads = candidates[0]
     if max_rows <= 16:
         return ((max_rows, 1, 8, threads),)
-    wide_cols = next(c for c in (4, 2, 1)
-                     if n % c == 0 and 16 * c <= threads and (n // c >= 16 or c == 1))
+    wide_cols = next(c for c in (8, 4, 2, 1)
+                     if n % c == 0 and 16 * c <= threads
+                     and ((c == 8 and n // c >= 32) or (c in (4, 2) and n // c >= 16) or c == 1))
     return ((16, 1, 8, threads), (max_rows, wide_cols, 16, threads))
 
 

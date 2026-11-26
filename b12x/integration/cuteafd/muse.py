@@ -8,10 +8,14 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 import torch
 from cutlass import BFloat16, Float32, Float64, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32
+from b12x._lib.intrinsics import cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_nc_v2_u32
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _fp8_scale, _warp_sum, _warp_max
 from ._qwen4_kernels import _sigmoid
@@ -146,8 +150,131 @@ class _RouterTiled:
                         out[at] = acc[r * self.experts + e]
 
 
+@dsl_user_op
+def _ld_stream_f32x4(address: Int64, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [Int64(address).ir_value(loc=loc, ip=ip)],
+        "ld.global.nc.L1::no_allocate.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,l",
+        has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return tuple(Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip)) for i in range(4))
+
+
+class _RouterSmemTiled:
+    """Four-warp SMEM-staged F32 router; 100% bit-identical to :class:`_RouterScalar`.
+
+    All 4 warps (128 threads) cooperatively load ``BK = 512`` (16 chunks of 32)
+    ``rows_per_cta`` BF16 activation slices into shared memory once per K tile,
+    then stream ``experts_per_cta`` F32 weight tiles through a 2 KiB SMEM staging
+    buffer using 128-bit non-allocating loads. Each warp accumulates its owned
+    rows across the 16 chunks in exact ascending ``col = 32*chunk + lane`` order
+    with ``_add(acc, _mul(x, w))`` and ``_warp_sum``.
+    """
+
+    warps = 4
+    threads = 128
+    bk = 512
+    tiles = 8192 // 512
+
+    def __init__(self, rows_per_cta: int, experts_per_cta: int = 1):
+        self.rows_per_cta = int(rows_per_cta)
+        self.experts_per_cta = int(experts_per_cta)
+        if self.rows_per_cta != 1 and self.rows_per_cta % self.warps != 0:
+            raise ValueError("rows_per_cta must be 1 or a multiple of 4")
+        if self.experts_per_cta <= 0 or 256 % self.experts_per_cta != 0:
+            raise ValueError("experts_per_cta must divide 256")
+        self.rows_per_warp = 1 if self.rows_per_cta == 1 else self.rows_per_cta // self.warps
+
+    def _storage(self):
+        rows_cta = self.rows_per_cta
+        bk = self.bk
+
+        class Storage:
+            pass
+
+        Storage.__annotations__ = {
+            "w": cute.struct.Align[cute.struct.MemRange[Float32, bk], 16],
+            "x": cute.struct.Align[cute.struct.MemRange[Float32, rows_cta * bk], 16],
+        }
+        return cute.struct(Storage)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        grid_m = (rows + Int32(self.rows_per_cta - 1)) // Int32(self.rows_per_cta)
+        self.kernel(x, weight, out, rows).launch(
+            grid=(grid_m, 256 // self.experts_per_cta, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer, rows: Int32):
+        tid = Int32(cute.arch.thread_idx()[0])
+        warp = tid // Int32(32)
+        lane = tid % Int32(32)
+        row_base = Int64(cute.arch.block_idx()[0]) * Int64(self.rows_per_cta)
+        expert_base = Int64(cute.arch.block_idx()[1]) * Int64(self.experts_per_cta)
+        live, last = Int64(rows), Int64(rows) - Int64(1)
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        s_w = storage.w.get_tensor(cute.make_layout((self.bk,), stride=(1,)))
+        s_x = storage.x.get_tensor(cute.make_layout((self.rows_per_cta, self.bk), stride=(self.bk, 1)))
+        n_acc = self.experts_per_cta * self.rows_per_warp
+        acc = cute.make_rmem_tensor(cute.make_layout((n_acc,), stride=(1,)), Float32)
+        for i in cutlass.range_constexpr(n_acc):
+            acc[i] = Float32(0.0)
+        w_base_addr = Int64(weight.toint()) + expert_base * Int64(8192 * 4) + Int64(tid) * Int64(16)
+        x_addr = Int64(x.toint()) + Int64(tid) * Int64(8)
+        dst = tid * Int32(4)
+        for tile in cutlass.range(self.tiles, unroll=1):
+            x_tile_addr = x_addr + Int64(tile * self.bk * 2)
+            for r in cutlass.range_constexpr(self.rows_per_cta):
+                src_row = cutlass.min(row_base + Int64(r), last)
+                u0, u1 = ld_global_nc_v2_u32(x_tile_addr + src_row * Int64(8192 * 2))
+                s_x[r, dst] = _bf16_lo(u0)
+                s_x[r, dst + Int32(1)] = _bf16_hi(u0)
+                s_x[r, dst + Int32(2)] = _bf16_lo(u1)
+                s_x[r, dst + Int32(3)] = _bf16_hi(u1)
+            w_tile_off = Int64(tile * self.bk * 4)
+            for e in cutlass.range_constexpr(self.experts_per_cta):
+                w0, w1, w2, w3 = _ld_stream_f32x4(w_base_addr + Int64(e * 8192 * 4) + w_tile_off)
+                s_w[dst] = w0
+                s_w[dst + Int32(1)] = w1
+                s_w[dst + Int32(2)] = w2
+                s_w[dst + Int32(3)] = w3
+                cute.arch.sync_threads()
+                if cutlass.const_expr(self.rows_per_cta == 1):
+                    if warp == Int32(0):
+                        for c in cutlass.range_constexpr(16):
+                            idx = Int32(c * 32) + lane
+                            acc[e] = _add(acc[e], _mul(s_x[0, idx], s_w[idx]))
+                else:
+                    for c in cutlass.range_constexpr(16):
+                        idx = Int32(c * 32) + lane
+                        wv = s_w[idx]
+                        for j in cutlass.range_constexpr(self.rows_per_warp):
+                            r_idx = warp * Int32(self.rows_per_warp) + Int32(j)
+                            at = e * self.rows_per_warp + j
+                            acc[at] = _add(acc[at], _mul(s_x[r_idx, idx], wv))
+                cute.arch.sync_threads()
+        out_t = _view(out)
+        if cutlass.const_expr(self.rows_per_cta == 1):
+            if warp == Int32(0):
+                for e in cutlass.range_constexpr(self.experts_per_cta):
+                    total = _warp_sum(acc[e])
+                    if lane == Int32(0) and row_base < live:
+                        out_t[row_base * Int64(256) + expert_base + Int64(e)] = total
+        else:
+            for e in cutlass.range_constexpr(self.experts_per_cta):
+                for j in cutlass.range_constexpr(self.rows_per_warp):
+                    total = _warp_sum(acc[e * self.rows_per_warp + j])
+                    out_row = row_base + Int64(warp * Int32(self.rows_per_warp) + Int32(j))
+                    if lane == Int32(0) and out_row < live:
+                        out_t[out_row * Int64(256) + expert_base + Int64(e)] = total
+
+
 class RouterProjection:
-    """Bit-exact F32 router with row-band tiled warps for decode, verify and prefill.
+    """Bit-exact F32 router with SMEM-staged warps for decode/verify and tiled prefill.
 
     Every band executes the exact same per-lane ascending ``col = 32*k + lane``
     ``mul.rn.f32`` / ``add.rn.f32`` and ``_warp_sum`` sequence as
@@ -168,13 +295,13 @@ class RouterProjection:
             == (ROUTER_TILE_ROWS, ROUTER_TILE_EXPERTS, ROUTER_BLOCK_WARPS, ROUTER_BLOCK_ROW_GROUPS)
         )
         self.scalar = _RouterScalar()
-        self.tiled = _RouterTiled(rows_per_warp, experts_per_warp, block_warps, row_groups,
-                                  unroll_k=2 if self.multiband else 1)
+        self.tiled = _RouterTiled(rows_per_warp, experts_per_warp, block_warps, row_groups, unroll_k=1)
         if self.multiband:
-            self.m1 = _RouterTiled(1, 1, 1, 1, unroll_k=8)
-            self.m8 = _RouterTiled(4, 1, 1, 1, unroll_k=4)
-            self.m16 = _RouterTiled(8, 1, 1, 1, unroll_k=4)
-            self.m64 = _RouterTiled(8, 2, 4, 2, unroll_k=4)
+            self.m1 = _RouterSmemTiled(1, 1)
+            self.m4 = _RouterSmemTiled(4, 1)
+            self.m8 = _RouterSmemTiled(8, 1)
+            self.m16 = _RouterSmemTiled(8, 4)
+            self.m64 = _RouterSmemTiled(16, 4)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
@@ -182,6 +309,8 @@ class RouterProjection:
         if cutlass.const_expr(self.multiband):
             if rows <= Int32(1):
                 self.m1(x, weight, out, rows, stream)
+            elif rows <= Int32(4):
+                self.m4(x, weight, out, rows, stream)
             elif rows <= Int32(8):
                 self.m8(x, weight, out, rows, stream)
             elif rows <= Int32(16):
@@ -211,7 +340,7 @@ def compile_router_aot(*, scalar_max_rows: int = ROUTER_SCALAR_MAX_ROWS,
     key = (8192, 256, int(scalar_max_rows), int(rows_per_warp), int(experts_per_warp),
            int(block_warps), int(row_groups))
     if launch.multiband:
-        key += ("multiband_v1",)
+        key += ("smem_multiband_v4",)
     return compile_program(
         launch,
         name="muse_router", operands=(
