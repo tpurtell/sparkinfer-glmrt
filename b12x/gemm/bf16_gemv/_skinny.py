@@ -30,6 +30,9 @@ __all__ = [
     "SKINNY_TILES_BY_ROWS",
     "SkinnyBf16Gemv",
     "TmaBf16Projection",
+    "decode_tma_tiles",
+    "default_decode_tma_tiles",
+    "narrow_skinny_tiles",
     "prefill_config",
     "skinny_config",
     "skinny_max_rows",
@@ -257,6 +260,35 @@ ROUTER_TILES_BY_ROWS = {
     (256, 4096): ((16, 4, 2, 256), (64, 8, 4, 256)),
     (384, 7168): ((16, 4, 2, 224), (64, 4, 4, 224)),
 }
+
+
+def narrow_skinny_tiles(n: int, k: int, max_rows: int = 64) -> tuple:
+    """Single-thread-count ``RowTiledSkinnyBf16Gemv`` tiles for narrow projections.
+
+    Every band shares one CTA thread count, so each thread sums the same K
+    vectors in the same order and every row's output is bit-identical across
+    ``1..=max_rows``. Wide CTA thread counts (up to 512 for very narrow N) keep
+    SM120 saturated when N is small (e.g. 16-64); for ``17..=max_rows`` the
+    tile grows to 16 rows and up to 4 columns to cut weight reloads in half.
+    """
+    n, k, max_rows = int(n), int(k), int(max_rows)
+    if k % 8 != 0 or n <= 0 or max_rows <= 0:
+        raise ValueError("narrow_skinny_tiles requires positive N, max_rows and K % 8 == 0")
+    vectors = k // 8
+    target = 512 if n <= 64 else 256
+    candidates = tuple(t for t in (512, 384, 288, 256, 224, 192, 160, 128, 96, 64, 32)
+                       if t <= target and vectors % t == 0)
+    if not candidates:
+        candidates = tuple(t for t in (512, 384, 288, 256, 224, 192, 160, 128, 96, 64, 32)
+                           if vectors % t == 0)
+    if not candidates:
+        raise ValueError(f"K/8={vectors} has no valid warp-multiple CTA thread count")
+    threads = candidates[0]
+    if max_rows <= 16:
+        return ((max_rows, 1, 8, threads),)
+    wide_cols = next(c for c in (4, 2, 1)
+                     if n % c == 0 and 16 * c <= threads and (n // c >= 16 or c == 1))
+    return ((16, 1, 8, threads), (max_rows, wide_cols, 16, threads))
 
 
 def router_skinny(n: int, k: int, *, kernel_type=SkinnyBf16Gemv):
@@ -487,6 +519,34 @@ COMPENSATED_TILES_BY_ROWS = {
 }
 
 
+def default_decode_tma_tiles(n: int, k: int) -> tuple:
+    """Measured SM120 TMA decode/verify row tiles for any uncatalogued shape.
+
+    Every entry retiles the same uncompensated m16n8k16 MMA K-reduction as
+    ``prefill_config`` and produces bitwise-identical outputs across all live
+    row counts. Wide outputs (N > 8192) already saturate SM120 under
+    ``prefill_config`` (64x128x3) and stay on it.
+    """
+    n, k = int(n), int(k)
+    if k % 64 != 0 or n <= 0 or n > 8192:
+        return ()
+    if n <= 16:
+        return ((16, 1, 2, 16, 16, 8), (64, 2, 2, 32, 16, 8))
+    if n <= 1024:
+        return ((16, 1, 2, 16, 16, 8), (64, 2, 2, 32, 32, 8))
+    if n <= 4096:
+        return ((16, 1, 4, 16, 32, 10), (32, 2, 2, 32, 32, 10), (64, 2, 2, 64, 64, 6))
+    return ((16, 1, 4, 16, 64, 9), (32, 2, 2, 32, 64, 8), (64, 2, 2, 64, 64, 6))
+
+
+def decode_tma_tiles(n: int, k: int) -> tuple:
+    """Measured per-shape ``DECODE_TMA_TILES`` entry, or ``default_decode_tma_tiles``."""
+    key = (int(n), int(k))
+    if key in DECODE_TMA_TILES:
+        return DECODE_TMA_TILES[key]
+    return default_decode_tma_tiles(key[0], key[1])
+
+
 def prefill_config(n: int, k: int) -> dict:
     """Measured SM120 choices for the TMA tensor-core route (uncompensated)."""
     if n >= 1024:
@@ -504,7 +564,7 @@ class TmaBf16Projection:
         self.n, self.k = int(n), int(k)
         self.out_dtype = out_dtype
         if tiles_by_rows is None:
-            tiles_by_rows = DECODE_TMA_TILES.get((self.n, self.k), ()) if not config else ()
+            tiles_by_rows = decode_tma_tiles(self.n, self.k) if not config else ()
         if tiles_by_rows:
             self.row_tiled = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype, **config)
             self.tiles_by_rows = self.row_tiled.tiles_by_rows
@@ -646,7 +706,7 @@ class RoutedBf16Projection:
             self.skinny = SkinnyBf16Gemv(self.n, self.k, out_dtype=out_dtype, **skinny_config(n, k, out_dtype))
             self.skinny_tiles_by_rows = ()
         if not tiles_by_rows and self.max_skinny_rows == 0:
-            tiles_by_rows = DECODE_TMA_TILES.get((self.n, self.k), ())
+            tiles_by_rows = decode_tma_tiles(self.n, self.k)
         if tiles_by_rows:
             self.large = RowTiledBf16Projection(self.n, self.k, tiles_by_rows, out_dtype=out_dtype)
             if self.large.limits[0] <= self.max_skinny_rows:
