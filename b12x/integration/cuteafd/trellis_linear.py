@@ -138,3 +138,130 @@ def compile_trellis_linear_aot(*, input_features, output_features, bits=4,
                            geometry={**g, "exact_row_cap": pointers.core.exact_row_cap,
                                      "decode_route_thresholds": routes},
                            scratch={"partial": lambda rows: groups*rows*s*n*4}, doc=__doc__)
+
+
+FUSED_SCALARS = ("rows", "cta_limit")
+
+
+def fused_geometry(input_features, output_features, *, bits=8, codebook="mul1",
+                   sharded_side=1, max_rows=64, input_dtype="bf16", output_dtype="bf16"):
+    from b12x.gemm.trellis_linear._fused_k8 import FUSED_DECODE_MAX_ROWS, fused_scratch_bytes
+
+    values = (input_features, output_features, max_rows)
+    if any(type(v) is not int or not 0 < v <= 2**31 - 1 for v in values):
+        raise ValueError("fused trellis geometry must contain positive int32 dimensions")
+    if max_rows > FUSED_DECODE_MAX_ROWS:
+        raise ValueError(f"fused trellis decode supports max_rows <= {FUSED_DECODE_MAX_ROWS}")
+    if input_features % 128 or output_features % 128:
+        raise ValueError("fused trellis input/output dimensions must be multiples of 128")
+    if bits != 8 or codebook not in ("mcg", "mul1") or sharded_side not in (1, 2):
+        raise ValueError("fused trellis decode requires K8, mcg/mul1, and sharded_side 1/2")
+    if input_dtype != "bf16" or output_dtype not in ("bf16", "f32", "raw_f32"):
+        raise ValueError("fused trellis decode requires input_dtype='bf16' and output_dtype in ('bf16', 'f32', 'raw_f32')")
+    splits = (input_features + 1023) // 1024
+    scratch = fused_scratch_bytes(max_rows, input_features, output_features)
+    if scratch > 2**63 - 1:
+        raise ValueError("fused trellis scratch exceeds signed int64 addressing")
+    return dict(
+        abi_version=ABI_VERSION,
+        fused_transform=True,
+        input_features=input_features,
+        output_features=output_features,
+        bits=bits,
+        codebook=codebook,
+        sharded_side=sharded_side,
+        max_rows=max_rows,
+        split_k_blocks=8,
+        splits=splits,
+        input_dtype=input_dtype,
+        output_dtype=output_dtype,
+        ctas_per_sm=CTAS_PER_SM,
+    )
+
+
+class _FusedPointers:
+    def __init__(self, g):
+        from b12x.gemm.trellis_linear._fused_k8 import FusedK8TrellisDecode
+        self.core = FusedK8TrellisDecode(g)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, payload: cute.Pointer,
+                 suh: cute.Pointer, svh: cute.Pointer,
+                 scratch: cute.Pointer, output: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32,
+                 stream: cuda.CUstream):
+        layout = cute.make_layout(1, stride=1)
+        self.core(
+            cute.make_tensor(x, layout),
+            cute.make_tensor(payload, layout),
+            cute.make_tensor(suh, layout),
+            cute.make_tensor(svh, layout),
+            cute.make_tensor(scratch, layout),
+            cute.make_tensor(output, layout),
+            rows, cta_limit, stream,
+        )
+
+
+class _FusedRawPointers:
+    def __init__(self, g):
+        from b12x.gemm.trellis_linear._fused_k8 import FusedK8TrellisDecode
+        self.core = FusedK8TrellisDecode(g)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, payload: cute.Pointer,
+                 suh: cute.Pointer, scratch: cute.Pointer, output: cute.Pointer,
+                 rows: cutlass.Int32, cta_limit: cutlass.Int32,
+                 stream: cuda.CUstream):
+        layout = cute.make_layout(1, stride=1)
+        self.core(
+            cute.make_tensor(x, layout),
+            cute.make_tensor(payload, layout),
+            cute.make_tensor(suh, layout),
+            cute.make_tensor(suh, layout),  # constexpr-unused when output_dtype == "raw_f32"
+            cute.make_tensor(scratch, layout),
+            cute.make_tensor(output, layout),
+            rows, cta_limit, stream,
+        )
+
+
+def compile_trellis_linear_fused_aot(*, input_features, output_features, bits=8,
+                                     codebook="mul1", sharded_side=1, max_rows=64,
+                                     input_dtype="bf16", output_dtype="bf16"):
+    """Compile fused H128-ingress + K8 decode + fused split-K/H128-egress program."""
+    from b12x.gemm.trellis_linear._fused_k8 import fused_scratch_bytes
+
+    g = fused_geometry(
+        input_features, output_features, bits=bits, codebook=codebook,
+        sharded_side=sharded_side, max_rows=max_rows,
+        input_dtype=input_dtype, output_dtype=output_dtype,
+    )
+    k, n = g["input_features"], g["output_features"]
+    scratch_bytes_cap = fused_scratch_bytes(max_rows, k, n)
+    if output_dtype == "raw_f32":
+        operands = (
+            Operand("x", torch.bfloat16, f"[rows,{k}]"),
+            Operand("payload", torch.uint8, f"[{k*n*bits//8}]"),
+            Operand("suh", torch.float16, f"[{k}]"),
+            Operand("scratch", torch.uint8, f"[{scratch_bytes_cap}]", "scratch"),
+            Operand("output", torch.float32, f"[rows,{n}]", "out"),
+        )
+        pointers = _FusedRawPointers(g)
+    else:
+        out_dt = torch.bfloat16 if output_dtype == "bf16" else torch.float32
+        operands = (
+            Operand("x", torch.bfloat16, f"[rows,{k}]"),
+            Operand("payload", torch.uint8, f"[{k*n*bits//8}]"),
+            Operand("suh", torch.float16, f"[{k}]"),
+            Operand("svh", torch.float16, f"[{n}]"),
+            Operand("scratch", torch.uint8, f"[{scratch_bytes_cap}]", "scratch"),
+            Operand("output", out_dt, f"[rows,{n}]", "out"),
+        )
+        pointers = _FusedPointers(g)
+    return compile_program(
+        pointers, name="trellis_linear_fused", operands=operands,
+        scalars=tuple(Scalar(name) for name in FUSED_SCALARS),
+        key=tuple(g.values()), version=1,
+        geometry={**g, "exact_row_cap": pointers.core.exact_row_cap,
+                  "decode_route_thresholds": []},
+        scratch={"scratch": lambda rows: fused_scratch_bytes(rows, k, n)}, doc=__doc__,
+    )
