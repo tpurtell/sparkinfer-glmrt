@@ -581,7 +581,8 @@ class _MiniAttnPrep:
                 and history_slot_stride >= Int64(TAPS - 1) * history_lag_stride
                 and (not self.replay or replay_row_stride >= Int64(KV_WIDTH))):
             qr_ctas = (rows * Int32(HEADS) + Int32(3)) // Int32(4)
-            total_ctas = Int32(16) + qr_ctas * Int32(2)
+            kv_ctas = Int32(16) * rows
+            total_ctas = kv_ctas + qr_ctas * Int32(2)
             self.kernel(
                 q, q_scale, r, r_scale, positions, q_out, rel_input_out,
                 k_bf16, k_weight, k_dynamic, k_history,
@@ -612,37 +613,35 @@ class _MiniAttnPrep:
         sums = storage.sums.get_tensor(cute.make_layout((1, 4)))
         if cutlass.const_expr(self.fp8):
             kv_s = storage.kv.get_tensor(cute.make_layout((HEAD_DIM,)))
+        k_ctas = Int32(8) * rows
+        kv_ctas = Int32(16) * rows
 
-        if bid < Int32(8):
-            # K branch: head = bid, single warp (32 lanes, 4 dims/lane) matches stock _Clip(K) order.
-            if tid32 < Int32(32):
-                head = Int64(bid)
+        if bid < k_ctas:
+            # K branch: one CTA per (segment_start_row, head); non-start CTAs exit immediately.
+            seg_start = bid // Int32(8)
+            if Int32(first[Int64(seg_start)]) == seg_start and tid32 < Int32(32):
+                head = Int64(bid % Int32(8))
                 lane = tid
                 sw = cute.make_rmem_tensor((4, TAPS), Float32)
                 h0 = cute.make_rmem_tensor((4,), Float32)
                 h1 = cute.make_rmem_tensor((4,), Float32)
                 h2 = cute.make_rmem_tensor((4,), Float32)
                 vals = cute.make_rmem_tensor((4,), Float32)
+                cslot = Int64(conv_slots[Int64(seg_start)])
                 for j in cutlass.range_constexpr(4):
                     col = head * Int64(HEAD_DIM) + lane + Int64(j * 32)
-                    h0[j], h1[j], h2[j] = Float32(0), Float32(0), Float32(0)
+                    hbase = cslot * history_slot_stride + col
+                    h0[j] = Float32(k_history[hbase])
+                    h1[j] = Float32(k_history[hbase + history_lag_stride])
+                    h2[j] = Float32(k_history[hbase + Int64(2) * history_lag_stride])
                     for lag in cutlass.range_constexpr(TAPS):
                         if cutlass.const_expr(self.dynamic):
                             sw[j, lag] = Float32(k_weight[Int64(lag * KV_WIDTH) + col])
                         else:
                             sw[j, lag] = Float32(k_weight[col * Int64(TAPS) + Int64(TAPS - 1 - lag)])
-                row_i = Int32(0)
-                while row_i < rows:
+                row_i = seg_start
+                while row_i < rows and Int32(first[Int64(row_i)]) == seg_start:
                     row = Int64(row_i)
-                    begin = Int64(first[row])
-                    cslot = Int64(conv_slots[row])
-                    if row == begin:
-                        for j in cutlass.range_constexpr(4):
-                            col = head * Int64(HEAD_DIM) + lane + Int64(j * 32)
-                            hbase = cslot * history_slot_stride + col
-                            h0[j] = Float32(k_history[hbase])
-                            h1[j] = Float32(k_history[hbase + history_lag_stride])
-                            h2[j] = Float32(k_history[hbase + Int64(2) * history_lag_stride])
                     dyn0 = Float32(0)
                     dyn1 = Float32(0)
                     dyn2 = Float32(0)
@@ -669,7 +668,6 @@ class _MiniAttnPrep:
                         acc = acc + _mul_rn(h1[j], t2)
                         acc = acc + _mul_rn(h2[j], t3)
                         y = (acc + cur) * Float32(self.conv_factor)
-                        # Exact narrow_kernel -> BF16 -> Clip(K) input (no widen_zero between narrow & Clip).
                         kv_val = _bf16(y)
                         h2[j] = h1[j]
                         h1[j] = h0[j]
@@ -711,113 +709,101 @@ class _MiniAttnPrep:
                                     cute.AddressSpace.gmem, assumed_align=4)
                                 sc[head] = pscale
                         cute.arch.sync_warp()
-                    is_last = row_i + Int32(1) == rows
-                    if row_i + Int32(1) < rows:
-                        is_last = Int64(first[row + Int64(1)]) != begin
-                    if is_last:
-                        for j in cutlass.range_constexpr(4):
-                            col = head * Int64(HEAD_DIM) + lane + Int64(j * 32)
-                            hbase = cslot * history_slot_stride + col
-                            k_history[hbase] = h0[j]
-                            k_history[hbase + history_lag_stride] = h1[j]
-                            k_history[hbase + Int64(2) * history_lag_stride] = h2[j]
                     row_i = row_i + Int32(1)
-
-        elif bid < Int32(16):
-            # V branch: head = bid - 8, all 128 threads (1 dim/thread) matches stock _Norm(V) order.
-            head = Int64(bid - Int32(8))
-            col = head * Int64(HEAD_DIM) + tid
-            if cutlass.const_expr(self.dynamic):
-                w0 = Float32(v_weight[col])
-                w1 = Float32(v_weight[Int64(KV_WIDTH) + col])
-                w2 = Float32(v_weight[Int64(2 * KV_WIDTH) + col])
-                w3 = Float32(v_weight[Int64(3 * KV_WIDTH) + col])
-            else:
-                w0 = Float32(v_weight[col * Int64(TAPS) + Int64(3)])
-                w1 = Float32(v_weight[col * Int64(TAPS) + Int64(2)])
-                w2 = Float32(v_weight[col * Int64(TAPS) + Int64(1)])
-                w3 = Float32(v_weight[col * Int64(TAPS)])
-            h0 = Float32(0)
-            h1 = Float32(0)
-            h2 = Float32(0)
-            row_i = Int32(0)
-            while row_i < rows:
-                row = Int64(row_i)
-                begin = Int64(first[row])
-                cslot = Int64(conv_slots[row])
-                if row == begin:
+                for j in cutlass.range_constexpr(4):
+                    col = head * Int64(HEAD_DIM) + lane + Int64(j * 32)
                     hbase = cslot * history_slot_stride + col
-                    h0 = Float32(v_history[hbase])
-                    h1 = Float32(v_history[hbase + history_lag_stride])
-                    h2 = Float32(v_history[hbase + Int64(2) * history_lag_stride])
-                cur = _add_rn(Float32(0.0), Float32(v_bf16[row * Int64(KV_WIDTH) + col]))
-                if cutlass.const_expr(self.replay):
-                    v_replay[row * replay_row_stride + col] = cur
+                    k_history[hbase] = h0[j]
+                    k_history[hbase + history_lag_stride] = h1[j]
+                    k_history[hbase + Int64(2) * history_lag_stride] = h2[j]
+
+        elif bid < kv_ctas:
+            # V branch: one CTA per (segment_start_row, head), all 128 threads match _Norm(V).
+            vbid = bid - k_ctas
+            seg_start = vbid // Int32(8)
+            if Int32(first[Int64(seg_start)]) == seg_start:
+                head = Int64(vbid % Int32(8))
+                col = head * Int64(HEAD_DIM) + tid
+                cslot = Int64(conv_slots[Int64(seg_start)])
+                hbase = cslot * history_slot_stride + col
+                h0 = Float32(v_history[hbase])
+                h1 = Float32(v_history[hbase + history_lag_stride])
+                h2 = Float32(v_history[hbase + Int64(2) * history_lag_stride])
                 if cutlass.const_expr(self.dynamic):
-                    dbase = (row * Int64(KV_HEADS) + head) * Int64(TAPS)
-                    t0 = w0 + Float32(v_dynamic[dbase])
-                    t1 = w1 + Float32(v_dynamic[dbase + Int64(1)])
-                    t2 = w2 + Float32(v_dynamic[dbase + Int64(2)])
-                    t3 = w3 + Float32(v_dynamic[dbase + Int64(3)])
+                    w0 = Float32(v_weight[col])
+                    w1 = Float32(v_weight[Int64(KV_WIDTH) + col])
+                    w2 = Float32(v_weight[Int64(2 * KV_WIDTH) + col])
+                    w3 = Float32(v_weight[Int64(3 * KV_WIDTH) + col])
                 else:
-                    t0, t1, t2, t3 = w0, w1, w2, w3
-                acc = Float32(0)
-                acc = acc + _mul_rn(cur, t0)
-                acc = acc + _mul_rn(h0, t1)
-                acc = acc + _mul_rn(h1, t2)
-                acc = acc + _mul_rn(h2, t3)
-                y = (acc + cur) * Float32(self.conv_factor)
-                # Exact narrow_kernel -> BF16 -> widen_zero -> F32 Norm(V) input.
-                v_val = _add_rn(Float32(0.0), _bf16(y))
-                h2 = h1
-                h1 = h0
-                h0 = cur
-                total = _block_sum(v_val * v_val, sums, Int32(0), 4)
-                inv = _rsqrt(div_rn_f32(total, Float32(HEAD_DIM)) + Float32(self.eps))
-                vn = BFloat16(v_val * inv)
-                vslot = Int64(cache_slots[row])
-                if cutlass.const_expr(not self.fp8):
-                    if vslot >= Int64(0):
-                        cache[vslot * Int64(2 * KV_WIDTH) + Int64(KV_WIDTH) + col] = vn
-                else:
-                    kv_s[tid] = vn
-                    cute.arch.sync_threads()
-                    if tid32 < Int32(32):
-                        pvals = cute.make_rmem_tensor((4,), Float32)
-                        pmax = Float32(0.0)
-                        for j in cutlass.range_constexpr(4):
-                            pv = Float32(kv_s[tid * Int64(4) + Int64(j)])
-                            pvals[j] = pv
-                            pmax = cutlass.max(pmax, cute.math.abs(pv))
-                        pscale = _fp8_scale(_warp_max(pmax))
-                        pinv = div_rn_f32(Float32(1.0), pscale)
-                        packed = cvt_f32x4_to_e4m3x4(
-                            pvals[0] * pinv, pvals[1] * pinv, pvals[2] * pinv, pvals[3] * pinv)
+                    w0 = Float32(v_weight[col * Int64(TAPS) + Int64(3)])
+                    w1 = Float32(v_weight[col * Int64(TAPS) + Int64(2)])
+                    w2 = Float32(v_weight[col * Int64(TAPS) + Int64(1)])
+                    w3 = Float32(v_weight[col * Int64(TAPS)])
+                row_i = seg_start
+                while row_i < rows and Int32(first[Int64(row_i)]) == seg_start:
+                    row = Int64(row_i)
+                    cur = _add_rn(Float32(0.0), Float32(v_bf16[row * Int64(KV_WIDTH) + col]))
+                    if cutlass.const_expr(self.replay):
+                        v_replay[row * replay_row_stride + col] = cur
+                    if cutlass.const_expr(self.dynamic):
+                        dbase = (row * Int64(KV_HEADS) + head) * Int64(TAPS)
+                        t0 = w0 + Float32(v_dynamic[dbase])
+                        t1 = w1 + Float32(v_dynamic[dbase + Int64(1)])
+                        t2 = w2 + Float32(v_dynamic[dbase + Int64(2)])
+                        t3 = w3 + Float32(v_dynamic[dbase + Int64(3)])
+                    else:
+                        t0, t1, t2, t3 = w0, w1, w2, w3
+                    acc = Float32(0)
+                    acc = acc + _mul_rn(cur, t0)
+                    acc = acc + _mul_rn(h0, t1)
+                    acc = acc + _mul_rn(h1, t2)
+                    acc = acc + _mul_rn(h2, t3)
+                    y = (acc + cur) * Float32(self.conv_factor)
+                    v_val = _add_rn(Float32(0.0), _bf16(y))
+                    h2 = h1
+                    h1 = h0
+                    h0 = cur
+                    total = _block_sum(v_val * v_val, sums, Int32(0), 4)
+                    inv = _rsqrt(div_rn_f32(total, Float32(HEAD_DIM)) + Float32(self.eps))
+                    vn = BFloat16(v_val * inv)
+                    vslot = Int64(cache_slots[row])
+                    if cutlass.const_expr(not self.fp8):
                         if vslot >= Int64(0):
-                            caddr = Int64(cache.toint()) + vslot * Int64(self.record_bytes)
-                            dst = cute.make_ptr(
-                                Uint32, caddr + Int64(KV_WIDTH) + head * Int64(HEAD_DIM) + tid * Int64(4),
-                                cute.AddressSpace.gmem, assumed_align=4)
-                            dst[0] = packed
-                            if tid32 == Int32(0):
-                                sc = cute.make_ptr(
-                                    Float32, caddr + Int64(self.scale_offset),
+                            cache[vslot * Int64(2 * KV_WIDTH) + Int64(KV_WIDTH) + col] = vn
+                    else:
+                        kv_s[tid] = vn
+                        cute.arch.sync_threads()
+                        if tid32 < Int32(32):
+                            pvals = cute.make_rmem_tensor((4,), Float32)
+                            pmax = Float32(0.0)
+                            for j in cutlass.range_constexpr(4):
+                                pv = Float32(kv_s[tid * Int64(4) + Int64(j)])
+                                pvals[j] = pv
+                                pmax = cutlass.max(pmax, cute.math.abs(pv))
+                            pscale = _fp8_scale(_warp_max(pmax))
+                            pinv = div_rn_f32(Float32(1.0), pscale)
+                            packed = cvt_f32x4_to_e4m3x4(
+                                pvals[0] * pinv, pvals[1] * pinv, pvals[2] * pinv, pvals[3] * pinv)
+                            if vslot >= Int64(0):
+                                caddr = Int64(cache.toint()) + vslot * Int64(self.record_bytes)
+                                dst = cute.make_ptr(
+                                    Uint32, caddr + Int64(KV_WIDTH) + head * Int64(HEAD_DIM) + tid * Int64(4),
                                     cute.AddressSpace.gmem, assumed_align=4)
-                                sc[Int64(KV_HEADS) + head] = pscale
-                    cute.arch.sync_threads()
-                is_last = row_i + Int32(1) == rows
-                if row_i + Int32(1) < rows:
-                    is_last = Int64(first[row + Int64(1)]) != begin
-                if is_last:
-                    hbase = cslot * history_slot_stride + col
-                    v_history[hbase] = h0
-                    v_history[hbase + history_lag_stride] = h1
-                    v_history[hbase + Int64(2) * history_lag_stride] = h2
-                row_i = row_i + Int32(1)
+                                dst[0] = packed
+                                if tid32 == Int32(0):
+                                    sc = cute.make_ptr(
+                                        Float32, caddr + Int64(self.scale_offset),
+                                        cute.AddressSpace.gmem, assumed_align=4)
+                                    sc[Int64(KV_HEADS) + head] = pscale
+                        cute.arch.sync_threads()
+                    row_i = row_i + Int32(1)
+                v_history[hbase] = h0
+                v_history[hbase + history_lag_stride] = h1
+                v_history[hbase + Int64(2) * history_lag_stride] = h2
 
-        elif bid < Int32(16) + qr_ctas:
+        elif bid < kv_ctas + qr_ctas:
             # Q clip: 4 warps/CTA, 1 warp per (row, head), exact stock _Clip(Q).
-            q_bid = Int64(bid - Int32(16))
+            q_bid = Int64(bid - kv_ctas)
             head_row = q_bid * Int64(4) + tid // Int64(32)
             lane = tid % Int64(32)
             if head_row < Int64(rows) * Int64(HEADS):
@@ -842,7 +828,7 @@ class _MiniAttnPrep:
 
         else:
             # R clip + zero-pad to K=64 into rel_input_out directly (eliminates r_clipped + copy_rows).
-            r_bid = Int64(bid - Int32(16) - qr_ctas)
+            r_bid = Int64(bid - kv_ctas - qr_ctas)
             head_row = r_bid * Int64(4) + tid // Int64(32)
             lane = tid % Int64(32)
             if head_row < Int64(rows) * Int64(HEADS):
@@ -893,7 +879,7 @@ class _MiniPostAttnConv:
                 x_bf16, weight, history, first, slots, partial, arena, out_base, replay,
                 rows, arena_rows, mlp_cand_idx, history_slot_stride, history_lag_stride,
                 replay_row_stride,
-            ).launch(grid=(HIDDEN // self.threads, 1, 1), block=(self.threads, 1, 1), stream=stream)
+            ).launch(grid=(HIDDEN // self.threads, rows, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(
@@ -905,57 +891,51 @@ class _MiniPostAttnConv:
         rows: Int32, arena_rows: Int32, mlp_cand_idx: Int32,
         history_slot_stride: Int64, history_lag_stride: Int64, replay_row_stride: Int64,
     ):
-        col = Int64(cute.arch.block_idx()[0]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
-        w0 = Float32(weight[col * Int64(TAPS) + Int64(3)])
-        w1 = Float32(weight[col * Int64(TAPS) + Int64(2)])
-        w2 = Float32(weight[col * Int64(TAPS) + Int64(1)])
-        w3 = Float32(weight[col * Int64(TAPS)])
-        arena_stride = Int64(arena_rows) * Int64(HIDDEN)
-        mlp_slot_off = Int64(mlp_cand_idx) * arena_stride
-        attn_slot_off = Int64(mlp_cand_idx - Int32(1)) * arena_stride
-        h0, h1, h2 = Float32(0), Float32(0), Float32(0)
-        row_i = Int32(0)
-        while row_i < rows:
-            row = Int64(row_i)
-            begin = Int64(first[row])
-            cslot = Int64(slots[row])
-            if row == begin:
-                hbase = cslot * history_slot_stride + col
-                h0 = Float32(history[hbase])
-                h1 = Float32(history[hbase + history_lag_stride])
-                h2 = Float32(history[hbase + Int64(2) * history_lag_stride])
-            idx = row * Int64(HIDDEN) + col
-            cur = _add_rn(Float32(0.0), Float32(x_bf16[idx]))
-            if cutlass.const_expr(self.replay):
-                replay[row * replay_row_stride + col] = cur
-            acc = Float32(0)
-            acc = acc + _mul_rn(cur, w0)
-            acc = acc + _mul_rn(h0, w1)
-            acc = acc + _mul_rn(h1, w2)
-            acc = acc + _mul_rn(h2, w3)
-            y = (acc + cur) * Float32(self.factor)
-            attn = _add_rn(Float32(0.0), _bf16(y))
-            h2 = h1
-            h1 = h0
-            h0 = cur
-            p_val = Float32(partial[idx])
-            if cutlass.const_expr(self.starts_block):
-                out_base[idx] = attn
-                arena[attn_slot_off + idx] = p_val
-                arena[mlp_slot_off + idx] = attn
-            else:
-                br = p_val + attn
-                out_base[idx] = br
-                arena[mlp_slot_off + idx] = br
-            is_last = row_i + Int32(1) == rows
-            if row_i + Int32(1) < rows:
-                is_last = Int64(first[row + Int64(1)]) != begin
-            if is_last:
-                hbase = cslot * history_slot_stride + col
-                history[hbase] = h0
-                history[hbase + history_lag_stride] = h1
-                history[hbase + Int64(2) * history_lag_stride] = h2
-            row_i = row_i + Int32(1)
+        seg_start = Int32(cute.arch.block_idx()[1])
+        if Int32(first[Int64(seg_start)]) == seg_start:
+            col = Int64(cute.arch.block_idx()[0]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
+            w0 = Float32(weight[col * Int64(TAPS) + Int64(3)])
+            w1 = Float32(weight[col * Int64(TAPS) + Int64(2)])
+            w2 = Float32(weight[col * Int64(TAPS) + Int64(1)])
+            w3 = Float32(weight[col * Int64(TAPS)])
+            arena_stride = Int64(arena_rows) * Int64(HIDDEN)
+            mlp_slot_off = Int64(mlp_cand_idx) * arena_stride
+            attn_slot_off = Int64(mlp_cand_idx - Int32(1)) * arena_stride
+            cslot = Int64(slots[Int64(seg_start)])
+            hbase = cslot * history_slot_stride + col
+            h0 = Float32(history[hbase])
+            h1 = Float32(history[hbase + history_lag_stride])
+            h2 = Float32(history[hbase + Int64(2) * history_lag_stride])
+            row_i = seg_start
+            while row_i < rows and Int32(first[Int64(row_i)]) == seg_start:
+                row = Int64(row_i)
+                idx = row * Int64(HIDDEN) + col
+                cur = _add_rn(Float32(0.0), Float32(x_bf16[idx]))
+                if cutlass.const_expr(self.replay):
+                    replay[row * replay_row_stride + col] = cur
+                acc = Float32(0)
+                acc = acc + _mul_rn(cur, w0)
+                acc = acc + _mul_rn(h0, w1)
+                acc = acc + _mul_rn(h1, w2)
+                acc = acc + _mul_rn(h2, w3)
+                y = (acc + cur) * Float32(self.factor)
+                attn = _add_rn(Float32(0.0), _bf16(y))
+                h2 = h1
+                h1 = h0
+                h0 = cur
+                p_val = Float32(partial[idx])
+                if cutlass.const_expr(self.starts_block):
+                    out_base[idx] = attn
+                    arena[attn_slot_off + idx] = p_val
+                    arena[mlp_slot_off + idx] = attn
+                else:
+                    br = p_val + attn
+                    out_base[idx] = br
+                    arena[mlp_slot_off + idx] = br
+                row_i = row_i + Int32(1)
+            history[hbase] = h0
+            history[hbase + history_lag_stride] = h1
+            history[hbase + Int64(2) * history_lag_stride] = h2
 
 
 class _MiniPostMlpConvResidual:
@@ -985,7 +965,7 @@ class _MiniPostMlpConvResidual:
                 x_bf16, weight, history, first, slots, base, partial, arena, replay,
                 rows, arena_rows, mlp_cand_idx, history_slot_stride, history_lag_stride,
                 replay_row_stride,
-            ).launch(grid=(HIDDEN // self.threads, 1, 1), block=(self.threads, 1, 1), stream=stream)
+            ).launch(grid=(HIDDEN // self.threads, rows, 1), block=(self.threads, 1, 1), stream=stream)
 
     @cute.kernel
     def kernel(
@@ -997,50 +977,44 @@ class _MiniPostMlpConvResidual:
         rows: Int32, arena_rows: Int32, mlp_cand_idx: Int32,
         history_slot_stride: Int64, history_lag_stride: Int64, replay_row_stride: Int64,
     ):
-        col = Int64(cute.arch.block_idx()[0]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
-        w0 = Float32(weight[col * Int64(TAPS) + Int64(3)])
-        w1 = Float32(weight[col * Int64(TAPS) + Int64(2)])
-        w2 = Float32(weight[col * Int64(TAPS) + Int64(1)])
-        w3 = Float32(weight[col * Int64(TAPS)])
-        arena_stride = Int64(arena_rows) * Int64(HIDDEN)
-        mlp_slot_off = Int64(mlp_cand_idx) * arena_stride
-        h0, h1, h2 = Float32(0), Float32(0), Float32(0)
-        row_i = Int32(0)
-        while row_i < rows:
-            row = Int64(row_i)
-            begin = Int64(first[row])
-            cslot = Int64(slots[row])
-            if row == begin:
-                hbase = cslot * history_slot_stride + col
-                h0 = Float32(history[hbase])
-                h1 = Float32(history[hbase + history_lag_stride])
-                h2 = Float32(history[hbase + Int64(2) * history_lag_stride])
-            idx = row * Int64(HIDDEN) + col
-            cur = _add_rn(Float32(0.0), Float32(x_bf16[idx]))
-            if cutlass.const_expr(self.replay):
-                replay[row * replay_row_stride + col] = cur
-            acc = Float32(0)
-            acc = acc + _mul_rn(cur, w0)
-            acc = acc + _mul_rn(h0, w1)
-            acc = acc + _mul_rn(h1, w2)
-            acc = acc + _mul_rn(h2, w3)
-            y = (acc + cur) * Float32(self.factor)
-            mlp_val = _add_rn(Float32(0.0), _bf16(y))
-            h2 = h1
-            h1 = h0
-            h0 = cur
-            out_val = _add_rn(Float32(0.0), _bf16(Float32(base[idx]) + mlp_val))
-            partial[idx] = out_val
-            arena[mlp_slot_off + idx] = out_val
-            is_last = row_i + Int32(1) == rows
-            if row_i + Int32(1) < rows:
-                is_last = Int64(first[row + Int64(1)]) != begin
-            if is_last:
-                hbase = cslot * history_slot_stride + col
-                history[hbase] = h0
-                history[hbase + history_lag_stride] = h1
-                history[hbase + Int64(2) * history_lag_stride] = h2
-            row_i = row_i + Int32(1)
+        seg_start = Int32(cute.arch.block_idx()[1])
+        if Int32(first[Int64(seg_start)]) == seg_start:
+            col = Int64(cute.arch.block_idx()[0]) * Int64(self.threads) + Int64(cute.arch.thread_idx()[0])
+            w0 = Float32(weight[col * Int64(TAPS) + Int64(3)])
+            w1 = Float32(weight[col * Int64(TAPS) + Int64(2)])
+            w2 = Float32(weight[col * Int64(TAPS) + Int64(1)])
+            w3 = Float32(weight[col * Int64(TAPS)])
+            arena_stride = Int64(arena_rows) * Int64(HIDDEN)
+            mlp_slot_off = Int64(mlp_cand_idx) * arena_stride
+            cslot = Int64(slots[Int64(seg_start)])
+            hbase = cslot * history_slot_stride + col
+            h0 = Float32(history[hbase])
+            h1 = Float32(history[hbase + history_lag_stride])
+            h2 = Float32(history[hbase + Int64(2) * history_lag_stride])
+            row_i = seg_start
+            while row_i < rows and Int32(first[Int64(row_i)]) == seg_start:
+                row = Int64(row_i)
+                idx = row * Int64(HIDDEN) + col
+                cur = _add_rn(Float32(0.0), Float32(x_bf16[idx]))
+                if cutlass.const_expr(self.replay):
+                    replay[row * replay_row_stride + col] = cur
+                acc = Float32(0)
+                acc = acc + _mul_rn(cur, w0)
+                acc = acc + _mul_rn(h0, w1)
+                acc = acc + _mul_rn(h1, w2)
+                acc = acc + _mul_rn(h2, w3)
+                y = (acc + cur) * Float32(self.factor)
+                mlp_val = _add_rn(Float32(0.0), _bf16(y))
+                h2 = h1
+                h1 = h0
+                h0 = cur
+                out_val = _add_rn(Float32(0.0), _bf16(Float32(base[idx]) + mlp_val))
+                partial[idx] = out_val
+                arena[mlp_slot_off + idx] = out_val
+                row_i = row_i + Int32(1)
+            history[hbase] = h0
+            history[hbase + history_lag_stride] = h1
+            history[hbase + Int64(2) * history_lag_stride] = h2
 
 
 class _MiniFastRouter:

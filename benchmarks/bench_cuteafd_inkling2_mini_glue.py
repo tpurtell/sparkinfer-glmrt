@@ -210,16 +210,43 @@ def _check_prefix_and_exact(progs, rows_sweep: list[int], compare_exact: bool, c
                 _bit_eq(g, ref, f"conv_prefix op={idx} r={r}")
 
 
+def _make_packed_segments(rows: int, seg_len: int):
+    first, cslots = [], []
+    cur = 0
+    s_idx = 0
+    while cur < rows:
+        ln = min(seg_len, rows - cur)
+        first.extend([cur] * ln)
+        cslots.extend([s_idx] * ln)
+        cur += ln
+        s_idx += 1
+    return (
+        torch.tensor(first, dtype=torch.int32, device="cuda"),
+        torch.tensor(cslots, dtype=torch.int64, device="cuda"),
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rows", default="1,2,3,4,8,16,32,64")
+    ap.add_argument("--rows", default="1:1,2:2,3:3,4:4,8:8,16:1,16:4,32:4,48:3,64:4,64:8")
     ap.add_argument("--wide-rows", default="2048,2752,4096")
     ap.add_argument("--reps", type=int, default=80)
     ap.add_argument("--compare-routes-exact", action="store_true")
     ap.add_argument("--check-prefix-rows", action="store_true")
     ap.add_argument("--check-only", action="store_true")
     args = ap.parse_args()
-    row_list = [int(x) for x in args.rows.split(",") if x.strip()]
+    shape_list = []
+    for item in args.rows.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            r_s, sl_s = item.split(":", 1)
+            shape_list.append((int(r_s), int(sl_s)))
+        else:
+            r = int(item)
+            shape_list.append((r, min(r, 8)))
+    row_list = sorted(set(r for r, _ in shape_list))
     wide_list = [int(x) for x in args.wide_rows.split(",") if x.strip()]
 
     progs = dict(
@@ -260,7 +287,7 @@ def main():
     if args.check_only:
         return
 
-    for rows in row_list:
+    for rows, seg_len in shape_list:
         cap = 64
         arena = torch.randn((5, cap, HIDDEN), device="cuda")
         prev = torch.randn((2, cap, HIDDEN), device="cuda")
@@ -300,14 +327,13 @@ def main():
         vw = torch.randn((KV_WIDTH, TAPS), dtype=torch.bfloat16, device="cuda")
         lag_stride = 6656
         slot_stride = 3 * lag_stride
-        hist_k = torch.zeros((8, 3, lag_stride), device="cuda")
-        hist_v = torch.zeros((8, 3, lag_stride), device="cuda")
-        hist_h = torch.zeros((8, 3, lag_stride), device="cuda")
+        hist_k = torch.zeros((64, 3, lag_stride), device="cuda")
+        hist_v = torch.zeros((64, 3, lag_stride), device="cuda")
+        hist_h = torch.zeros((64, 3, lag_stride), device="cuda")
         rep_k = torch.empty((64, lag_stride), device="cuda")
         rep_v = torch.empty((64, lag_stride), device="cuda")
         rep_h = torch.empty((64, lag_stride), device="cuda")
-        first = torch.zeros((rows,), dtype=torch.int32, device="cuda")
-        cslots = torch.zeros((rows,), dtype=torch.int64, device="cuda")
+        first, cslots = _make_packed_segments(rows, seg_len)
         kslots = torch.arange(rows, dtype=torch.int64, device="cuda")
         kv_cache = torch.empty((64, 2 * KV_WIDTH), dtype=torch.bfloat16, device="cuda")
 
@@ -401,18 +427,24 @@ def main():
         t_rt_s = _time_graph_us(lambda: progs["s_router"].launch(r_logits, r_bias, r_ids, r_w, scalars=(rows,)), reps=args.reps)
         t_rt_f = _time_graph_us(lambda: progs["f_router"].launch(r_logits, r_bias, r_ids, r_w, scalars=(rows,)), reps=args.reps)
 
+        c12_s = (t_norm_s + 43 * t_rn1_s + 4 * t_rn3_s + 24 * t_rp1_s + 24 * t_cp3_s
+                 + 24 * t_bl1_s + 24 * t_bl3_s + 48 * t_ap_s) / 1000.0
+        c12_f = (t_norm_f + 43 * t_rn1_f + 4 * t_rn3_f + 24 * t_rp1_f + 24 * t_cp3_f
+                 + 24 * t_bl1_f + 24 * t_bl3_f + 48 * t_ap_f) / 1000.0
+        # Production dispatches stock Router for rows <= 64 and FastRouter for rows > 64.
+        t_rt_eff = t_rt_f if rows > 64 else t_rt_s
         tot_s = (t_norm_s + 43 * t_rn1_s + 4 * t_rn3_s + 24 * t_rp1_s + 24 * t_cp3_s
                  + 24 * t_bl1_s + 24 * t_bl3_s + 48 * t_ap_s + 48 * t_pa_s + 48 * t_pm_s + 48 * t_rt_s) / 1000.0
         tot_f = (t_norm_f + 43 * t_rn1_f + 4 * t_rn3_f + 24 * t_rp1_f + 24 * t_cp3_f
-                 + 24 * t_bl1_f + 24 * t_bl3_f + 48 * t_ap_f + 48 * t_pa_f + 48 * t_pm_f + 48 * t_rt_f) / 1000.0
+                 + 24 * t_bl1_f + 24 * t_bl3_f + 48 * t_ap_f + 48 * t_pa_f + 48 * t_pm_f + 48 * t_rt_eff) / 1000.0
 
         print(
-            f"M={rows:2d} | norm {t_norm_s:5.2f}->{t_norm_f:4.2f} | rn1 {t_rn1_s:5.2f}->{t_rn1_f:4.2f} "
+            f"M={rows:2d} (seg={seg_len}) | norm {t_norm_s:5.2f}->{t_norm_f:4.2f} | rn1 {t_rn1_s:5.2f}->{t_rn1_f:4.2f} "
             f"| rn3 {t_rn3_s:5.2f}->{t_rn3_f:4.2f} | rp1 {t_rp1_s:5.2f}->{t_rp1_f:4.2f} "
             f"| cp3 {t_cp3_s:5.2f}->{t_cp3_f:4.2f} | bl1 {t_bl1_s:5.2f}->{t_bl1_f:4.2f} "
             f"| bl3 {t_bl3_s:5.2f}->{t_bl3_f:4.2f} | ap {t_ap_s:5.2f}->{t_ap_f:4.2f} "
             f"| pa {t_pa_s:5.2f}->{t_pa_f:4.2f} | pm {t_pm_s:5.2f}->{t_pm_f:4.2f} "
-            f"| rt {t_rt_s:5.2f}->{t_rt_f:4.2f} || 48v {tot_s:.3f}->{tot_f:.3f} ms (save {tot_s - tot_f:.3f} ms)"
+            f"| rt {t_rt_s:5.2f}->{t_rt_f:4.2f} || c1+c2 save {c12_s - c12_f:.3f} ms | 48v {tot_s:.3f}->{tot_f:.3f} ms (save {tot_s - tot_f:.3f} ms)"
         )
 
     for rows in wide_list:

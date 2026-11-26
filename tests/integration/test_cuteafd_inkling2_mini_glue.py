@@ -209,14 +209,20 @@ def test_attn_cross_pair_norm_bit_exact(bcast):
             _assert_bit_exact(paired_f, paired_s, f"attn_cross paired b={bcast} r={rows} c={cand}")
 
 
-def _make_segments(rows: int, num_slots: int = 8):
-    """Build multi-segment packed metadata (1..4 segments) with exclusive conv_slots."""
+def _make_segments(rows: int, num_slots: int = 64):
+    """Build multi-segment packed metadata (including C16 1-row and 8-row shapes) with exclusive conv_slots."""
     if rows == 1:
         lens = [1]
     elif rows <= 4:
         lens = [rows]
     elif rows <= 10:
         lens = [3, rows - 3]
+    elif rows == 16:
+        lens = [1] * 16
+    elif rows == 48:
+        lens = [3] * 16
+    elif rows == 64:
+        lens = [8] * 8
     else:
         a = rows // 3
         b = rows // 3
@@ -225,7 +231,7 @@ def _make_segments(rows: int, num_slots: int = 8):
     cur = 0
     for s_idx, length in enumerate(lens):
         first.extend([cur] * length)
-        cslots.extend([(s_idx * 2 + 1) % num_slots] * length)
+        cslots.extend([(s_idx * 3 + 1) % num_slots] * length)
         cur += length
     return (
         torch.tensor(first, dtype=torch.int32, device="cuda"),
@@ -290,8 +296,8 @@ def test_attn_prep_bit_exact_all_rows_and_graph(local, fp8, replay):
 
         lag_stride = 6656
         slot_stride = 3 * lag_stride
-        hist_k_s = torch.randn((8, 3, lag_stride), generator=gen, device="cuda")
-        hist_v_s = torch.randn((8, 3, lag_stride), generator=gen, device="cuda")
+        hist_k_s = torch.randn((64, 3, lag_stride), generator=gen, device="cuda")
+        hist_v_s = torch.randn((64, 3, lag_stride), generator=gen, device="cuda")
         hist_k_f = hist_k_s.clone()
         hist_v_f = hist_v_s.clone()
 
@@ -384,7 +390,7 @@ def test_post_attn_conv_bit_exact(starts_block, replay):
         first, cslots = _make_segments(rows)
         lag_stride = 6656
         slot_stride = 3 * lag_stride
-        hist_s = torch.randn((8, 3, lag_stride), generator=gen, device="cuda")
+        hist_s = torch.randn((64, 3, lag_stride), generator=gen, device="cuda")
         hist_f = hist_s.clone()
         rep_stride = 6656
         rep_s = torch.full((64, rep_stride), -3.0, device="cuda")
@@ -443,7 +449,7 @@ def test_post_mlp_conv_residual_bit_exact(replay):
         first, cslots = _make_segments(rows)
         lag_stride = 6656
         slot_stride = 3 * lag_stride
-        hist_s = torch.randn((8, 3, lag_stride), generator=gen, device="cuda")
+        hist_s = torch.randn((64, 3, lag_stride), generator=gen, device="cuda")
         hist_f = hist_s.clone()
         rep_stride = 6656
         rep_s = torch.full((64, rep_stride), -3.0, device="cuda")
