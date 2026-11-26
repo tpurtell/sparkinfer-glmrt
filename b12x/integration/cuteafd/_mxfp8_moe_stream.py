@@ -90,9 +90,10 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
     a_ring = 3
 
     def __init__(self, *, inter: int, hidden: int, experts: int, gate_cap: float = SITU_GATE_CAP,
-                 up_cap: float = SITU_UP_CAP, row_addresses: bool = False):
+                 up_cap: float = SITU_UP_CAP, row_addresses: bool = False, mini_prefill: bool = False):
         super().__init__(inter=inter, hidden=hidden, experts=experts, limit=0.0, qmma=True,
                          row_addresses=row_addresses)
+        self.mini_prefill = bool(mini_prefill)
         self.gate_cap, self.up_cap = float(gate_cap), float(up_cap)
         if self.gate_cap <= 0 or self.up_cap <= 0:
             raise ValueError("SiTU caps must be positive")
@@ -109,10 +110,11 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
             raise ValueError("the weight scale row stride must be an odd number of words")
 
     def key(self) -> tuple:
-        return ("stream_gate_up_mxfp8", 1, self.inter, self.hidden, self.experts, self.a_ring, self.w_ring,
+        base = ("stream_gate_up_mxfp8", 1, self.inter, self.hidden, self.experts, self.a_ring, self.w_ring,
                 self.gate_cap, self.up_cap, self.act_row_bytes) + (
                     ("row_addresses",) if self.row_addresses else ()) + (
                     ("wire_align8",) if self.row_bytes % 16 else ())
+        return base + ("mini_prefill", 3) if self.mini_prefill else base
 
     def _storage(self, w_layout):
         class Storage:
@@ -133,19 +135,40 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
                  stream: cuda.CUstream, grouped_gamma: cute.Pointer = None):
         if cutlass.const_expr(grouped_gamma is None):
             raise ValueError("the MXFP8 stream gate/up applies the route weight before FC2: pass grouped_gamma")
-        w_layout = self._w_layout()
-        rows_w = self.experts * self.inter
-        box = cute.slice_(w_layout, (None, None, 0))
-        tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w1, rows_w, self.hidden), box, (self.cols, self.k_step),
-            num_multicast=1)
-        tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, self.hidden), box, (self.cols, self.k_step),
-            num_multicast=1)
-        self.kernel(x, pair_row, meta, tma_tensor_g, tma_tensor_u, s1, s3, act, tma_g, tma_u, w_layout,
-                    self._storage(w_layout), grouped_gamma).launch(
-            grid=(self.inter // self.cols, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
-            min_blocks_per_mp=1)
+        if cutlass.const_expr(self.mini_prefill):
+            from ._inkling2_mini_moe import (
+                MINI_EXPERTS, MINI_HIDDEN, MINI_INTER, MINI_MMA_THREADS,
+                mini_mxfp8_gate_up_layout, mini_mxfp8_gate_up_storage,
+            )
+            w_layout = mini_mxfp8_gate_up_layout()
+            rows_w = MINI_EXPERTS * MINI_INTER
+            box = cute.slice_(w_layout, (None, None, 0))
+            tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w1, rows_w, MINI_HIDDEN), box, (64, 128),
+                num_multicast=1)
+            tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, MINI_HIDDEN), box, (64, 128),
+                num_multicast=1)
+            self.kernel_mini(
+                x, pair_row, meta, tma_tensor_g, tma_tensor_u, s1, s3, act, tma_g, tma_u, w_layout,
+                mini_mxfp8_gate_up_storage(w_layout), grouped_gamma,
+            ).launch(
+                grid=(MINI_INTER // 64, max_tiles, 1), block=(MINI_MMA_THREADS, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
+        else:
+            w_layout = self._w_layout()
+            rows_w = self.experts * self.inter
+            box = cute.slice_(w_layout, (None, None, 0))
+            tma_g, tma_tensor_g = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w1, rows_w, self.hidden), box, (self.cols, self.k_step),
+                num_multicast=1)
+            tma_u, tma_tensor_u = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(), _u8_weight(w3, rows_w, self.hidden), box, (self.cols, self.k_step),
+                num_multicast=1)
+            self.kernel(x, pair_row, meta, tma_tensor_g, tma_tensor_u, s1, s3, act, tma_g, tma_u, w_layout,
+                        self._storage(w_layout), grouped_gamma).launch(
+                grid=(self.inter // self.cols, max_tiles, 1), block=(self.threads, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
 
     @cute.jit
     def _step_mx(self, step, slot, sa, sw, ss, sc, warp_m, warp_n, lane, g, acc):
@@ -342,6 +365,18 @@ class StreamMxfp8GateUp(StreamFp8GateUp):
                                      payload[4 * half + 2], payload[4 * half + 3])
                 st_global_u8(at + Int64(i) + Int64(n0 // Int32(32)), cutlass.Uint8(scale))
 
+    @cute.kernel
+    def kernel_mini(self, x: cute.Pointer, pair_row: cute.Pointer, meta: cute.Pointer,
+                    weight_g: cute.Tensor, weight_u: cute.Tensor, s1: cute.Pointer, s3: cute.Pointer,
+                    act: cute.Pointer, tma_g: cute.CopyAtom, tma_u: cute.CopyAtom,
+                    w_layout: cute.ComposedLayout, Storage: cutlass.Constexpr, grouped_gamma: cute.Pointer):
+        from ._inkling2_mini_moe import mini_mxfp8_gate_up_body
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(Storage)
+        mini_mxfp8_gate_up_body(
+            x, pair_row, meta, weight_g, weight_u, s1, s3, act, tma_g, tma_u,
+            w_layout, storage, grouped_gamma, self.gate_cap, self.up_cap)
+
 
 class StreamMxfp8Down:
     """``y[p] = act_p . dequant(w2_e)^T`` over MXFP8 K32 ``act`` rows and E4M3
@@ -359,8 +394,9 @@ class StreamMxfp8Down:
     a_ring = 2
     sa_group = 4
 
-    def __init__(self, *, hidden: int, inter: int, experts: int):
+    def __init__(self, *, hidden: int, inter: int, experts: int, mini_prefill: bool = False):
         self.hidden, self.inter, self.experts = int(hidden), int(inter), int(experts)
+        self.mini_prefill = bool(mini_prefill)
         if self.hidden % self.tile_n or self.inter % 32 or self.inter <= 0:
             raise ValueError("MXFP8 stream down needs a 128-aligned H and a positive 32-aligned I")
         self.blocks = (self.inter + self.k_block - 1) // self.k_block
@@ -392,8 +428,9 @@ class StreamMxfp8Down:
             raise ValueError("the output staging tile must fit the drained ring")
 
     def key(self) -> tuple:
-        return ("stream_down_mxfp8", 2, self.hidden, self.inter, self.experts,
+        base = ("stream_down_mxfp8", 2, self.hidden, self.inter, self.experts,
                 self.tma_w, self.w_ring, self.a_ring, self.sa_group)
+        return base + ("mini_prefill", 3) if self.mini_prefill else base
 
     def _w_layout(self):
         w_atom = warpgroup.make_smem_layout_atom(
@@ -425,8 +462,30 @@ class StreamMxfp8Down:
 
     @cute.jit
     def __call__(self, act: cute.Pointer, meta: cute.Pointer, w2: cute.Pointer, s2: cute.Pointer,
-                 y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream):
-        if cutlass.const_expr(self.tma_w):
+                 y: cute.Pointer, max_tiles: Int32, stream: cuda.CUstream, max_groups: Int32 = None):
+        if cutlass.const_expr(self.mini_prefill):
+            from ._inkling2_mini_moe import (
+                MINI_EXPERTS, MINI_HIDDEN, MINI_INTER, MINI_WS_THREADS,
+                mini_mxfp8_down_layouts, mini_mxfp8_down_storage, mini_u8_strided,
+            )
+            w_layout, a_layout = mini_mxfp8_down_layouts()
+            w_box = cute.slice_(w_layout, (None, None, 0))
+            a_box = cute.slice_(a_layout, (None, None, 0))
+            tma_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                _u8_weight(w2, MINI_EXPERTS * MINI_HIDDEN, MINI_INTER), w_box,
+                (128, 128), num_multicast=1)
+            tma_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                mini_u8_strided(act, max_tiles * Int32(STREAM_TILE_M), MINI_INTER, self.row_bytes), a_box,
+                (32, 128), num_multicast=1)
+            self.kernel_tma_mini(
+                act, meta, tma_tensor_a, tma_tensor_w, s2, y,
+                tma_a, tma_w, w_layout, a_layout, mini_mxfp8_down_storage(w_layout, a_layout),
+            ).launch(
+                grid=(MINI_HIDDEN // 128, max_groups, 1), block=(MINI_WS_THREADS, 1, 1), stream=stream,
+                min_blocks_per_mp=1)
+        elif cutlass.const_expr(self.tma_w):
             w_layout = self._w_layout()
             tma_w, tma_tensor_w = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileG2SOp(),
@@ -776,6 +835,18 @@ class StreamMxfp8Down:
                     st_global_v4_u32(Int64(y.toint()) + ((Int64(first) + Int64(row)) * Int64(self.hidden)
                                                         + Int64(n0)) * Int64(2) + Int64(seg) * Int64(16),
                                      v0, v1, v2, v3)
+
+    @cute.kernel
+    def kernel_tma_mini(self, act: cute.Pointer, meta: cute.Pointer, act_t: cute.Tensor,
+                        weight_t: cute.Tensor, s2: cute.Pointer, y: cute.Pointer,
+                        tma_a: cute.CopyAtom, tma_w: cute.CopyAtom,
+                        w_layout: cute.ComposedLayout, a_layout: cute.ComposedLayout,
+                        Storage: cutlass.Constexpr):
+        from ._inkling2_mini_moe import mini_mxfp8_down_body
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(Storage)
+        mini_mxfp8_down_body(
+            act, meta, act_t, weight_t, s2, y, tma_a, tma_w, w_layout, a_layout, storage)
 
 
 class GroupedGamma:
