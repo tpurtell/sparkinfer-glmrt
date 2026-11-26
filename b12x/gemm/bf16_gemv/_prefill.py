@@ -108,7 +108,7 @@ class Bf16PrefillKernel:
                  compensated: bool = True, warp_layout: tuple[int, int] | None = None,
                  tile_m: int | None = None, tile_k: int | None = None,
                  mbar_last: bool = False, cross_stage_pipe: bool = False,
-                 k_unroll: int = 1):
+                 k_unroll: int = 1, split_k: int = 1):
         """Defaults keep the original 64x64x64, two-stage, compensated kernel.
 
         ``compensated=False`` accumulates directly in the tensor-core FP32
@@ -145,7 +145,10 @@ class Bf16PrefillKernel:
         self.n, self.k = int(n), int(k)
         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k or self.tile_k % 16:
             raise ValueError("BF16 prefill needs positive N and a K divisible by its K tile")
-        self.k_tiles = self.k // self.tile_k
+        self.split_k = int(split_k)
+        if self.split_k <= 0 or self.k % (self.tile_k * self.split_k):
+            raise ValueError("K must divide into equal split-K tiles")
+        self.k_tiles = self.k // self.tile_k // self.split_k
         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
 
     def smem_bytes(self) -> int:
@@ -249,6 +252,8 @@ class Bf16PrefillKernel:
         if const_expr(output.element_type not in (cutlass.Float32, cutlass.BFloat16)):
             raise TypeError("output must be Float32 or BFloat16")
 
+        if const_expr(self.split_k > 1 and output.element_type != cutlass.Float32):
+            raise TypeError("split-K partials must be Float32")
         sA_layout, sB_layout = self._get_smem_layouts()
         tiled_mma = self._get_tiled_mma()
         SharedStorage = self._get_shared_storage_cls(sA_layout, sB_layout)
@@ -284,7 +289,7 @@ class Bf16PrefillKernel:
             num_tokens,
             channel_scales,
         ).launch(
-            grid=(grid_m, self.n_tiles, 1),
+            grid=(grid_m, self.n_tiles, self.split_k),
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
@@ -306,7 +311,8 @@ class Bf16PrefillKernel:
         channel_scales: cute.Pointer | None = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        m_tile, n_tile, _ = cute.arch.block_idx()
+        m_tile, n_tile, block_z = cute.arch.block_idx()
+        k_part = block_z if const_expr(self.split_k > 1) else Int32(0)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if warp_idx == 0:
@@ -531,7 +537,10 @@ class Bf16PrefillKernel:
                         value = acc[index]
                         if const_expr(channel_scales is not None):
                             value = value * s_scales[coord[1]]
-                        output[Int64(token), Int64(column)] = value.to(output.element_type)
+                        if const_expr(self.split_k > 1):
+                            output[Int64(token) + Int64(k_part) * Int64(num_tokens), Int64(column)] = value.to(output.element_type)
+                        else:
+                            output[Int64(token), Int64(column)] = value.to(output.element_type)
 
         elif warp_idx == Int32(self.producer_warp):
             producer_state = pipeline.make_pipeline_state(
@@ -544,13 +553,13 @@ class Bf16PrefillKernel:
                     load_pipeline.producer_acquire(producer_state)
                     cute.copy(
                         tma_atom_A,
-                        tAgA[(None, m_tile, k_tile)],
+                        tAgA[(None, m_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
                         tAsA[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
                     cute.copy(
                         tma_atom_B,
-                        tBgB[(None, n_tile, k_tile)],
+                        tBgB[(None, n_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
                         tBsB[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
@@ -561,13 +570,13 @@ class Bf16PrefillKernel:
                     load_pipeline.producer_acquire(producer_state)
                     cute.copy(
                         tma_atom_A,
-                        tAgA[(None, m_tile, k_tile)],
+                        tAgA[(None, m_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
                         tAsA[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
                     cute.copy(
                         tma_atom_B,
-                        tBgB[(None, n_tile, k_tile)],
+                        tBgB[(None, n_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
                         tBsB[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )

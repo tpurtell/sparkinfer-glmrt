@@ -195,3 +195,48 @@ def compile_inkling2_loop_blend_norm_aot(
                       broadcast_weight=broadcast_weight, eps=eps, max_rows=max_rows),
         doc=__doc__,
     )
+
+
+class _ControllerDownSplitK:
+    """Fixed eight-way K partition, then increasing-part FP32 fold.
+
+    Both row routes run precisely the same K16 MMA segments and split fold.
+    The partial plane is caller-owned and uses live-row stride.
+    """
+    n = 64
+    k = 4608
+    threads = 128
+
+    def __init__(self, *, splits=8, decode_tile=(1, 1, 16, 8, 4, 64)):
+        from b12x.gemm.bf16_gemv._prefill import Bf16PrefillKernel
+        self.splits = splits
+        wm, wn, tm, tn, stages, tk = decode_tile
+        self.decode = Bf16PrefillKernel(self.n, self.k, warp_layout=(wm, wn), tile_m=tm,
+                                        tile_n=tn, tile_k=tk, num_stages=stages,
+                                        compensated=False, split_k=splits)
+        self.prefill = Bf16PrefillKernel(self.n, self.k, compute_warps=4, tile_n=64,
+                                         num_stages=4, compensated=False, split_k=splits)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer,
+                 partial: cute.Pointer, rows: Int32, stream: cuda.CUstream):
+        xt = cute.make_tensor(x, cute.make_layout((rows, self.k), stride=(self.k, 1)))
+        wt = cute.make_tensor(w, cute.make_layout((self.n, self.k), stride=(self.k, 1)))
+        pt = cute.make_tensor(partial, cute.make_layout((rows * self.splits, self.n), stride=(self.n, 1)))
+        if rows <= Int32(16):
+            self.decode(xt, wt, pt, rows, stream)
+        else:
+            self.prefill(xt, wt, pt, rows, stream)
+        self.fold(partial, out, rows).launch(
+            grid=((rows * self.n + self.threads - 1) // self.threads, 1, 1),
+            block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def fold(self, partial: cute.Pointer, out: cute.Pointer, rows: Int32):
+        i = Int64(cute.arch.block_idx()[0]) * self.threads + Int64(cute.arch.thread_idx()[0])
+        stride = Int64(rows) * self.n
+        if i < stride:
+            acc = Float32(partial[i])
+            for part in cutlass.range_constexpr(1, self.splits):
+                acc = acc + Float32(partial[i + Int64(part) * stride])
+            out[i] = BFloat16(acc)
