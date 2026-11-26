@@ -14,9 +14,11 @@ with an L2 flush before each.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import platform
 import time
+from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
@@ -25,16 +27,21 @@ import torch
 from cutlass import Int32, Int64
 
 
-def time_us(fn, iters: int, flush: torch.Tensor) -> float:
+def time_us(fn, iters: int, flush: torch.Tensor, prepare=lambda: None) -> float:
+    prepare()
     fn()
     torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn()
     times = []
     for _ in range(iters):
+        prepare()
         flush.max()  # read-only L2 flush: no dirty lines to write back inside fn
         torch.cuda._sleep(3_000_000)  # covers the host-side launch of fn
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        fn()
+        graph.replay()
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end) * 1000.0)
@@ -94,12 +101,12 @@ def _inputs(g, rows: int, kind: str, gen):
 
 
 def bench_prefill(g, rows: int, samples: int, flush, gen, max_rows: int) -> dict:
-    from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot
+    from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot, prefill_tokens
 
     q, rel, sinks, records, out = _inputs(g, rows, "local", gen)
     positions = torch.arange(rows, device="cuda")
-    tile_rows = torch.arange(0, rows, 10, dtype=torch.int32, device="cuda")
-    result = {"rows": rows}
+    tile_rows = torch.arange(0, rows, prefill_tokens(g), dtype=torch.int32, device="cuda")
+    result = {"rows": rows, "context": rows}
 
     # Local: this step's records plus an (initially empty) ring.
     local = compile_inkling2_attention_aot(g, kind="local", route="prefill", max_rows=max_rows)
@@ -171,6 +178,132 @@ def bench_decode(g, concurrency: int, context: int, samples: int, flush, gen, sp
     return result
 
 
+def _bytes(tensor):
+    return tensor.detach().contiguous().cpu().view(torch.uint8)
+
+
+def _exact_prefix(full, prefix):
+    expected, actual = _bytes(full[:len(prefix)]), _bytes(prefix)
+    a, b = full[:len(prefix)].detach().cpu().contiguous(), prefix.detach().cpu().contiguous()
+    diff = a.view(torch.int16) != b.view(torch.int16)
+    coords = diff.nonzero()
+    av, bv = a[diff].float(), b[diff].float()
+    absolute = (av - bv).abs()
+    # BF16 spacing at the full-run element's magnitude, including subnormals.
+    _, exponent = torch.frexp(av.abs())
+    spacing = torch.ldexp(torch.ones_like(av), (exponent - 8).clamp(min=-133))
+    spacing = torch.where(av == 0, torch.full_like(av, 2.0**-133), spacing)
+    return {"rows": len(prefix), "bitwise_equal": torch.equal(expected, actual),
+            "differing_rows": int(coords[:, 0].unique().numel()),
+            "row_indices": coords[:, 0].unique().tolist(),
+            "head_indices": coords[:, 1].unique().tolist(),
+            "differing_elements": len(coords),
+            "max_abs_diff": float(absolute.max()) if len(coords) else 0.0,
+            "max_ulp_diff": float((absolute / spacing).max()) if len(coords) else 0.0,
+            "full_prefix_sha256": hashlib.sha256(expected.numpy().tobytes()).hexdigest(),
+            "prefix_sha256": hashlib.sha256(actual.numpy().tobytes()).hexdigest()}
+
+
+def bench_prefill_program(g, kind, kv_format, rows, context, args, flush):
+    """Time one runtime-selected export on a single contiguous sequence.
+
+    Context is the final length (including the query rows). Prefix tests keep
+    the original starting position, page table stride, capacity and KV history.
+    """
+    from b12x.integration.cuteafd.inkling2_attention import (
+        compile_inkling2_attention_aot, prefill_tokens, record_bytes,
+    )
+    from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_kv_pack_aot
+
+    gen = torch.Generator(device="cuda").manual_seed(args.seed)
+    q, rel, sinks, _, out = _inputs(g, rows, kind, gen)
+    records = torch.randn((context, g.record_elems), generator=gen, device="cuda").bfloat16()
+    start = context - rows
+    positions = torch.arange(start, context, device="cuda")
+    first = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    tiles = torch.arange(0, rows, prefill_tokens(g), dtype=torch.int32, device="cuda")
+    program = compile_inkling2_attention_aot(g, kind=kind, route="prefill",
+                                           max_rows=args.max_rows, kv_format=kv_format)
+    scratch = torch.empty(program.scratch_bytes(args.max_rows)["scratch"], dtype=torch.uint8, device="cuda")
+    if kind == "local":
+        slots = positions % g.ring_rows
+        initial = torch.zeros((g.ring_rows, g.record_elems), dtype=torch.bfloat16, device="cuda")
+        history = torch.arange(max(0, start - g.ring_rows), start, device="cuda")
+        initial[history % g.ring_rows] = records[history]
+        ring = initial.clone()
+
+        def prepare():
+            ring.copy_(initial)
+
+        def launch(n):
+            nt = (n + prefill_tokens(g) - 1) // prefill_tokens(g)
+            program.launch(q, records[start:], ring, positions, slots, first, tiles, rel, sinks, out,
+                           scratch, scalars=(n, nt))
+    else:
+        pages = -(-context // g.page_rows)
+        table = torch.randperm(pages, generator=gen, device="cuda").int()
+        pos = torch.arange(context, device="cuda")
+        slots = table.long()[pos // g.page_rows] * g.page_rows + pos % g.page_rows
+        if kv_format == "fp8":
+            cache = torch.zeros((pages * g.page_rows, record_bytes(g, kv_format)), dtype=torch.uint8, device="cuda")
+            pack = compile_inkling2_kv_pack_aot(heads=g.kv_heads, dim=g.head_dim, input_dtype=torch.bfloat16,
+                                               max_rows=args.max_rows, kv_format=kv_format)
+            k, v = records.reshape(context, 2, g.kv_heads, g.head_dim).unbind(1)
+            for offset in range(0, context, args.max_rows):
+                end = min(offset + args.max_rows, context)
+                pack.launch(k[offset:end].contiguous(), v[offset:end].contiguous(), slots[offset:end], cache,
+                            scalars=(end - offset,))
+        else:
+            cache = torch.zeros((pages * g.page_rows, g.record_elems), dtype=torch.bfloat16, device="cuda")
+            cache[slots] = records
+
+        def prepare():
+            pass
+
+        def launch(n):
+            nt = (n + prefill_tokens(g) - 1) // prefill_tokens(g)
+            program.launch(q, cache, positions, table, first, first, tiles, rel, sinks, out,
+                           scratch, scalars=(n, pages, nt))
+
+    name = f"{g.name}/{kind}_attention_prefill_{kv_format}_v2_m{args.max_rows}"
+    # The ABI selects a single prefill kernel at compile time. There is no
+    # alternate runtime dispatch (unlike global decode's split count).
+    result = {"program": name, "rows": rows, "context": context}
+    if args.compare_routes_exact:
+        result["route_comparison"] = {"routes": ["prefill"], "status": "1 route: nothing to compare"}
+        print(f"{name} r{rows} c{context}: 1 route: nothing to compare")
+    prepare()
+    launch(rows)
+    full = out.clone()
+    if not torch.isfinite(full).all().item():
+        raise RuntimeError(f"{name}: nonfinite output")
+    result["output_sha256"] = hashlib.sha256(_bytes(full).numpy().tobytes()).hexdigest()
+    if args.output_tensors:
+        path = Path(args.output_tensors) / f"{kind}-{kv_format}-r{rows}-c{context}.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(full.cpu(), path)
+    if args.check_prefix_rows:
+        checks = []
+        for n in args.check_prefix_rows:
+            if n >= rows:
+                continue
+            prepare()
+            out.fill_(float("nan"))
+            launch(n)
+            check = _exact_prefix(full, out[:n])
+            checks.append(check)
+            if not check["bitwise_equal"]:
+                message = f"{name} r{rows} c{context}: prefix check failed: {check}"
+                print(message, flush=True)
+                if args.strict_prefix:
+                    raise RuntimeError(message)
+        result["prefix_checks"] = checks
+    result["us"] = time_us(lambda: launch(rows), args.samples, flush, prepare)
+    result["us_per_row"] = result["us"] / rows
+    print(f"{name} r{rows} c{context}: {result['us']:.2f} us ({result['us_per_row']:.4f} us/row)", flush=True)
+    return result
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--rows", default="2048,2752,4096")
@@ -180,16 +313,53 @@ def main():
     p.add_argument("--samples", type=int, default=15)
     p.add_argument("--max-rows", type=int, default=4096)
     p.add_argument("--json", default=None)
+    p.add_argument("--geometry", choices=("inkling2", "inkling2_mini"), default="inkling2")
+    p.add_argument("--prefill-only", action="store_true", help="time selected prefill programs individually")
+    p.add_argument("--programs", default="local-bf16,global-fp8",
+                   help="comma-separated prefill programs: local-bf16,global-bf16,global-fp8")
+    p.add_argument("--prefill-contexts", default="fresh", help="fresh or comma-separated final context lengths")
+    p.add_argument("--check-prefix-rows", type=lambda s: [int(x) for x in s.split(",")],
+                   help="comma-separated shorter live row counts to check byte-exactly under the same export")
+    p.add_argument("--strict-prefix", action="store_true", help="fail on any prefix byte mismatch")
+    p.add_argument("--compare-routes-exact", action="store_true", help="compare all internal routes byte-exactly")
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--output-tensors", help="save output tensors for cross-arm numerics")
     args = p.parse_args()
+    rows = [int(r) for r in args.rows.split(",")]
+    if not rows or min(rows) <= 0 or max(rows) > args.max_rows or args.samples <= 0:
+        p.error("rows must be positive and <= max-rows; samples must be positive")
+    if (args.check_prefix_rows or args.compare_routes_exact or args.output_tensors) and not args.prefill_only:
+        p.error("prefix/route checks and output tensors require --prefill-only")
+    if args.strict_prefix and not args.check_prefix_rows:
+        p.error("--strict-prefix requires --check-prefix-rows")
+    if args.check_prefix_rows and any(n <= 0 or n >= max(rows) for n in args.check_prefix_rows):
+        p.error("each prefix must be positive and shorter than at least one case")
+    programs = args.programs.split(",")
+    if set(programs) - {"local-bf16", "global-bf16", "global-fp8"}:
+        p.error("invalid --programs")
+    contexts = None if args.prefill_contexts == "fresh" else [int(c) for c in args.prefill_contexts.split(",")]
+    if contexts and min(contexts) < max(rows):
+        p.error("final context must be >= rows")
 
-    from b12x.integration.cuteafd import INKLING2_SMALL as g
+    from b12x.integration.cuteafd import INKLING2_SMALL, INKLING2_MINI
+    g = INKLING2_MINI if args.geometry == "inkling2_mini" else INKLING2_SMALL
 
     device = torch.cuda.get_device_properties(0)
     print(f"{device.name} sm_{device.major}{device.minor} {device.multi_processor_count} SMs, {platform.node()}")
-    flush = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    gen = torch.Generator(device="cuda").manual_seed(7)
+    flush = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(args.seed)
     report = {"device": device.name, "sm": f"{device.major}{device.minor}", "host": platform.node(),
-              "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "prefill": [], "decode": []}
+              "time": time.strftime("%Y-%m-%dT%H:%M:%S"), "geometry": g.name, "seed": args.seed,
+              "prefill": [], "decode": []}
+    if args.prefill_only:
+        for name in programs:
+            kind, kv_format = name.split("-")
+            for n in rows:
+                for context in contexts if contexts is not None else [n]:
+                    report["prefill"].append(bench_prefill_program(g, kind, kv_format, n, context, args, flush))
+        if args.json:
+            Path(args.json).write_text(json.dumps(report, indent=1) + "\n")
+        return
     print(f"{'rows':>6} {'local us':>10} {'/row':>8} {'control us':>11} {'/row':>8} {'ratio':>6} "
           f"{'global us':>10} {'/row':>8}")
     for rows in (int(r) for r in args.rows.split(",")):
