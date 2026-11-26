@@ -313,13 +313,17 @@ class RuntimeAffineNorm(AffineNorm):
                     out[base + Int64(dim)] = value.to(BFloat16)
 
 
-class _Hy4Bf16RmsNorm3072:
-    """Single-pass 384-thread 128-bit vectorized BF16 RMSNorm for Hy4-flash width=3072."""
+class _Hy4Bf16RmsNormWide:
+    """Single-pass 128-bit vectorized BF16 RMSNorm for Hy4 widths 3072 (384t) and 6144 (768t)."""
 
-    def __init__(self, eps: float, *, use_pdl: bool):
+    def __init__(self, width: int, eps: float, *, use_pdl: bool):
+        if width not in (3072, 6144):
+            raise ValueError(f"unsupported Hy4 wide BF16 RMSNorm width {width}")
+        self.width = int(width)
         self.eps = float(eps)
         self.use_pdl = bool(use_pdl)
-        self.warps = 12  # 384 threads * 8 BF16 = 3072
+        self.threads = self.width // 8  # 384 (12 warps) for 3072, 768 (24 warps) for 6144
+        self.warps = self.threads // 32
 
     def _storage(self):
         warps = self.warps
@@ -336,7 +340,7 @@ class _Hy4Bf16RmsNorm3072:
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
                  rows: Int32, stream: cuda.CUstream):
         self.kernel(Int64(x.toint()), Int64(weight.toint()), Int64(out.toint())).launch(
-            grid=(rows, 1, 1), block=(384, 1, 1), use_pdl=self.use_pdl, stream=stream)
+            grid=(rows, 1, 1), block=(self.threads, 1, 1), use_pdl=self.use_pdl, stream=stream)
 
     @cute.kernel
     def kernel(self, x_addr: Int64, w_addr: Int64, out_addr: Int64):
@@ -357,7 +361,7 @@ class _Hy4Bf16RmsNorm3072:
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
 
-        row_off = (row * Int64(3072) + col) * Int64(2)
+        row_off = (row * Int64(self.width) + col) * Int64(2)
         xu0, xu1, xu2, xu3 = ld_global_v4_u32(x_addr + row_off)
         x0, x1 = _bf16_lo(xu0), _bf16_hi(xu0)
         x2, x3 = _bf16_lo(xu1), _bf16_hi(xu1)
@@ -375,7 +379,7 @@ class _Hy4Bf16RmsNorm3072:
         total = Float32(0.0)
         for src in cutlass.range_constexpr(self.warps):
             total = _add(total, sums[src])
-        inv = rsqrt_approx_ftz_f32(_add(div_rn_f32(total, Float32(3072.0)), Float32(self.eps)))
+        inv = rsqrt_approx_ftz_f32(_add(div_rn_f32(total, Float32(float(self.width))), Float32(self.eps)))
 
         st_global_v4_u32(
             out_addr + row_off,
@@ -384,6 +388,13 @@ class _Hy4Bf16RmsNorm3072:
             pack_f32x2_to_bfloat2(_mul(_mul(x4, inv), _bf16_lo(w2)), _mul(_mul(x5, inv), _bf16_hi(w2))),
             pack_f32x2_to_bfloat2(_mul(_mul(x6, inv), _bf16_lo(w3)), _mul(_mul(x7, inv), _bf16_hi(w3))),
         )
+
+
+class _Hy4Bf16RmsNorm3072(_Hy4Bf16RmsNormWide):
+    """Single-pass 384-thread 128-bit vectorized BF16 RMSNorm for Hy4-flash width=3072."""
+
+    def __init__(self, eps: float, *, use_pdl: bool):
+        super().__init__(3072, eps, use_pdl=use_pdl)
 
 
 class _Hy4Bf16RmsNorm128:
@@ -429,9 +440,9 @@ class _Hy4Bf16RmsNorm:
     def __init__(self, width: int, eps: float):
         self.width = int(width)
         self.eps = float(eps)
-        if self.width == 3072:
-            self.decode = _Hy4Bf16RmsNorm3072(eps, use_pdl=True)
-            self.prefill = _Hy4Bf16RmsNorm3072(eps, use_pdl=False)
+        if self.width in (3072, 6144):
+            self.decode = _Hy4Bf16RmsNormWide(self.width, eps, use_pdl=True)
+            self.prefill = _Hy4Bf16RmsNormWide(self.width, eps, use_pdl=False)
         else:
             self.decode = _Hy4Bf16RmsNorm128(eps, warps_per_cta=1)
             self.prefill = _Hy4Bf16RmsNorm128(eps, warps_per_cta=4)
@@ -798,7 +809,7 @@ def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
     # None explicitly selects the scalar ABI; the historical default stays constant.
     hy4_bf16_rms = (
         eps == 1e-5
-        and width in (128, 3072)
+        and width in (128, 3072, 6144)
         and heads == 1
         and not zero_centered
         and not subtract_mean
