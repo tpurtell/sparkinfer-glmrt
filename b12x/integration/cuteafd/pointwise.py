@@ -12,15 +12,18 @@ import math
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 import torch
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from b12x._lib.intrinsics import (
-    cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_v4_f32, pack_f32x2_to_bfloat2, rsqrt_approx_ftz_f32,
-    st_global_v4_u32,
+    cvt_f32x4_to_e4m3x4, div_rn_f32, ld_global_nc_v2_u32, ld_global_nc_v4_u32, ld_global_v2_u32,
+    ld_global_v4_f32, ld_global_v4_u32, pack_f32x2_to_bfloat2, rsqrt_approx_ftz_f32,
+    st_global_v2_u32, st_global_v4_u32,
 )
+from b12x.gemm.bf16_gemv._skinny import _bf16_hi, _bf16_lo
 from ._common import Operand, Scalar, compile_program
 from ._glm_kernels import _bf16, _fp8_scale, _warp_max, _warp_sum
 from ._fp8_moe_kernels import _post_silu_product
@@ -308,6 +311,140 @@ class RuntimeAffineNorm(AffineNorm):
                             else:
                                 value = _fma(real, s, _mul(imag, c))
                     out[base + Int64(dim)] = value.to(BFloat16)
+
+
+class _Hy4Bf16RmsNorm3072:
+    """Single-pass 384-thread 128-bit vectorized BF16 RMSNorm for Hy4-flash width=3072."""
+
+    def __init__(self, eps: float, *, use_pdl: bool):
+        self.eps = float(eps)
+        self.use_pdl = bool(use_pdl)
+        self.warps = 12  # 384 threads * 8 BF16 = 3072
+
+    def _storage(self):
+        warps = self.warps
+
+        class NormStorage:
+            pass
+
+        NormStorage.__annotations__ = {
+            "sums": cute.struct.Align[cute.struct.MemRange[Float32, warps], 16],
+        }
+        return cute.struct(NormStorage)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        self.kernel(Int64(x.toint()), Int64(weight.toint()), Int64(out.toint())).launch(
+            grid=(rows, 1, 1), block=(384, 1, 1), use_pdl=self.use_pdl, stream=stream)
+
+    @cute.kernel
+    def kernel(self, x_addr: Int64, w_addr: Int64, out_addr: Int64):
+        row = Int64(cute.arch.block_idx()[0])
+        tidx = Int32(cute.arch.thread_idx()[0])
+        warp = tidx >> Int32(5)
+        lane = tidx & Int32(31)
+
+        smem = cutlass_utils.SmemAllocator()
+        storage = smem.allocate(self._storage())
+        sums = storage.sums.get_tensor(cute.make_layout((self.warps,), stride=(1,)))
+
+        col = Int64(tidx) * Int64(8)
+        # Immutable weight load overlaps with prior PDL kernel.
+        w0, w1, w2, w3 = ld_global_nc_v4_u32(w_addr + col * Int64(2))
+
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+
+        row_off = (row * Int64(3072) + col) * Int64(2)
+        xu0, xu1, xu2, xu3 = ld_global_v4_u32(x_addr + row_off)
+        x0, x1 = _bf16_lo(xu0), _bf16_hi(xu0)
+        x2, x3 = _bf16_lo(xu1), _bf16_hi(xu1)
+        x4, x5 = _bf16_lo(xu2), _bf16_hi(xu2)
+        x6, x7 = _bf16_lo(xu3), _bf16_hi(xu3)
+
+        sq = ((x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3)) + (
+            (x4 * x4 + x5 * x5) + (x6 * x6 + x7 * x7)
+        )
+        sq = _warp_sum(sq)
+        if lane == Int32(0):
+            sums[warp] = sq
+        cute.arch.sync_threads()
+
+        total = Float32(0.0)
+        for src in cutlass.range_constexpr(self.warps):
+            total = _add(total, sums[src])
+        inv = rsqrt_approx_ftz_f32(_add(div_rn_f32(total, Float32(3072.0)), Float32(self.eps)))
+
+        st_global_v4_u32(
+            out_addr + row_off,
+            pack_f32x2_to_bfloat2(_mul(_mul(x0, inv), _bf16_lo(w0)), _mul(_mul(x1, inv), _bf16_hi(w0))),
+            pack_f32x2_to_bfloat2(_mul(_mul(x2, inv), _bf16_lo(w1)), _mul(_mul(x3, inv), _bf16_hi(w1))),
+            pack_f32x2_to_bfloat2(_mul(_mul(x4, inv), _bf16_lo(w2)), _mul(_mul(x5, inv), _bf16_hi(w2))),
+            pack_f32x2_to_bfloat2(_mul(_mul(x6, inv), _bf16_lo(w3)), _mul(_mul(x7, inv), _bf16_hi(w3))),
+        )
+
+
+class _Hy4Bf16RmsNorm128:
+    """Single-pass 64-bit vectorized BF16 RMSNorm for Hy4-flash width=128 (1 warp per row)."""
+
+    def __init__(self, eps: float, *, warps_per_cta: int):
+        self.eps = float(eps)
+        self.warps_per_cta = int(warps_per_cta)
+        self.threads = self.warps_per_cta * 32
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        blocks = (rows + Int32(self.warps_per_cta - 1)) // Int32(self.warps_per_cta)
+        self.kernel(Int64(x.toint()), Int64(weight.toint()), Int64(out.toint()), rows).launch(
+            grid=(blocks, 1, 1), block=(self.threads, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, x_addr: Int64, w_addr: Int64, out_addr: Int64, rows: Int32):
+        tidx = Int32(cute.arch.thread_idx()[0])
+        warp = tidx >> Int32(5)
+        lane = tidx & Int32(31)
+        row = Int32(cute.arch.block_idx()[0]) * Int32(self.warps_per_cta) + warp
+        if row < rows:
+            col = Int64(lane) * Int64(4)
+            row_off = (Int64(row) * Int64(128) + col) * Int64(2)
+            wu0, wu1 = ld_global_nc_v2_u32(w_addr + col * Int64(2))
+            xu0, xu1 = ld_global_v2_u32(x_addr + row_off)
+            x0, x1 = _bf16_lo(xu0), _bf16_hi(xu0)
+            x2, x3 = _bf16_lo(xu1), _bf16_hi(xu1)
+            sq = _warp_sum((x0 * x0 + x1 * x1) + (x2 * x2 + x3 * x3))
+            inv = rsqrt_approx_ftz_f32(_add(div_rn_f32(sq, Float32(128.0)), Float32(self.eps)))
+            st_global_v2_u32(
+                out_addr + row_off,
+                pack_f32x2_to_bfloat2(_mul(_mul(x0, inv), _bf16_lo(wu0)), _mul(_mul(x1, inv), _bf16_hi(wu0))),
+                pack_f32x2_to_bfloat2(_mul(_mul(x2, inv), _bf16_lo(wu1)), _mul(_mul(x3, inv), _bf16_hi(wu1))),
+            )
+
+
+class _Hy4Bf16RmsNorm:
+    """Hy4-only BF16 RMSNorm wrapper preserving the exact AffineNorm ABI."""
+
+    def __init__(self, width: int, eps: float):
+        self.width = int(width)
+        self.eps = float(eps)
+        if self.width == 3072:
+            self.decode = _Hy4Bf16RmsNorm3072(eps, use_pdl=True)
+            self.prefill = _Hy4Bf16RmsNorm3072(eps, use_pdl=False)
+        else:
+            self.decode = _Hy4Bf16RmsNorm128(eps, warps_per_cta=1)
+            self.prefill = _Hy4Bf16RmsNorm128(eps, warps_per_cta=4)
+
+    @cute.jit
+    def __call__(self, x: cute.Pointer, weight: cute.Pointer, bias: cute.Pointer,
+                 cos: cute.Pointer, sin: cute.Pointer, positions: cute.Pointer, out: cute.Pointer,
+                 rows: Int32, stream: cuda.CUstream):
+        if rows > Int32(0):
+            if rows <= Int32(64):
+                self.decode(x, weight, out, rows, stream)
+            else:
+                self.prefill(x, weight, out, rows, stream)
 
 
 class ResidualAdd:
@@ -659,10 +796,22 @@ def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,
             geometry=dict(width=width, heads=heads, eps=eps,
                           round_normalized_before_weight=True))
     # None explicitly selects the scalar ABI; the historical default stays constant.
+    hy4_bf16_rms = (
+        eps == 1e-5
+        and width in (128, 3072)
+        and heads == 1
+        and not zero_centered
+        and not subtract_mean
+        and not bias
+        and rotary == 0
+        and input_dtype is torch.bfloat16
+        and parameter_dtype is torch.bfloat16
+    )
     launch = (RuntimeAffineNorm(width, heads, 1.0, zero_centered, subtract_mean, bias, rotary,
                                 vector_io=input_dtype is torch.float32
                                 and parameter_dtype is torch.float32)
               if eps is None else
+              _Hy4Bf16RmsNorm(width, eps) if hy4_bf16_rms else
               AffineNorm(width, heads, eps, zero_centered, subtract_mean, bias, rotary))
     if width == 192 and rotary and (subtract_mean or bias):
         raise ValueError("fixed D192 Q/K reduction requires RMSNorm without bias")
