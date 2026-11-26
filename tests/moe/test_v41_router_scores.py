@@ -15,7 +15,7 @@ def test_router_scores(experts, hidden):
     torch.manual_seed(experts + hidden)
     compiled = compile_v41_router_scores_aot(experts=experts, hidden=hidden)
     w = (torch.randn(experts, hidden, device="cuda") * 0.02).bfloat16()
-    for rows in (1, 7, 64, 300):
+    for rows in (1, 7, 64, 128, 256, 300):
         x = torch.randn(rows, hidden, device="cuda").bfloat16()
         out = torch.full((rows, experts), float("nan"), device="cuda")
         ptr = lambda t, dtype: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
@@ -30,19 +30,24 @@ def test_router_scores(experts, hidden):
 @pytest.mark.parametrize("experts", [384, 128])
 @pytest.mark.parametrize("activated", [False, True])
 def test_router_scores_rows_match_single_row_decode(experts, activated):
-    """The canonical skinny M=1 logits must survive every verify width (#736)."""
+    """The canonical skinny M=1 logits must survive every admitted V4.1 verify width (#736, #2793)."""
     from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, skinny_config
-    from b12x.moe._shared.v41_router import _V41ActivatedSkinnyScores
+    from b12x.moe._shared.v41_router import (
+        V41_ROUTER_SKINNY_MAX_ROWS,
+        _V41ActivatedSkinnyScores,
+    )
     from b12x._lib.compiler import compile as compile_kernel
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 GPU required")
+    assert V41_ROUTER_SKINNY_MAX_ROWS == 256
     hidden = 5120
+    max_rows = V41_ROUTER_SKINNY_MAX_ROWS
     torch.manual_seed(experts + hidden)
     w = (torch.randn(experts, hidden, device="cuda") / 64).bfloat16()
-    x = torch.randn(64, hidden, device="cuda").bfloat16()
+    x = torch.randn(max_rows, hidden, device="cuda").bfloat16()
     ptr = lambda t, dtype: make_ptr(dtype, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
-    scratch = torch.empty(64, experts, device="cuda")
+    scratch = torch.empty(max_rows, experts, device="cuda")
     args = (ptr(x, cutlass.BFloat16), ptr(w, cutlass.BFloat16),
             ptr(scratch, cutlass.Float32))
     skinny_type = _V41ActivatedSkinnyScores if activated else SkinnyBf16Gemv
@@ -61,9 +66,28 @@ def test_router_scores_rows_match_single_row_decode(experts, activated):
         return out
 
     # Pin the accepted canonical M=1 route too: the old MMA-only export must fail.
-    expected = torch.cat([run(skinny, x[r:r + 1]) for r in range(64)])
-    single = torch.cat([run(compiled, x[r:r + 1]) for r in range(64)])
+    expected = torch.cat([run(skinny, x[r:r + 1]) for r in range(max_rows)])
+    single = torch.cat([run(compiled, x[r:r + 1]) for r in range(max_rows)])
     assert torch.equal(single.view(torch.int32), expected.view(torch.int32))
-    for rows in range(1, 65):
+    widths = list(range(1, 66)) + [80, 96, 127, 128, 129, 160, 192, 255, 256]
+    for rows in widths:
         actual = run(compiled, x[:rows])
         assert torch.equal(actual.view(torch.int32), single[:rows].view(torch.int32)), rows
+    # Also verify CUDA graph capture + 3x replay across the old 64->65 boundary and 128/256.
+    for rows in (64, 65, 128, 256):
+        gx = x[:rows].contiguous()
+        gout = torch.full((rows, experts), float("nan"), device="cuda")
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            compiled(ptr(gx, cutlass.BFloat16), ptr(w, cutlass.BFloat16),
+                     ptr(gout, cutlass.Float32), cutlass.Int32(rows), current_cuda_stream())
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            compiled(ptr(gx, cutlass.BFloat16), ptr(w, cutlass.BFloat16),
+                     ptr(gout, cutlass.Float32), cutlass.Int32(rows), current_cuda_stream())
+        for _ in range(3):
+            gout.fill_(float("nan"))
+            graph.replay()
+            stream.synchronize()
+            assert torch.equal(gout.view(torch.int32), single[:rows].view(torch.int32)), ("graph", rows)
