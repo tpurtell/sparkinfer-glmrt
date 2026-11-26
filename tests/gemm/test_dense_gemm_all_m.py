@@ -97,7 +97,11 @@ def test_m1_recipe_all_m_matches_serial_and_old_grid_drops_rows(capacity, rows, 
     assert torch.equal(folded(replay_partial).view(torch.uint8), replay_expected.view(torch.uint8))
 
 
-@pytest.mark.parametrize("capacity,rows", [(16, 2), (16, 16), (64, 17), (64, 32), (64, 64), (80, 17), (80, 80)])
+@pytest.mark.parametrize(
+    "capacity,rows",
+    [(16, 2), (16, 16), (64, 17), (64, 32), (64, 64), (80, 17), (80, 80),
+     (256, 65), (256, 128), (256, 129), (256, 192), (256, 256)],
+)
 @pytest.mark.parametrize("n", [512, 1280])
 def test_v41_narrow_q_a_kv_uniform_split_k_matches_serial_and_replays_graph(capacity, rows, n, monkeypatch):
     import cutlass
@@ -128,7 +132,9 @@ def test_v41_narrow_q_a_kv_uniform_split_k_matches_serial_and_replays_graph(capa
         return value
 
     def compile_for(admitted, sm_count):
-        em = v41_fp8_aot_expected_m(capacity=admitted, input_dim=k, output_dim=n, sm_count=sm_count)
+        em = v41_fp8_aot_expected_m(
+            capacity=admitted, input_dim=k, output_dim=n, sm_count=sm_count, decode=True,
+        )
         assert em == 16
         kernel, actual_slices = compile_dense_gemm_mxfp8_aot(
             size_m=admitted, size_n=n, size_k=k, expected_m=em, sm_count=sm_count,

@@ -1431,10 +1431,10 @@ def test_v41_narrow_q_a_kv_decode_recipe_is_uniform_across_capacities_and_sm120_
         return SimpleNamespace(compiled=compiled)
 
     monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compiler)
-    for capacity in (1, 16, 64, 80):
+    for capacity in (1, 16, 64, 80, 128, 256):
         expected_m = dense_module.v41_fp8_aot_expected_m(
             capacity=capacity, input_dim=5120, output_dim=output_dim,
-            sm_count=sm_count, num_groups=1,
+            sm_count=sm_count, num_groups=1, decode=True,
         )
         assert expected_m == 16
         result, slices = dense_module.compile_dense_gemm_mxfp8_aot(
@@ -1460,7 +1460,7 @@ def test_v41_narrow_q_a_kv_decode_recipe_is_uniform_across_capacities_and_sm120_
     for entry in recorded[1:]:
         assert entry == first
 
-    # Prefill capacities (> 80) and unrelated geometries remain untouched.
+    # Prefill capacities (> 80 with decode=False) and unrelated geometries remain untouched.
     for capacity in (256, 1024, 4096):
         assert dense_module.v41_fp8_aot_expected_m(
             capacity=capacity, input_dim=5120, output_dim=output_dim,

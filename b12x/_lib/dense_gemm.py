@@ -10165,19 +10165,22 @@ def _materialize_dense_fused_quant(lowering, device):
 
 
 def v41_fp8_aot_expected_m(*, capacity: int, input_dim: int, output_dim: int,
-                          sm_count: int, num_groups: int = 1) -> int:
+                          sm_count: int, num_groups: int = 1,
+                          decode: bool = False) -> int:
     """Plan native V4.1 quantization/GEMM scheduling independently of storage.
 
-    Narrow split-K Q-A/KV share one decode/verify recipe across capacities
-    1..80 on all SM120 coordinators (both 170-SM RTX 5090 and 188-SM RTX PRO
-    6000). A declared scheduling regime of 16 selects the subgroup row
+    Narrow split-K Q-A/KV share one decode/verify recipe across all decode/
+    verify capacities (1..256 when ``decode=True``, or capacities <= 80 by
+    default) on all SM120 coordinators (both 170-SM RTX 5090 and 188-SM RTX
+    PRO 6000). A declared scheduling regime of 16 selects the subgroup row
     quantizer and uniform four-partial FP32 split-K GEMM without changing
     runtime row bounds, per-capacity scratch layout, or K32 quantization.
-    Other geometries keep their measured recipes; notably index-Q prefers M1.
+    Prefill buckets (> 80 with ``decode=False``) and other geometries keep
+    their measured recipes unchanged; notably index-Q prefers M1.
     """
     if capacity <= 0:
         raise ValueError('native FP8 capacity must be positive')
-    if (capacity <= 80 and num_groups == 1
+    if ((decode or capacity <= 80) and num_groups == 1
             and input_dim == 5120 and output_dim in (512, 1280)):
         return 16
     return capacity
