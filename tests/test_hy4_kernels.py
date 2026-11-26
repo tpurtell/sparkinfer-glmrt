@@ -1244,3 +1244,182 @@ def test_hy4_mrope_axis_selection_is_bitwise_per_pair():
         cols = [64 + 2 * pair, 65 + 2 * pair]
         expected[:, :, cols] = per_axis[axis][:, :, cols]
     assert torch.equal(mixed, expected)
+
+
+# ---------------------------------------------------------------------------
+# Strict bitwise row-invariance across decode & verify widths (rows 1..64).
+# Every row's output must be bit-identical to running that row alone (rows=1)
+# so DFly2 speculative verification matches drafts-off greedy decoding.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "heads,window,q_lora_rank",
+    [
+        (32, None, 1024),   # Hy4-flash TP1 DSA
+        (64, 512, 1024),    # Hy4-flash TP1 SWA
+        (16, None, 1024),   # Hy4-flash TP2 DSA
+        (32, 512, 1024),    # Hy4-flash TP2 SWA
+        (64, None, 2048),   # Hy4 TP1 DSA
+        (32, None, 2048),   # Hy4 TP2 DSA
+    ],
+)
+def test_hy4_mla_q_absorb_row_invariant_1_to_64(heads: int, window: int | None, q_lora_rank: int):
+    dev = require_b12x()
+    torch.manual_seed(9001 + heads + q_lora_rank)
+    g = Hy4MlaGeometry(heads=heads, q_lora_rank=q_lora_rank, window_size=window, kv_cache="bf16")
+    prog = compile_hy4_mla_q_absorb_aot(g)
+    q_raw = torch.randn(65, heads, 256, dtype=torch.bfloat16, device=dev) * 0.3
+    w_uk = torch.randn(heads, 512, 192, dtype=torch.bfloat16, device=dev) * 0.1
+    inv_freq = (1.0 / (10_000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+    pos = _thw(torch.arange(72, 72 + 65, dtype=torch.int64, device=dev))
+    ref = torch.empty(1, heads, 576, dtype=torch.bfloat16, device=dev)
+    prog.launch(q_raw[:1].contiguous(), w_uk, pos[:1].contiguous(), inv_freq, ref, scalars=(1,))
+    torch.cuda.synchronize()
+    out = torch.empty(65, heads, 576, dtype=torch.bfloat16, device=dev)
+    for rows in list(range(2, 66)):
+        out[:rows].fill_(float("nan"))
+        prog.launch(q_raw[:rows].contiguous(), w_uk, pos[:rows].contiguous(), inv_freq, out[:rows], scalars=(rows,))
+        torch.cuda.synchronize()
+        assert torch.equal(out[0], ref[0]), f"q_absorb H={heads} q_lora={q_lora_rank} diverged at rows={rows}"
+
+
+@pytest.mark.parametrize(
+    "heads,window,q_lora_rank",
+    [
+        (32, None, 1024),   # Hy4-flash TP1 DSA
+        (64, 512, 1024),    # Hy4-flash TP1 SWA
+        (16, None, 1024),   # Hy4-flash TP2 DSA
+        (32, 512, 1024),    # Hy4-flash TP2 SWA
+        (64, None, 2048),   # Hy4 TP1 DSA
+        (32, None, 2048),   # Hy4 TP2 DSA
+    ],
+)
+def test_hy4_mla_sink_gate_uv_row_invariant_1_to_64(heads: int, window: int | None, q_lora_rank: int):
+    dev = require_b12x()
+    torch.manual_seed(9101 + heads + q_lora_rank)
+    g = Hy4MlaGeometry(heads=heads, q_lora_rank=q_lora_rank, window_size=window, kv_cache="bf16")
+    prog = compile_hy4_mla_sink_gate_uv_aot(g)
+    attn = torch.randn(64, heads, 512, dtype=torch.bfloat16, device=dev) * 0.3
+    w_uv = torch.randn(heads, 256, 512, dtype=torch.bfloat16, device=dev) * 0.1
+    gate = torch.randn(64, heads, 256, dtype=torch.bfloat16, device=dev) * 0.5
+    lse = torch.randn(64, heads, dtype=torch.float32, device=dev) * 2.0 + 3.0
+    sink = torch.randn(heads, dtype=torch.float32, device=dev) * 0.5
+    ref = torch.empty(1, heads, 256, dtype=torch.bfloat16, device=dev)
+    prog.launch(attn[:1].contiguous(), w_uv, gate[:1].contiguous(), lse[:1].contiguous(), sink, ref, scalars=(1,))
+    torch.cuda.synchronize()
+    out = torch.empty(64, heads, 256, dtype=torch.bfloat16, device=dev)
+    for rows in range(2, 65):
+        out[:rows].fill_(float("nan"))
+        prog.launch(
+            attn[:rows].contiguous(), w_uv, gate[:rows].contiguous(), lse[:rows].contiguous(), sink, out[:rows],
+            scalars=(rows,),
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out[0], ref[0]), f"sink_gate_uv H={heads} q_lora={q_lora_rank} diverged at rows={rows}"
+
+
+@pytest.mark.parametrize("heads", [64, 32])
+@pytest.mark.parametrize("seq_len", [81, 256, 512])
+def test_hy4_mla_swa_fp8_row_invariant_1_to_64(heads: int, seq_len: int):
+    dev = require_b12x()
+    torch.manual_seed(9201 + heads + seq_len)
+    g = Hy4MlaGeometry(heads=heads, window_size=512, kv_cache="fp8")
+    kv_pages = 10
+    max_kv = kv_pages * 64
+    cache = torch.zeros(kv_pages, 64, 656, dtype=torch.uint8, device=dev)
+    inv_freq = (1.0 / (10_000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+    compile_hy4_mla_rank_norm_pack_aot(g).launch(
+        torch.randn(max_kv, 1024, dtype=torch.bfloat16, device=dev) * 0.2,
+        torch.randn(max_kv, 576, dtype=torch.bfloat16, device=dev) * 0.3,
+        torch.ones(1024, dtype=torch.bfloat16, device=dev),
+        torch.ones(512, dtype=torch.bfloat16, device=dev),
+        torch.arange(max_kv, dtype=torch.int64, device=dev),
+        _thw(torch.arange(max_kv, dtype=torch.int64, device=dev)),
+        inv_freq,
+        torch.empty(max_kv, 1024, dtype=torch.bfloat16, device=dev),
+        cache,
+        scalars=(max_kv,),
+    )
+    prog = compile_hy4_mla_attention_aot(g, max_rows=64, max_context=512, mode="decode", page_size=64)
+    lay = hy4_attention_layout(g, 64, max_context=512, mode="decode")
+    scratch = torch.empty(max(1024, lay["scratch_bytes"]), dtype=torch.uint8, device=dev)
+    q = torch.randn(64, heads, 576, dtype=torch.bfloat16, device=dev) * 0.3
+    pt = torch.arange(kv_pages, dtype=torch.int32, device=dev).unsqueeze(0).contiguous()
+    ref_o = torch.empty(1, heads, 512, dtype=torch.bfloat16, device=dev)
+    ref_l = torch.empty(1, heads, dtype=torch.float32, device=dev)
+    prog.launch(
+        q[:1].contiguous(), cache, pt, torch.tensor([seq_len], dtype=torch.int32, device=dev),
+        torch.tensor([0, 1], dtype=torch.int32, device=dev), ref_o, ref_l, scratch,
+        scalars=(1, 1, kv_pages, lay["num_splits"]),
+    )
+    torch.cuda.synchronize()
+    out_o = torch.empty(64, heads, 512, dtype=torch.bfloat16, device=dev)
+    out_l = torch.empty(64, heads, dtype=torch.float32, device=dev)
+    for rows in range(2, 65):
+        prog.launch(
+            q[:rows].contiguous(), cache, pt, torch.tensor([seq_len + rows - 1], dtype=torch.int32, device=dev),
+            torch.tensor([0, rows], dtype=torch.int32, device=dev), out_o[:rows], out_l[:rows], scratch,
+            scalars=(rows, 1, kv_pages, lay["num_splits"]),
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out_o[0], ref_o[0]), f"swa_fp8 H={heads} L={seq_len} out diverged at rows={rows}"
+        assert torch.equal(out_l[0], ref_l[0]), f"swa_fp8 H={heads} L={seq_len} lse diverged at rows={rows}"
+
+
+@pytest.mark.parametrize(
+    "heads,q_lora_rank",
+    [
+        (32, 1024),   # Hy4-flash TP1 DSA
+        (16, 1024),   # Hy4-flash TP2 DSA
+        (64, 2048),   # Hy4 TP1 DSA
+        (32, 2048),   # Hy4 TP2 DSA
+    ],
+)
+@pytest.mark.parametrize("seq_len", [81, 512, 2048])
+def test_hy4_mla_dsa_fp8_row_invariant_1_to_64(heads: int, q_lora_rank: int, seq_len: int):
+    dev = require_b12x()
+    torch.manual_seed(9301 + heads + q_lora_rank + seq_len)
+    g = Hy4MlaGeometry(heads=heads, q_lora_rank=q_lora_rank, window_size=None, kv_cache="fp8")
+    kv_pages = 32
+    max_kv = kv_pages * 64
+    cache = torch.zeros(kv_pages, 64, 656, dtype=torch.uint8, device=dev)
+    inv_freq = (1.0 / (10_000_000.0 ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+    compile_hy4_mla_rank_norm_pack_aot(g).launch(
+        torch.randn(max_kv, q_lora_rank, dtype=torch.bfloat16, device=dev) * 0.2,
+        torch.randn(max_kv, 576, dtype=torch.bfloat16, device=dev) * 0.3,
+        torch.ones(q_lora_rank, dtype=torch.bfloat16, device=dev),
+        torch.ones(512, dtype=torch.bfloat16, device=dev),
+        torch.arange(max_kv, dtype=torch.int64, device=dev),
+        _thw(torch.arange(max_kv, dtype=torch.int64, device=dev)),
+        inv_freq,
+        torch.empty(max_kv, q_lora_rank, dtype=torch.bfloat16, device=dev),
+        cache,
+        scalars=(max_kv,),
+    )
+    prog = compile_hy4_mla_attention_aot(g, max_rows=64, max_context=2048, mode="decode", page_size=1)
+    lay = hy4_attention_layout(g, 64, max_context=2048, mode="decode")
+    scratch = torch.empty(max(1024, lay["scratch_bytes"]), dtype=torch.uint8, device=dev)
+    q = torch.randn(64, heads, 576, dtype=torch.bfloat16, device=dev) * 0.3
+    pt_row = torch.full((2048,), -1, dtype=torch.int32, device=dev)
+    pt_row[:seq_len] = torch.arange(seq_len, dtype=torch.int32, device=dev)
+    pt = pt_row.unsqueeze(0).expand(64, 2048).contiguous()
+    seqlens = torch.full((64,), seq_len, dtype=torch.int32, device=dev)
+    cu = torch.arange(65, dtype=torch.int32, device=dev)
+    ref_o = torch.empty(1, heads, 512, dtype=torch.bfloat16, device=dev)
+    ref_l = torch.empty(1, heads, dtype=torch.float32, device=dev)
+    prog.launch(
+        q[:1].contiguous(), cache, pt[:1].contiguous(), seqlens[:1].contiguous(), cu[:2].contiguous(),
+        ref_o, ref_l, scratch, scalars=(1, 1, 2048, lay["num_splits"]),
+    )
+    torch.cuda.synchronize()
+    out_o = torch.empty(64, heads, 512, dtype=torch.bfloat16, device=dev)
+    out_l = torch.empty(64, heads, dtype=torch.float32, device=dev)
+    for rows in range(2, 65):
+        prog.launch(
+            q[:rows].contiguous(), cache, pt[:rows].contiguous(), seqlens[:rows].contiguous(), cu[: rows + 1].contiguous(),
+            out_o[:rows], out_l[:rows], scratch, scalars=(rows, rows, 2048, lay["num_splits"]),
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(out_o[0], ref_o[0]), f"dsa_fp8 H={heads} q_lora={q_lora_rank} L={seq_len} out diverged at rows={rows}"
+        assert torch.equal(out_l[0], ref_l[0]), f"dsa_fp8 H={heads} q_lora={q_lora_rank} L={seq_len} lse diverged at rows={rows}"

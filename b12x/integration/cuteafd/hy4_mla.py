@@ -725,7 +725,7 @@ class _Hy4QAbsorbGemvFused:
 
 
 class _Hy4QAbsorbCoalescedMma:
-    """100%-coalesced 128B-cache-line Tensor-Core BF16 GEMM + STACK:0 RoPE for rows 5..64.
+    """100%-coalesced 128B-cache-line Tensor-Core BF16 GEMM + STACK:0 RoPE for rows 1..64.
 
     128 threads (4 warps) own 32 output columns (1024 CTAs for H=64, 512 for H=32).
     All 6 contiguous 128B-line weight loads are issued back-to-back into padded SMEM
@@ -1074,7 +1074,6 @@ class _Hy4QAbsorbMmaFused:
 class _Hy4Tp1QAbsorb:
     def __init__(self, g: Hy4MlaGeometry):
         h = g.heads
-        self.gemv = _Hy4QAbsorbGemvFused(h, g.mrope_section)
         self.mma16 = _Hy4QAbsorbCoalescedMma(heads=h, num_m_tiles=1, mrope_section=g.mrope_section)
         self.mma32 = _Hy4QAbsorbCoalescedMma(heads=h, num_m_tiles=2, mrope_section=g.mrope_section)
         self.mma64 = _Hy4QAbsorbCoalescedMma(heads=h, num_m_tiles=4, mrope_section=g.mrope_section)
@@ -1093,10 +1092,10 @@ class _Hy4Tp1QAbsorb:
         rows: Int32,
         stream: cuda.CUstream,
     ):
+        # Use one uniform m16n8k16 MMA reduction order across all rows 1..4096 so
+        # decode (M=1) and speculative verify (M=2..64) match bitwise.
         if rows > Int32(0):
-            if rows <= Int32(4):
-                self.gemv(q_raw, w_uk, positions, inv_freq, query, rows, stream)
-            elif rows <= Int32(16):
+            if rows <= Int32(16):
                 self.mma16(q_raw, w_uk, positions, inv_freq, query, rows, stream)
             elif rows <= Int32(32):
                 self.mma32(q_raw, w_uk, positions, inv_freq, query, rows, stream)
@@ -1256,7 +1255,7 @@ class _Hy4SinkGateUvGemvFused:
 
 
 class _Hy4SinkGateUvCoalescedMma:
-    """100%-coalesced 256B-line software-pipelined TC BF16 GEMM + fused sink & gate for rows 5..64.
+    """100%-coalesced 256B-line software-pipelined TC BF16 GEMM + fused sink & gate for rows 1..64.
 
     128 threads (4 warps: 2 col-tiles x 2 K-halves) own 16 output columns -> 1024 CTAs (H=64),
     512 CTAs (H=32). Double-buffered sB[2] + software-pipelined 256B contiguous `_ld_stream` loads
@@ -1673,7 +1672,6 @@ class _Hy4SinkGateUvMmaFused:
 class _Hy4Tp1SinkGateUv:
     def __init__(self, g: Hy4MlaGeometry):
         h = g.heads
-        self.gemv = _Hy4SinkGateUvGemvFused(h)
         self.mma16 = _Hy4SinkGateUvCoalescedMma(heads=h, num_m_tiles=1)
         self.mma32 = _Hy4SinkGateUvCoalescedMma(heads=h, num_m_tiles=2)
         self.mma64 = _Hy4SinkGateUvCoalescedMma(heads=h, num_m_tiles=4)
@@ -1691,10 +1689,10 @@ class _Hy4Tp1SinkGateUv:
         rows: Int32,
         stream: cuda.CUstream,
     ):
+        # Use one uniform 2-way K-split m16n8k16 MMA reduction order across all
+        # decode/verify widths (rows 1..64) so decode and verify match bitwise.
         if rows > Int32(0):
-            if rows <= Int32(4):
-                self.gemv(attn, w_uv, gate, lse, sink, out, rows, stream)
-            elif rows <= Int32(16):
+            if rows <= Int32(16):
                 self.mma16(attn, w_uv, gate, lse, sink, out, rows, stream)
             elif rows <= Int32(32):
                 self.mma32(attn, w_uv, gate, lse, sink, out, rows, stream)
@@ -3374,9 +3372,12 @@ class _Hy4Attention:
         if self.use_fast_fp8:
             self.has_h32 = (g.heads >= 32 and g.heads % 32 == 0)
             self.has_swa_2wg = (self.page_size == 64 and self.splits == 1 and g.heads % 8 == 0)
-            self.fwd_h16 = _Hy4Fp8MlaForward(
-                num_heads=g.heads, hpb=16, bi=32, page_size=self.page_size,
-                window_size=g.window_size, max_splits=self.splits,
+            self.fwd_h16 = (
+                _Hy4Fp8MlaForward(
+                    num_heads=g.heads, hpb=16, bi=32, page_size=self.page_size,
+                    window_size=g.window_size, max_splits=self.splits,
+                )
+                if (self.page_size != 1 or not self.has_h32) else None
             )
             self.fwd_h32 = (
                 _Hy4Fp8MlaForward(
@@ -3460,71 +3461,40 @@ class _Hy4Attention:
         if cutlass.const_expr(self.use_fast_fp8):
             if rows > Int32(0):
                 if cutlass.const_expr(self.page_size == 1):
-                    # DSA selected-token gather: dynamic split-K + hpb=16/32 dispatch from runtime SM count.
-                    sm_count = runtime_num_sm()
-                    h16_tiles: cutlass.Constexpr = g.heads // 16
+                    # DSA selected-token gather: one row- and SM-count-invariant kernel
+                    # and split count across all decode/verify widths (rows 1..64).
+                    # Honors active_splits (16 in decode/verify, 1 in prefill).
+                    eff = active_splits
+                    if eff > Int32(self.splits):
+                        eff = Int32(self.splits)
+                    if eff < Int32(1):
+                        eff = Int32(1)
                     if cutlass.const_expr(self.has_h32):
-                        h32_tiles: cutlass.Constexpr = g.heads // 32
-                        if rows * Int32(h16_tiles * self.splits) <= sm_count:
-                            eff = Int32(self.splits)
-                            self.fwd_h16(
-                                query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
-                                scale_log2, page_table_width, rows, batch, eff, stream,
-                            )
-                            if cutlass.const_expr(self.splits > 1):
-                                if eff > Int32(1):
-                                    self.merge(po, pl, out, lse_out, eff, stream)
-                        else:
-                            max_chunks_32: cutlass.Constexpr = (self.max_context + 31) // 32
-                            max_s = sm_count // (rows * Int32(h32_tiles))
-                            if max_s > Int32(self.splits):
-                                max_s = Int32(self.splits)
-                            if max_s < Int32(1):
-                                max_s = Int32(1)
-                            cps = (Int32(max_chunks_32) + max_s - Int32(1)) // max_s
-                            eff = (Int32(max_chunks_32) + cps - Int32(1)) // cps
-                            if eff > Int32(self.splits):
-                                eff = Int32(self.splits)
-                            if eff < Int32(1):
-                                eff = Int32(1)
-                            self.fwd_h32(
-                                query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
-                                scale_log2, page_table_width, rows, batch, eff, stream,
-                            )
-                            if cutlass.const_expr(self.splits > 1):
-                                if eff > Int32(1):
-                                    self.merge(po, pl, out, lse_out, eff, stream)
+                        self.fwd_h32(
+                            query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
+                            scale_log2, page_table_width, rows, batch, eff, stream,
+                        )
                     else:
-                        max_chunks_32: cutlass.Constexpr = (self.max_context + 31) // 32
-                        max_s = sm_count // (rows * Int32(h16_tiles))
-                        if max_s > Int32(self.splits):
-                            max_s = Int32(self.splits)
-                        if max_s < Int32(1):
-                            max_s = Int32(1)
-                        cps = (Int32(max_chunks_32) + max_s - Int32(1)) // max_s
-                        eff = (Int32(max_chunks_32) + cps - Int32(1)) // cps
-                        if eff > Int32(self.splits):
-                            eff = Int32(self.splits)
-                        if eff < Int32(1):
-                            eff = Int32(1)
                         self.fwd_h16(
                             query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
                             scale_log2, page_table_width, rows, batch, eff, stream,
                         )
-                        if cutlass.const_expr(self.splits > 1):
-                            if eff > Int32(1):
-                                self.merge(po, pl, out, lse_out, eff, stream)
+                    if cutlass.const_expr(self.splits > 1):
+                        if eff > Int32(1):
+                            self.merge(po, pl, out, lse_out, eff, stream)
                 else:
                     # SWA-512 (page_size=64): decode (splits>1) or extend (splits=1).
                     h8_tiles: cutlass.Constexpr = g.heads // 8
                     h16_tiles: cutlass.Constexpr = g.heads // 16
                     if cutlass.const_expr(self.splits > 1):
-                        # swa_decode: split-K for tiny rows (1..4), single-pass above.
-                        eff = Int32(1)
-                        if rows == Int32(1):
-                            eff = Int32(self.splits)
-                        elif rows <= Int32(4):
-                            eff = Int32(4) if cutlass.const_expr(self.splits >= 4) else Int32(self.splits)
+                        # swa_decode: one fixed split-K (4) across every decode/verify width
+                        # (rows 1..64) so decode and verify share one reduction order.
+                        max_swa_splits: cutlass.Constexpr = 4 if self.splits >= 4 else self.splits
+                        eff = active_splits
+                        if eff > Int32(max_swa_splits):
+                            eff = Int32(max_swa_splits)
+                        if eff < Int32(1):
+                            eff = Int32(1)
                         self.fwd_h16(
                             query, kv_cache, table, lengths, cu, out, lse_out, po, pl,
                             scale_log2, page_table_width, rows, batch, eff, stream,
