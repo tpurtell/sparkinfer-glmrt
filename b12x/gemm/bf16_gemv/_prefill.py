@@ -119,6 +119,9 @@ class Bf16PrefillKernel:
         ``tile_k`` widens the pipelined K step (default 64); the K tiles run in
         increasing order either way, so the per-element accumulation order and
         its bits do not depend on it.
+        ``split_k`` partitions K into equal contiguous groups, writes FP32
+        partials in [split,live_rows,N] order, and leaves the reduction to
+        the caller. The default one-part route is unchanged.
         """
         self.warp_layout = None
         if compute_warps is not None:
@@ -252,8 +255,8 @@ class Bf16PrefillKernel:
         if const_expr(output.element_type not in (cutlass.Float32, cutlass.BFloat16)):
             raise TypeError("output must be Float32 or BFloat16")
 
-        if const_expr(self.split_k > 1 and output.element_type != cutlass.Float32):
-            raise TypeError("split-K partials must be Float32")
+        if const_expr(self.split_k > 1 and (output.element_type != cutlass.Float32 or channel_scales is not None)):
+            raise TypeError("split-K partials must be unscaled Float32")
         sA_layout, sB_layout = self._get_smem_layouts()
         tiled_mma = self._get_tiled_mma()
         SharedStorage = self._get_shared_storage_cls(sA_layout, sB_layout)
@@ -550,16 +553,17 @@ class Bf16PrefillKernel:
             if const_expr(self.k_unroll > 1):
                 prod_unroll = min(self.k_unroll, self.k_tiles)
                 for k_tile in cutlass.range(self.k_tiles, unroll=prod_unroll):
+                    source_k = k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile
                     load_pipeline.producer_acquire(producer_state)
                     cute.copy(
                         tma_atom_A,
-                        tAgA[(None, m_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
+                        tAgA[(None, m_tile, source_k)],
                         tAsA[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
                     cute.copy(
                         tma_atom_B,
-                        tBgB[(None, n_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
+                        tBgB[(None, n_tile, source_k)],
                         tBsB[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
@@ -567,16 +571,17 @@ class Bf16PrefillKernel:
                     producer_state.advance()
             else:
                 for k_tile in cutlass.range(self.k_tiles, unroll_full=self.unroll_k):
+                    source_k = k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile
                     load_pipeline.producer_acquire(producer_state)
                     cute.copy(
                         tma_atom_A,
-                        tAgA[(None, m_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
+                        tAgA[(None, m_tile, source_k)],
                         tAsA[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
                     cute.copy(
                         tma_atom_B,
-                        tBgB[(None, n_tile, k_tile + k_part * self.k_tiles if const_expr(self.split_k > 1) else k_tile)],
+                        tBgB[(None, n_tile, source_k)],
                         tBsB[(None, producer_state.index)],
                         tma_bar_ptr=load_pipeline.producer_get_barrier(producer_state),
                     )
