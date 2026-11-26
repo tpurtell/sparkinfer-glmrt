@@ -26,8 +26,9 @@ import cutlass.cute as cute
 import torch
 from cutlass import Int32, Int64
 
-from ._common import INKLING2_SMALL, Inkling2Geometry, Operand, Scalar, compile_program
+from ._common import INKLING2_MINI, INKLING2_SMALL, Inkling2Geometry, Operand, Scalar, compile_program
 from ._inkling2_kernels import InklingGqaAttention, InklingSplitMerge
+from ._inkling2_mini_prefill import InklingMiniGlobalFp8Prefill, InklingMiniLocalBf16Prefill
 from ._mimo_kernels import MAX_SPLITS, MimoRingCommit
 
 __all__ = [
@@ -75,14 +76,29 @@ def attention_scratch_bytes(g: Inkling2Geometry, kind: str, route: str, rows: in
     return _ALIGN
 
 
+def _is_inkling2_mini_geometry(g: Inkling2Geometry) -> bool:
+    return (
+        g.heads == INKLING2_MINI.heads
+        and g.kv_heads == INKLING2_MINI.kv_heads
+        and g.head_dim == INKLING2_MINI.head_dim
+        and g.window == INKLING2_MINI.window
+        and g.rel_extent == INKLING2_MINI.rel_extent
+        and g.ring_rows == INKLING2_MINI.ring_rows
+        and g.page_rows == INKLING2_MINI.page_rows
+    )
+
+
 class _GlobalAttention:
     def __init__(self, g: Inkling2Geometry, route: str, max_splits: int, kv_format: str):
         self.g, self.route = g, route
         decode = route == "decode"
-        self.attn = InklingGqaAttention(
-            heads=g.heads, kv_heads=g.kv_heads, tokens=1 if decode else prefill_tokens(g), window=0, paged=True,
-            extent=g.extent("global"), softmax_scale=g.softmax_scale, direct=not decode, page_rows=g.page_rows,
-            ring_rows=g.ring_rows, kv_format=kv_format)
+        if not decode and kv_format == "fp8" and _is_inkling2_mini_geometry(g):
+            self.attn = InklingMiniGlobalFp8Prefill(softmax_scale=g.softmax_scale)
+        else:
+            self.attn = InklingGqaAttention(
+                heads=g.heads, kv_heads=g.kv_heads, tokens=1 if decode else prefill_tokens(g), window=0, paged=True,
+                extent=g.extent("global"), softmax_scale=g.softmax_scale, direct=not decode, page_rows=g.page_rows,
+                ring_rows=g.ring_rows, kv_format=kv_format)
         self.merge = InklingSplitMerge(heads=g.heads, v_head=g.head_dim) if decode else None
         self.max_splits = int(max_splits)
 
@@ -132,10 +148,13 @@ class _GlobalAttentionPrefill(_GlobalAttention):
 class _LocalAttention:
     def __init__(self, g: Inkling2Geometry, route: str):
         self.g, self.route = g, route
-        self.attn = InklingGqaAttention(
-            heads=g.heads, kv_heads=g.kv_heads, tokens=1 if route == "decode" else prefill_tokens(g),
-            window=g.window, paged=False, extent=g.extent("local"), softmax_scale=g.softmax_scale, direct=True,
-            page_rows=g.page_rows, ring_rows=g.ring_rows)
+        if route == "prefill" and _is_inkling2_mini_geometry(g):
+            self.attn = InklingMiniLocalBf16Prefill(softmax_scale=g.softmax_scale)
+        else:
+            self.attn = InklingGqaAttention(
+                heads=g.heads, kv_heads=g.kv_heads, tokens=1 if route == "decode" else prefill_tokens(g),
+                window=g.window, paged=False, extent=g.extent("local"), softmax_scale=g.softmax_scale, direct=True,
+                page_rows=g.page_rows, ring_rows=g.ring_rows)
         self.commit = MimoRingCommit(record=g.record_elems, ring_rows=g.ring_rows, record_bytes=record_bytes(g))
 
     def key(self) -> tuple:
