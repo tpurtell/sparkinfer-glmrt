@@ -6157,11 +6157,12 @@ def compile_dense_gemm_mxfp8_aot(
     # Native V4.1 query-A/KV expose only 20/8 output CTAs on SM120
     # coordinators (both 170-SM RTX 5090 and 188-SM RTX PRO 6000). Four FP32
     # partial planes shorten the K loop without changing the K32
-    # activation/weight contract. Geometry and decode/verify regime (<=80)
-    # select one uniform split-K recipe across every decode/verify capacity
-    # (1/16/64/80) so batched speculation stays bitwise row-invariant.
+    # activation/weight contract. Decode/verify capacities (1..256) request
+    # expected_m=16 via v41_fp8_aot_expected_m(..., decode=True) so every
+    # decode/verify bucket shares one uniform split-K recipe across SM120 cards
+    # while prefill buckets (64/256/1024/4096 with decode=False) keep split_k=1.
     narrow_v41_split = (
-        num_groups == 1 and regime_m <= 80
+        num_groups == 1 and regime_m <= 16
         and size_k == 5120 and size_n in (512, 1280)
     )
     if narrow_v41_split:
@@ -10170,17 +10171,17 @@ def v41_fp8_aot_expected_m(*, capacity: int, input_dim: int, output_dim: int,
     """Plan native V4.1 quantization/GEMM scheduling independently of storage.
 
     Narrow split-K Q-A/KV share one decode/verify recipe across all decode/
-    verify capacities (1..256 when ``decode=True``, or capacities <= 80 by
+    verify capacities (1..256 when ``decode=True``, or capacities <= 16 by
     default) on all SM120 coordinators (both 170-SM RTX 5090 and 188-SM RTX
     PRO 6000). A declared scheduling regime of 16 selects the subgroup row
     quantizer and uniform four-partial FP32 split-K GEMM without changing
     runtime row bounds, per-capacity scratch layout, or K32 quantization.
-    Prefill buckets (> 80 with ``decode=False``) and other geometries keep
-    their measured recipes unchanged; notably index-Q prefers M1.
+    Prefill buckets (64/256/1024/4096 with ``decode=False``) and other
+    geometries keep their measured recipes unchanged; notably index-Q prefers M1.
     """
     if capacity <= 0:
         raise ValueError('native FP8 capacity must be positive')
-    if ((decode or capacity <= 80) and num_groups == 1
+    if ((decode or capacity <= 16) and num_groups == 1
             and input_dim == 5120 and output_dim in (512, 1280)):
         return 16
     return capacity

@@ -1460,11 +1460,11 @@ def test_v41_narrow_q_a_kv_decode_recipe_is_uniform_across_capacities_and_sm120_
     for entry in recorded[1:]:
         assert entry == first
 
-    # Prefill capacities (> 80 with decode=False) and unrelated geometries remain untouched.
-    for capacity in (256, 1024, 4096):
+    # Prefill capacities (64/256/1024/4096 with decode=False) and unrelated geometries remain untouched.
+    for capacity in (64, 256, 1024, 4096):
         assert dense_module.v41_fp8_aot_expected_m(
             capacity=capacity, input_dim=5120, output_dim=output_dim,
-            sm_count=sm_count, num_groups=1,
+            sm_count=sm_count, num_groups=1, decode=False,
         ) == capacity
         _, slices = dense_module.compile_dense_gemm_mxfp8_aot(
             size_m=capacity, size_n=output_dim, size_k=5120,
