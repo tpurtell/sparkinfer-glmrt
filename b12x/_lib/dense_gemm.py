@@ -6154,12 +6154,14 @@ def compile_dense_gemm_mxfp8_aot(
     # Match the grouped WO-A schedule, with all live row counts passed to
     # the exported launch at runtime. Group count is static model geometry.
     mma_tiler_mn = plan.mma_tiler_mn
-    # Native V4.1 query-A/KV expose only 20/8 output CTAs on the 188-SM
-    # coordinator. Four FP32 partial planes shorten the K loop without
-    # changing the K32 activation/weight contract. Capacity, not live M,
-    # selects this recipe; larger reservations and other devices stay intact.
+    # Native V4.1 query-A/KV expose only 20/8 output CTAs on SM120
+    # coordinators (both 170-SM RTX 5090 and 188-SM RTX PRO 6000). Four FP32
+    # partial planes shorten the K loop without changing the K32
+    # activation/weight contract. Geometry and decode/verify regime (<=80)
+    # select one uniform split-K recipe across every decode/verify capacity
+    # (1/16/64/80) so batched speculation stays bitwise row-invariant.
     narrow_v41_split = (
-        sm_count == 188 and num_groups == 1 and regime_m in (1, 16)
+        num_groups == 1 and regime_m <= 80
         and size_k == 5120 and size_n in (512, 1280)
     )
     if narrow_v41_split:
@@ -6186,7 +6188,15 @@ def compile_dense_gemm_mxfp8_aot(
         expected_m=regime_m,
     )
     if narrow_v41_split:
-        policy = replace(policy, split_k_slices=4, split_k_atomic_bf16=False)
+        policy = replace(
+            policy,
+            single_work_tile_per_cta=True,
+            direct_one_m_tile_scheduler=True,
+            use_m1_non_tma=False,
+            split_k_slices=4,
+            split_k_atomic_bf16=False,
+        )
+        split_k_all_m = True
     if policy.split_k_slices != 1 and not return_split_k_metadata:
         raise ValueError(
             "MXFP8 AOT standalone export does not support split-K: "
@@ -10158,15 +10168,16 @@ def v41_fp8_aot_expected_m(*, capacity: int, input_dim: int, output_dim: int,
                           sm_count: int, num_groups: int = 1) -> int:
     """Plan native V4.1 quantization/GEMM scheduling independently of storage.
 
-    On the 188-SM RTX, narrow split-K Q-A/KV are faster with the general TMA
-    scheduler and subgroup row quantizer than the special M1 paths. A declared
-    scheduling regime of 16 selects both without changing the runtime row bound,
-    one-row scratch layout, K32 quantization, or four-partial FP32 reduction.
+    Narrow split-K Q-A/KV share one decode/verify recipe across capacities
+    1..80 on all SM120 coordinators (both 170-SM RTX 5090 and 188-SM RTX PRO
+    6000). A declared scheduling regime of 16 selects the subgroup row
+    quantizer and uniform four-partial FP32 split-K GEMM without changing
+    runtime row bounds, per-capacity scratch layout, or K32 quantization.
     Other geometries keep their measured recipes; notably index-Q prefers M1.
     """
     if capacity <= 0:
         raise ValueError('native FP8 capacity must be positive')
-    if (capacity == 1 and sm_count == 188 and num_groups == 1
+    if (capacity <= 80 and num_groups == 1
             and input_dim == 5120 and output_dim in (512, 1280)):
         return 16
     return capacity

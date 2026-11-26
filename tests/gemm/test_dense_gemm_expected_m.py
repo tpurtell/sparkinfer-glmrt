@@ -1416,6 +1416,67 @@ def test_aot_all_m_rejects_non_direct_recipe(monkeypatch):
             return_split_k_metadata=True, split_k_all_m=True)
 
 
+@pytest.mark.parametrize("output_dim", (512, 1280))
+@pytest.mark.parametrize("sm_count", (170, HIGH_SM))
+def test_v41_narrow_q_a_kv_decode_recipe_is_uniform_across_capacities_and_sm120_cards(
+    output_dim: int, sm_count: int, monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    recorded = []
+    compiled = object()
+
+    def compiler(**kwargs):
+        recorded.append(kwargs)
+        return SimpleNamespace(compiled=compiled)
+
+    monkeypatch.setattr(dense_module, "_get_compiled_dense_gemm", compiler)
+    for capacity in (1, 16, 64, 80):
+        expected_m = dense_module.v41_fp8_aot_expected_m(
+            capacity=capacity, input_dim=5120, output_dim=output_dim,
+            sm_count=sm_count, num_groups=1,
+        )
+        assert expected_m == 16
+        result, slices = dense_module.compile_dense_gemm_mxfp8_aot(
+            size_m=capacity, size_n=output_dim, size_k=5120,
+            expected_m=expected_m, sm_count=sm_count,
+            device=torch.device("cuda"), return_split_k_metadata=True,
+            split_k_all_m=True,
+        )
+        assert result is compiled
+        assert slices == 4
+    first = dict(recorded[0])
+    assert first["mma_tiler_mn"] == (16, 64)
+    assert first["tile_k"] == 128
+    assert first["split_k_all_m"] is True
+    assert first["policy"] == _DenseGemmPolicy(
+        single_work_tile_per_cta=True,
+        direct_one_m_tile_scheduler=True,
+        use_m1_non_tma=False,
+        split_k_slices=4,
+        split_k_atomic_bf16=False,
+        large_m_unroll=False,
+    )
+    for entry in recorded[1:]:
+        assert entry == first
+
+    # Prefill capacities (> 80) and unrelated geometries remain untouched.
+    for capacity in (256, 1024, 4096):
+        assert dense_module.v41_fp8_aot_expected_m(
+            capacity=capacity, input_dim=5120, output_dim=output_dim,
+            sm_count=sm_count, num_groups=1,
+        ) == capacity
+        _, slices = dense_module.compile_dense_gemm_mxfp8_aot(
+            size_m=capacity, size_n=output_dim, size_k=5120,
+            expected_m=capacity, sm_count=sm_count,
+            device=torch.device("cuda"), return_split_k_metadata=True,
+        )
+        assert slices == 1
+    assert dense_module.v41_fp8_aot_expected_m(
+        capacity=1, input_dim=1280, output_dim=4096, sm_count=sm_count, num_groups=1,
+    ) == 1
+
+
 def test_dense_compile_key_covers_atom_shape_environment(monkeypatch):
     monkeypatch.setattr(dense_module, "_B12X_DENSE_ATOM_24", False)
     atom_42 = _bk64_launch()

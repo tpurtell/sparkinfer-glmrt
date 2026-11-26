@@ -95,3 +95,99 @@ def test_m1_recipe_all_m_matches_serial_and_old_grid_drops_rows(capacity, rows, 
     torch.cuda.synchronize()
     assert torch.cuda.memory_allocated() == allocated
     assert torch.equal(folded(replay_partial).view(torch.uint8), replay_expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("capacity,rows", [(16, 2), (16, 16), (64, 17), (64, 32), (64, 64), (80, 17), (80, 80)])
+@pytest.mark.parametrize("n", [512, 1280])
+def test_v41_narrow_q_a_kv_uniform_split_k_matches_serial_and_replays_graph(capacity, rows, n, monkeypatch):
+    import cutlass
+    import cutlass.cute as cute
+    import cuda.bindings.driver as cuda
+    from cutlass.cute.runtime import make_ptr
+    from b12x._lib.dense_gemm import compile_dense_gemm_mxfp8_aot, v41_fp8_aot_expected_m
+    from b12x._lib.quant.mxfp8_rows import quantize_mxfp8_rows_cute
+    from b12x.gemm._shared.wo_mxfp8 import empty_mxfp8_rows_for_dense_gemm
+
+    device = require_b12x()
+    k = 5120
+    torch.manual_seed(41200 + rows + n)
+    x = torch.randn((rows, k), device=device, dtype=torch.bfloat16)
+    w = (torch.randn((n, k), device=device) / 16).to(torch.float8_e4m3fn)
+    scale = torch.full((n // 32, k // 32), 127, device=device, dtype=torch.uint8).view(torch.float8_e8m0fnu)
+    weight = pack_block_fp8_linear_weight_mxfp8(w, scale, block_size=(32, 32)).weight
+    alpha = torch.ones(1, device=device)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    def pointer(dtype, tensor):
+        return make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    def packed(source):
+        value = empty_mxfp8_rows_for_dense_gemm(source.shape[0], k, num_groups=1, device=device)
+        quantize_mxfp8_rows_cute(source, value.values, value.scale_rows, value.scale_mma,
+                               scale_block_size=32, amax_floor=1e-4, expected_m=16)
+        return value
+
+    def compile_for(admitted, sm_count):
+        em = v41_fp8_aot_expected_m(capacity=admitted, input_dim=k, output_dim=n, sm_count=sm_count)
+        assert em == 16
+        kernel, actual_slices = compile_dense_gemm_mxfp8_aot(
+            size_m=admitted, size_n=n, size_k=k, expected_m=em, sm_count=sm_count,
+            return_split_k_metadata=True, split_k_all_m=True)
+        assert actual_slices == 4
+        return kernel
+
+    batched = compile_for(capacity, 188)
+    serial = compile_for(1, 188)
+    batched_sm170 = compile_for(capacity, 170)
+
+    def arguments(value, partial):
+        return (pointer(cutlass.Float8E4M3FN, value.values),
+                pointer(cutlass.Float8E4M3FN, weight.values),
+                pointer(cutlass.Float8E8M0FNU, value.scale_mma),
+                pointer(cutlass.Float8E8M0FNU, weight.scale_mma),
+                pointer(cutlass.Float32, partial),
+                pointer(cutlass.Float8E4M3FN, value.values),
+                pointer(cutlass.Float8E8M0FNU, value.scale_rows),
+                pointer(cutlass.Float8E8M0FNU, value.scale_mma), pointer(cutlass.Float32, alpha))
+
+    def folded(partial):
+        # Match cuteafd_v41_fp8_reduce_splits ascending FP32 plane fold.
+        return (((partial[0] + partial[1]) + partial[2]) + partial[3]).bfloat16()
+
+    def launch(kernel, source):
+        value = packed(source)
+        partial = torch.full((4, source.shape[0], n), float("nan"), device=device, dtype=torch.float32)
+        kernel(*arguments(value, partial), source.shape[0], stream)
+        return partial, folded(partial)
+
+    partial, actual = launch(batched, x)
+    partial_sm170, actual_sm170 = launch(batched_sm170, x)
+    expected = torch.cat([launch(serial, x[i:i + 1])[1] for i in range(rows)])
+    assert torch.isfinite(partial).all() and torch.isfinite(partial_sm170).all()
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(actual_sm170.view(torch.uint8), expected.view(torch.uint8))
+
+    value = packed(x)
+    replay_partial = torch.empty_like(partial)
+    replay_args = arguments(value, replay_partial)
+    batched(*replay_args, rows, stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        batched(*replay_args, rows, cuda.CUstream(capture_stream.cuda_stream))
+    x.mul_(-0.5)
+    quantize_mxfp8_rows_cute(x, value.values, value.scale_rows, value.scale_mma,
+                           scale_block_size=32, amax_floor=1e-4, expected_m=16)
+    replay_expected = torch.cat([launch(serial, x[i:i + 1])[1] for i in range(rows)])
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("frozen replay must not resolve or compile a kernel")
+    monkeypatch.setattr("b12x._lib.dense_gemm._get_compiled_dense_gemm", forbidden)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    assert torch.equal(folded(replay_partial).view(torch.uint8), replay_expected.view(torch.uint8))
