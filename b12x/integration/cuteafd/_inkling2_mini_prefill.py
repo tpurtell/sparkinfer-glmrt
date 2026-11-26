@@ -17,7 +17,9 @@ Design summary (Round 3):
   same-sequence tokens (126 live M-rows) clamped at ``seq_first``. Because
   pairing depends solely on each sequence's own ``seq_first``, packed batches
   (including odd-tile packs like ``4x1024``) are bit-identical to standalone
-  runs and row-count invariance holds by construction.
+  runs and paired-tile selection is row-count invariant. Partial tail tiles
+  can change bias-path selection and key-tile count, so output bytes are not
+  guaranteed invariant under a shortened live row count.
 - **256 threads (8 active warps/CTA, 1 CTA/SM, 0 idle warps, up to 255 regs):**
   Halves KV L2 reads and FP8 K/V widening work per SM compared to M=64, while
   keeping all 8 warps (2 warps per SM sub-partition) busy on QK MMA, relative
