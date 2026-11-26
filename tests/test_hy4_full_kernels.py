@@ -140,8 +140,49 @@ def test_hy4_ihc_6144_oracle(rows: int):
     prog_pre.launch(r_after, fn, scale, base, norm, post_seq, y_seq, scalars=(rows,))
     torch.cuda.synchronize()
     assert torch.equal(r_pp, r_after)
-    assert torch.allclose(post_pp, post_seq, atol=1e-5, rtol=1e-5)
+    assert torch.equal(post_pp, post_seq)
     assert torch.equal(y_pp, y_seq)
+
+    # Row invariance: every row in a multi-row launch must be bit-identical to an M=1 launch.
+    if rows > 1:
+        post_1 = torch.empty(1, 4, dtype=torch.float32, device=dev)
+        y_1 = torch.empty(1, h, dtype=torch.bfloat16, device=dev)
+        r_1 = torch.empty(1, 4, h, dtype=torch.bfloat16, device=dev)
+        for idx in (0, rows // 2, rows - 1):
+            prog_pre.launch(
+                r[idx : idx + 1].contiguous(), fn, scale, base, norm, post_1, y_1, scalars=(1,)
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(post_out[idx : idx + 1], post_1)
+            assert torch.equal(y_out[idx : idx + 1], y_1)
+
+            prog_post.launch(
+                delta[idx : idx + 1].contiguous(),
+                r[idx : idx + 1].contiguous(),
+                post_ref[idx : idx + 1].contiguous(),
+                r_1,
+                scalars=(1,),
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(r_after[idx : idx + 1], r_1)
+
+            prog_pp.launch(
+                delta[idx : idx + 1].contiguous(),
+                r[idx : idx + 1].contiguous(),
+                post_ref[idx : idx + 1].contiguous(),
+                fn,
+                scale,
+                base,
+                norm,
+                r_1,
+                post_1,
+                y_1,
+                scalars=(1,),
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(r_pp[idx : idx + 1], r_1)
+            assert torch.equal(post_pp[idx : idx + 1], post_1)
+            assert torch.equal(y_pp[idx : idx + 1], y_1)
 
     hfn = torch.randn(4, 4 * h, dtype=torch.float32, device=dev) * 0.015
     hscale = torch.tensor([0.5], dtype=torch.float32, device=dev)

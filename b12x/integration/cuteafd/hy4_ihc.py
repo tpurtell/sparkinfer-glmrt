@@ -74,6 +74,7 @@ _TILE_H = 64  # 3072 / 64 = 48 tiles; 8 elems/lane -> 128-bit v4.u32 coalesced I
 _BM2_BLOCK_M = 2
 _MED_BLOCK_M = 4
 _PREFILL_BLOCK_M = 32
+_PREFILL_CHUNK_ROWS_6144 = 512  # 512 * 4 * 6144 * 2 = 24 MiB -> residual_out stays L2-resident across partial->finalize
 _FINALIZE_THREADS = 384
 
 
@@ -955,23 +956,26 @@ class _Hy4IhcNormPostPreOneTokPartialKernel:
 
 
 class _Hy4IhcFinalizeKernel:
-    """Single-CTA-per-token 384-thread vectorized finalize: reduce 48 partials + collapse + RMSNorm.
+    """Single-CTA-per-token vectorized finalize: reduce tiled partials + collapse + RMSNorm.
 
-    Each thread owns 8 contiguous BF16 elements (1 x ld/st_global_v4_u32).
+    Each thread owns 8 contiguous BF16 elements (1 x ld/st_global_v4_u32):
+    384 threads for H=3072 (48 tiles) and 768 threads for H=6144 (96 tiles).
     Preloads immutable weights (norm, scale, base) before griddepcontrol_wait(), reduces
-    transposed [9, 48] partials from y_out in parallel across warps 0..8 (1.5 loads/lane),
+    transposed [9, num_tiles] partials from y_out in parallel across warps 0..8,
     computes pre[0..3] and post[0..3] in parallel at 1-exp latency, rounds collapsed to BF16
     before RMSNorm (exact checkpoint numerics), and overwrites y_out after sync_threads().
     """
 
-    def __init__(self, g: Hy4IhcGeometry, *, num_tiles: int, use_pdl: bool):
+    def __init__(self, g: Hy4IhcGeometry, *, num_tiles: int, use_pdl: bool, r_evict_first: bool = False):
         self.hidden = g.hidden
         self.rms_eps = float(g.rms_eps)
         self.hc_eps = float(g.hc_eps)
         self.hc_magnitude = float(g.hc_magnitude)
         self.num_tiles = int(num_tiles)
         self.use_pdl = bool(use_pdl)
-        self.warps = _FINALIZE_THREADS // 32
+        self.r_evict_first = bool(r_evict_first)
+        self.threads = g.hidden // 8
+        self.warps = self.threads // 32
 
     def _storage(self):
         warps = self.warps
@@ -1006,7 +1010,7 @@ class _Hy4IhcFinalizeKernel:
             Int64(y_out.toint()),
         ).launch(
             grid=(rows, 1, 1),
-            block=(_FINALIZE_THREADS, 1, 1),
+            block=(self.threads, 1, 1),
             use_pdl=self.use_pdl,
             stream=stream,
         )
@@ -1054,22 +1058,40 @@ class _Hy4IhcFinalizeKernel:
                 if lane < Int32(16):
                     v = v + _ld_global_f32_ordered(p_base + Int64(32 * 4))
                 v = _warp_sum(v)
+            elif const_expr(self.num_tiles == 96):
+                p_base = y_tok + (Int64(warp) * Int64(96) + Int64(lane)) * Int64(4)
+                v = (
+                    _ld_global_f32_ordered(p_base)
+                    + _ld_global_f32_ordered(p_base + Int64(32 * 4))
+                    + _ld_global_f32_ordered(p_base + Int64(64 * 4))
+                )
+                v = _warp_sum(v)
             else:
                 v = Float32(0.0)
-                if lane < Int32(self.num_tiles):
-                    v = _ld_global_f32_ordered(
-                        y_tok + (Int64(warp) * Int64(self.num_tiles) + Int64(lane)) * Int64(4)
-                    )
+                chunks = (self.num_tiles + 31) // 32
+                for c in cutlass.range_constexpr(chunks):
+                    idx = Int32(c * 32) + lane
+                    if idx < Int32(self.num_tiles):
+                        v = v + _ld_global_f32_ordered(
+                            y_tok + (Int64(warp) * Int64(self.num_tiles) + Int64(idx)) * Int64(4)
+                        )
                 v = _warp_sum(v)
             if lane == Int32(0):
                 s_totals[warp] = v
 
         # Issue all 4 residual stream 128-bit loads in parallel before the first barrier.
         r_base = src_r_addr + (tok * Int64(4 * h) + h_off) * Int64(2)
-        r0_0, r0_1, r0_2, r0_3 = ld_global_v4_u32(r_base)
-        r1_0, r1_1, r1_2, r1_3 = ld_global_v4_u32(r_base + Int64(h * 2))
-        r2_0, r2_1, r2_2, r2_3 = ld_global_v4_u32(r_base + Int64(2 * h * 2))
-        r3_0, r3_1, r3_2, r3_3 = ld_global_v4_u32(r_base + Int64(3 * h * 2))
+        if const_expr(self.r_evict_first):
+            evict_r = create_l2_evict_first_policy()
+            r0_0, r0_1, r0_2, r0_3 = _ld_global_v4_u32_l2hint(r_base, evict_r)
+            r1_0, r1_1, r1_2, r1_3 = _ld_global_v4_u32_l2hint(r_base + Int64(h * 2), evict_r)
+            r2_0, r2_1, r2_2, r2_3 = _ld_global_v4_u32_l2hint(r_base + Int64(2 * h * 2), evict_r)
+            r3_0, r3_1, r3_2, r3_3 = _ld_global_v4_u32_l2hint(r_base + Int64(3 * h * 2), evict_r)
+        else:
+            r0_0, r0_1, r0_2, r0_3 = ld_global_v4_u32(r_base)
+            r1_0, r1_1, r1_2, r1_3 = ld_global_v4_u32(r_base + Int64(h * 2))
+            r2_0, r2_1, r2_2, r2_3 = ld_global_v4_u32(r_base + Int64(2 * h * 2))
+            r3_0, r3_1, r3_2, r3_3 = ld_global_v4_u32(r_base + Int64(3 * h * 2))
 
         # Every warp has finished reading y_out partials and s_totals[0..8] is ready.
         cute.arch.sync_threads()
@@ -1177,7 +1199,9 @@ class _Hy4IhcPreKernel:
             r_evict_first=fuse_post,
         )
         self.decode_finalize = _Hy4IhcFinalizeKernel(g, num_tiles=num_tiles, use_pdl=True)
-        self.prefill_finalize = _Hy4IhcFinalizeKernel(g, num_tiles=num_tiles, use_pdl=False)
+        self.prefill_finalize = _Hy4IhcFinalizeKernel(
+            g, num_tiles=num_tiles, use_pdl=False, r_evict_first=(g.hidden == 6144)
+        )
 
     @cute.jit
     def __call__(
@@ -1210,8 +1234,32 @@ class _Hy4IhcPreKernel:
                     self.med_partial(delta, residual, prev_post, fn, residual_out, y_out, rows, stream)
                 self.decode_finalize(src_r, scale, base, norm, post_out, y_out, rows, stream)
             else:
-                self.prefill_partial(delta, residual, prev_post, fn, residual_out, y_out, rows, stream)
-                self.prefill_finalize(src_r, scale, base, norm, post_out, y_out, rows, stream)
+                if const_expr(self.hidden == 6144):
+                    # Chunk wide H=6144 launches at 512 rows (24 MiB/chunk) so residual /
+                    # residual_out stays L2-resident between partial and finalize, avoiding
+                    # the 2x DRAM read cliff once rows * 48 KiB exceeds L2 capacity.
+                    h = Int64(self.hidden)
+                    num_chunks = (rows + Int32(_PREFILL_CHUNK_ROWS_6144 - 1)) // Int32(_PREFILL_CHUNK_ROWS_6144)
+                    per_chunk = (rows + num_chunks - Int32(1)) // num_chunks
+                    chunk_cap = ((per_chunk + Int32(31)) // Int32(32)) * Int32(32)
+                    offset = Int32(0)
+                    while offset < rows:
+                        rem = rows - offset
+                        c_rows = chunk_cap if rem > chunk_cap else rem
+                        off64 = Int64(offset)
+                        d_ptr = delta + off64 * h
+                        r_ptr = residual + off64 * Int64(4) * h
+                        pp_ptr = prev_post + off64 * Int64(4)
+                        ro_ptr = residual_out + off64 * Int64(4) * h
+                        po_ptr = post_out + off64 * Int64(4)
+                        y_ptr = y_out + off64 * h
+                        src_c = ro_ptr if const_expr(self.fuse_post) else r_ptr
+                        self.prefill_partial(d_ptr, r_ptr, pp_ptr, fn, ro_ptr, y_ptr, c_rows, stream)
+                        self.prefill_finalize(src_c, scale, base, norm, po_ptr, y_ptr, c_rows, stream)
+                        offset = offset + c_rows
+                else:
+                    self.prefill_partial(delta, residual, prev_post, fn, residual_out, y_out, rows, stream)
+                    self.prefill_finalize(src_r, scale, base, norm, post_out, y_out, rows, stream)
 
 
 class _Hy4IhcPreStandalone:
@@ -1270,7 +1318,9 @@ class _Hy4IhcNormPostPreKernel:
             r_evict_first=True,
         )
         self.decode_finalize = _Hy4IhcFinalizeKernel(g, num_tiles=num_tiles, use_pdl=True)
-        self.prefill_finalize = _Hy4IhcFinalizeKernel(g, num_tiles=num_tiles, use_pdl=False)
+        self.prefill_finalize = _Hy4IhcFinalizeKernel(
+            g, num_tiles=num_tiles, use_pdl=False, r_evict_first=(g.hidden == 6144)
+        )
 
     @cute.jit
     def __call__(
@@ -1604,6 +1654,10 @@ class _Hy4IhcPostKernel:
                 self.prefill(delta, residual, prev_post, out, rows, stream)
 
 
+def _supports_tiled_ihc(h: int) -> bool:
+    return h in (3072, 6144)
+
+
 def compile_hy4_ihc_pre_aot(g: Hy4IhcGeometry = HY4_FLASH_IHC):
     h = g.hidden
     operands = (
@@ -1616,7 +1670,7 @@ def compile_hy4_ihc_pre_aot(g: Hy4IhcGeometry = HY4_FLASH_IHC):
         Operand("y_out", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     return compile_program(
-        (_Hy4IhcPreStandalone(g) if h == 3072 else _Hy4IhcPreStandalone6144(g)),
+        (_Hy4IhcPreStandalone(g) if _supports_tiled_ihc(h) else _Hy4IhcPreStandalone6144(g)),
         name="hy4_ihc_pre",
         operands=operands,
         scalars=(Scalar("rows"),),
@@ -1641,7 +1695,7 @@ def compile_hy4_ihc_post_pre_aot(g: Hy4IhcGeometry = HY4_FLASH_IHC):
         Operand("y_out", torch.bfloat16, f"[rows,{h}]", "out"),
     )
     return compile_program(
-        (_Hy4IhcPreKernel(g, fuse_post=True) if h == 3072 else _Hy4IhcPreKernel6144(g, fuse_post=True)),
+        (_Hy4IhcPreKernel(g, fuse_post=True) if _supports_tiled_ihc(h) else _Hy4IhcPreKernel6144(g, fuse_post=True)),
         name="hy4_ihc_post_pre",
         operands=operands,
         scalars=(Scalar("rows"),),
@@ -1660,7 +1714,7 @@ def compile_hy4_ihc_post_aot(g: Hy4IhcGeometry = HY4_FLASH_IHC):
         Operand("out", torch.bfloat16, f"[rows,4,{h}]", "out"),
     )
     return compile_program(
-        (_Hy4IhcPostKernel(g) if h == 3072 else _Hy4IhcPostKernel6144(g)),
+        (_Hy4IhcPostKernel(g) if _supports_tiled_ihc(h) else _Hy4IhcPostKernel6144(g)),
         name="hy4_ihc_post",
         operands=operands,
         scalars=(Scalar("rows"),),
