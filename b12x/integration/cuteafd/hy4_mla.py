@@ -252,12 +252,13 @@ def _mrope_position(positions: cute.Pointer, row: Int64, pair: Int64, s1: cutlas
     return Float32(positions[row * Int64(3) + axis])
 
 
-def _is_tp1(g: Hy4MlaGeometry) -> bool:
-    # Hy4-flash (q_lora_rank=1024): TP1 has 32 DSA heads and 64 SWA heads; keep TP2 routes unchanged.
-    # Hy4 (q_lora_rank=2048): fast fused Q-absorb, sink-gate-UV, and FP8 MLA on both TP1 (64H) and TP2 (32H).
+def _use_fast_mla(g: Hy4MlaGeometry) -> bool:
+    # Enable fused Q-absorb, fused sink-gate-UV, and raw-FP8 MLA across both
+    # TP1 and TP2 head counts for Hy4-flash (q_lora_rank=1024: 32H/16H DSA,
+    # 64H/32H SWA) and Hy4 (q_lora_rank=2048: 64H/32H DSA).
     if g.q_lora_rank == 2048:
         return g.heads in (32, 64)
-    return g.heads == (32 if g.window_size is None else 64)
+    return g.heads in ((16, 32) if g.window_size is None else (32, 64))
 
 
 def _align(n: int) -> int:
@@ -3368,7 +3369,7 @@ class _Hy4Attention:
         self.max_context = int(max_context)
         self.layout = hy4_attention_layout(g, rows, max_context=max_context, mode=mode)
         self.splits = self.layout["num_splits"]
-        self.use_fast_fp8 = g.kv_cache == "fp8" and _is_tp1(g)
+        self.use_fast_fp8 = g.kv_cache == "fp8" and _use_fast_mla(g)
         if self.use_fast_fp8:
             self.has_h32 = (g.heads >= 32 and g.heads % 32 == 0)
             self.has_swa_2wg = (self.page_size == 64 and self.splits == 1 and g.heads % 8 == 0)
@@ -3582,12 +3583,8 @@ def compile_hy4_mla_q_absorb_aot(g: Hy4MlaGeometry):
         Operand("inv_freq", torch.float32, "[32]", align=4),
         Operand("query", torch.bfloat16, f"[rows,{g.heads},576]", "out"),
     )
-    fast = _is_tp1(g)
-    key = (
-        (g.heads, "q_absorb", g.mrope_section)
-        if g.q_lora_rank == 1024
-        else (g.heads, "q_absorb", g.mrope_section, fast)
-    )
+    fast = _use_fast_mla(g)
+    key = (g.heads, "q_absorb", g.mrope_section, fast)
     return compile_program(
         _Hy4Tp1QAbsorb(g) if fast else _Hy4QAbsorb(g),
         name=f"hy4_mla_q_absorb_h{g.heads}",
@@ -3609,12 +3606,8 @@ def compile_hy4_mla_sink_gate_uv_aot(g: Hy4MlaGeometry):
         Operand("sink", torch.float32, f"[{g.heads}]", align=4),
         Operand("out", torch.bfloat16, f"[rows,{g.heads},256]", "out"),
     )
-    fast = _is_tp1(g)
-    key = (
-        (g.heads, "sink_gate_uv")
-        if g.q_lora_rank == 1024
-        else (g.heads, "sink_gate_uv", fast)
-    )
+    fast = _use_fast_mla(g)
+    key = (g.heads, "sink_gate_uv", fast)
     return compile_program(
         _Hy4Tp1SinkGateUv(g) if fast else _Hy4SinkGateUv(g),
         name=f"hy4_mla_sink_gate_uv_h{g.heads}",
@@ -3755,7 +3748,7 @@ def compile_hy4_mla_attention_aot(g: Hy4MlaGeometry, *, max_rows: int = 64, max_
         name=f"hy4_mla_{tag}_{mode}_h{g.heads}_{g.kv_cache}",
         operands=operands,
         scalars=(Scalar("rows"), Scalar("batch"), Scalar("page_table_width", "int64"), Scalar("active_splits")),
-        key=(g, int(max_rows), int(max_context), mode, ps),
+        key=(g, int(max_rows), int(max_context), mode, ps, launch.use_fast_fp8),
         geometry={**vars(g), **launch.layout, "mode": mode, "page_size": ps, "max_rows": int(max_rows),
                   "max_context": int(max_context), "lse_base": "e"},
         scratch={"scratch": lambda rows: hy4_attention_layout(g, rows, max_context=max_context, mode=mode)["scratch_bytes"]},
