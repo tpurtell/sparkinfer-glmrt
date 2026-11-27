@@ -94,16 +94,25 @@ class _GlobalAttention:
         decode = route == "decode"
         if not decode and kv_format == "fp8" and _is_inkling2_mini_geometry(g):
             self.attn = InklingMiniGlobalFp8Prefill(softmax_scale=g.softmax_scale)
+            self.attn_direct = None
         else:
             self.attn = InklingGqaAttention(
                 heads=g.heads, kv_heads=g.kv_heads, tokens=1 if decode else prefill_tokens(g), window=0, paged=True,
                 extent=g.extent("global"), softmax_scale=g.softmax_scale, direct=not decode, page_rows=g.page_rows,
                 ring_rows=g.ring_rows, kv_format=kv_format)
+            self.attn_direct = (
+                InklingGqaAttention(
+                    heads=g.heads, kv_heads=g.kv_heads, tokens=1, window=0, paged=True,
+                    extent=g.extent("global"), softmax_scale=g.softmax_scale, direct=True, page_rows=g.page_rows,
+                    ring_rows=g.ring_rows, kv_format=kv_format)
+                if decode else None
+            )
         self.merge = InklingSplitMerge(heads=g.heads, v_head=g.head_dim) if decode else None
         self.max_splits = int(max_splits)
 
     def key(self) -> tuple:
-        return (self.attn.key(), self.route, self.max_splits)
+        return (self.attn.key(), None if self.attn_direct is None else self.attn_direct.key(),
+                self.route, self.max_splits)
 
     @cute.jit
     def run(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
@@ -116,10 +125,17 @@ class _GlobalAttention:
                           + Int64(_ALIGN - 1)) // Int64(_ALIGN) * Int64(_ALIGN)
         lse = cute.make_ptr(cutlass.Float32, lse_off, cute.AddressSpace.gmem, assumed_align=16)
         # The ring operands (kv_step, ring_slots, seq_first) are unused on the paged route.
-        self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first, rel, sinks, out, partials,
-                  lse, rows, table_stride, tiles, splits, stream)
         if cutlass.const_expr(self.merge is not None):
-            self.merge(partials, lse, sinks, out, rows, splits, stream)
+            if splits == Int32(1):
+                self.attn_direct(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first,
+                                 seq_first, rel, sinks, out, partials, lse, rows, table_stride, tiles, Int32(1), stream)
+            else:
+                self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first,
+                          rel, sinks, out, partials, lse, rows, table_stride, tiles, splits, stream)
+                self.merge(partials, lse, sinks, out, rows, splits, stream)
+        else:
+            self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first, rel,
+                      sinks, out, partials, lse, rows, table_stride, tiles, splits, stream)
 
 
 class _GlobalAttentionDecode(_GlobalAttention):
