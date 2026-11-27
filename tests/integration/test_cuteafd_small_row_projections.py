@@ -111,16 +111,22 @@ def test_pillar1_default_decode_tma_bit_exact_against_prefill(k, n, dtype):
     )
     gen = torch.Generator(device="cuda").manual_seed(k * 7 + n)
     w = (torch.randn((n, k), generator=gen, device="cuda") / 16).bfloat16()
-    max_rows = 128
+    max_rows = 4096
     x = torch.randn((max_rows, k), generator=gen, device="cuda").bfloat16()
 
-    for rows in (1, 7, 16, 17, 32, 33, 64, 65, 128):
+    # Single-row reference at row 0 for bitwise invariance across every threshold (1..4096)
+    single0 = torch.empty((1, n), dtype=dtype, device="cuda")
+    canon.launch(x[:1], w, single0, scalars=(1,))
+    torch.cuda.synchronize()
+
+    for rows in (1, 7, 16, 17, 32, 33, 64, 65, 128, 256, 2048, 2752, 4096):
         out_c = torch.full((max_rows, n), float("nan"), dtype=dtype, device="cuda")
         out_d = torch.full((max_rows, n), float("nan"), dtype=dtype, device="cuda")
         canon.launch(x[:rows], w, out_c, scalars=(rows,))
         default.launch(x[:rows], w, out_d, scalars=(rows,))
         torch.cuda.synchronize()
         assert _same_bits(out_c[:rows], out_d[:rows]), f"K={k} N={n} rows={rows}: default TMA tiles differ"
+        assert _same_bits(out_c[:1], single0), f"K={k} N={n} rows={rows}: row-0 bitwise invariance broken"
         if rows < max_rows:
             assert torch.isnan(out_c[rows:]).all(), f"K={k} N={n} rows={rows}: wrote past live rows"
 
@@ -169,7 +175,7 @@ def test_pillar2_skinny_projection_row_invariance_and_cutoff(k, n, dtype):
 
     gen = torch.Generator(device="cuda").manual_seed(k * 13 + n)
     w = (torch.randn((n, k), generator=gen, device="cuda") / 16).bfloat16()
-    x = torch.randn((128, k), generator=gen, device="cuda").bfloat16()
+    x = torch.randn((4096, k), generator=gen, device="cuda").bfloat16()
 
     # Single-row oracle across all 64 rows
     singles = torch.empty((64, n), dtype=dtype, device="cuda")
@@ -182,22 +188,27 @@ def test_pillar2_skinny_projection_row_invariance_and_cutoff(k, n, dtype):
     atol = 1e-2 if dtype == torch.bfloat16 else 2e-4
     torch.testing.assert_close(singles.float(), ref64.float(), atol=atol, rtol=1e-2)
 
-    # Exact bitwise row invariance across all skinny sub-bands (1..64) + tail poison
-    for rows in (1, 4, 8, 16, 17, 32, 64):
+    # Exhaustive bitwise row invariance across EVERY row count 1..64 (including 16->17 split) + tail poison
+    for rows in range(1, 65):
         out = torch.full((80, n), float("nan"), dtype=dtype, device="cuda")
         prog.launch(x[:rows], w, out, scalars=(rows,))
         torch.cuda.synchronize()
         assert _same_bits(out[:rows], singles[:rows]), f"K={k} N={n} rows={rows}: skinny row invariance broken"
         assert torch.isnan(out[rows:]).all(), f"K={k} N={n} rows={rows}: wrote past live rows"
 
-    # Past skinny cutoff (>64): bit-identical to TMA prefill_config
-    for rows in (65, 128):
+    # Past skinny cutoff (65..4096): bit-identical to TMA prefill_config and row-invariant across prefill widths
+    out_65 = None
+    for rows in (65, 128, 256, 2048, 2752, 4096):
         out_s = torch.empty((rows, n), dtype=dtype, device="cuda")
         out_t = torch.empty((rows, n), dtype=dtype, device="cuda")
         prog.launch(x[:rows], w, out_s, scalars=(rows,))
         tma_ref.launch(x[:rows], w, out_t, scalars=(rows,))
         torch.cuda.synchronize()
         assert _same_bits(out_s, out_t), f"K={k} N={n} rows={rows}: >64 route must match TMA bit-for-bit"
+        if out_65 is None:
+            out_65 = out_s.clone()
+        else:
+            assert _same_bits(out_s[:65], out_65), f"K={k} N={n} rows={rows}: >64 row invariance broken"
 
     # CUDA graph replay
     for rows in (8, 64):
@@ -236,8 +247,8 @@ def test_pillar2_scaled_projection_fused_skinny_and_cutoff(outputs):
     )
     gen = torch.Generator(device="cuda").manual_seed(99 + outputs)
     w = (torch.randn((outputs, width), generator=gen, device="cuda") / 16).bfloat16()
-    x = torch.randn((128, width), generator=gen, device="cuda").bfloat16()
-    scratch = torch.empty((128, outputs), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((4096, width), generator=gen, device="cuda").bfloat16()
+    scratch = torch.empty((4096, outputs), dtype=torch.bfloat16, device="cuda")
 
     singles = torch.empty((64, outputs), dtype=torch.float32, device="cuda")
     for r in range(64):
@@ -246,27 +257,32 @@ def test_pillar2_scaled_projection_fused_skinny_and_cutoff(outputs):
     ref64 = (x[:64].double() @ w.double().T).bfloat16().float() * prescale
     torch.testing.assert_close(singles, ref64, atol=1e-2, rtol=1e-2)
 
-    for rows in (1, 8, 16, 17, 64):
+    for rows in range(1, 65):
         out = torch.full((80, outputs), float("nan"), dtype=torch.float32, device="cuda")
         prog.launch(x[:rows], w, out, scratch[:rows], scalars=(rows,))
         torch.cuda.synchronize()
         assert _same_bits(out[:rows], singles[:rows])
         assert torch.isnan(out[rows:]).all()
 
-    for rows in (65, 128):
+    out_65 = None
+    for rows in (65, 128, 256, 2048, 2752, 4096):
         out_p = torch.empty((rows, outputs), dtype=torch.float32, device="cuda")
         out_s = torch.empty((rows, outputs), dtype=torch.float32, device="cuda")
         prog.launch(x[:rows], w, out_p, scratch[:rows], scalars=(rows,))
         stock.launch(x[:rows], w, out_s, scratch[:rows], scalars=(rows,))
         torch.cuda.synchronize()
         assert _same_bits(out_p, out_s)
+        if out_65 is None:
+            out_65 = out_p.clone()
+        else:
+            assert _same_bits(out_p[:65], out_65)
 
 
 # ---------------------------------------------------------------------------
 # Pillar 3: Muse F32 router multi-band bit-exactness across all widths
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("rows", (1, 2, 4, 6, 8, 9, 16, 17, 32, 64, 65, 256, 2048, 2752, 4096))
+@pytest.mark.parametrize("rows", (1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 256, 2048, 2752, 4096))
 def test_pillar3_muse_router_multiband_bit_exact(rows):
     require_b12x()
     from b12x.integration.cuteafd.muse import compile_router_aot
