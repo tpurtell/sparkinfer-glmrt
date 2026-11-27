@@ -32,6 +32,7 @@ from b12x.integration.cuteafd.context_split import (
 )
 from b12x.integration.cuteafd.hy4_mla import (
     Hy4MlaGeometry,
+    _use_fast_mla,
     compile_hy4_mla_attention_aot,
     compile_hy4_mla_dsa_partial_aot,
     compile_hy4_mla_gate_uv_aot,
@@ -1423,3 +1424,150 @@ def test_hy4_mla_dsa_fp8_row_invariant_1_to_64(heads: int, q_lora_rank: int, seq
         torch.cuda.synchronize()
         assert torch.equal(out_o[0], ref_o[0]), f"dsa_fp8 H={heads} q_lora={q_lora_rank} L={seq_len} out diverged at rows={rows}"
         assert torch.equal(out_l[0], ref_l[0]), f"dsa_fp8 H={heads} q_lora={q_lora_rank} L={seq_len} lse diverged at rows={rows}"
+
+
+def test_hy4_mla_tp2_fast_gate_and_swa_extend_branches():
+    """Hy4-flash TP2 (16H DSA / 32H SWA) enables the fast MLA path and matches F32 across all SWA extend branches."""
+    for g in (
+        Hy4MlaGeometry(heads=16, q_lora_rank=1024, window_size=None, kv_cache="fp8"),
+        Hy4MlaGeometry(heads=32, q_lora_rank=1024, window_size=512, kv_cache="fp8"),
+        Hy4MlaGeometry(heads=32, q_lora_rank=1024, window_size=None, kv_cache="fp8"),
+        Hy4MlaGeometry(heads=64, q_lora_rank=1024, window_size=512, kv_cache="fp8"),
+        Hy4MlaGeometry(heads=32, q_lora_rank=2048, window_size=None, kv_cache="fp8"),
+        Hy4MlaGeometry(heads=64, q_lora_rank=2048, window_size=None, kv_cache="fp8"),
+    ):
+        assert _use_fast_mla(g)
+
+    dev = require_b12x()
+    torch.manual_seed(9401)
+    heads, window = 32, 512
+    prefix = 576  # > window so every extend row clips old tokens
+    g = Hy4MlaGeometry(heads=heads, window_size=window, kv_cache="fp8")
+    theta = 10_000.0
+    inv_freq = (1.0 / (theta ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+
+    # Exercise all 3 _Hy4Attention swa_extend branches on SM120/SM121:
+    # rows=8 (fwd_swa_2wg), rows=64 (fwd_h16 on SM120 / fwd_h32 on SM121), rows=256 (fwd_h32).
+    prog_pack = compile_hy4_mla_rank_norm_pack_aot(g)
+    prog_q = compile_hy4_mla_q_absorb_aot(g)
+    prog_attn = compile_hy4_mla_attention_aot(g, max_rows=512, max_context=2048, mode="extend", page_size=64)
+    prog_uv = compile_hy4_mla_sink_gate_uv_aot(g)
+    scratch = torch.empty(
+        max(1024, hy4_attention_layout(g, 512, max_context=2048, mode="extend")["scratch_bytes"]),
+        dtype=torch.uint8, device=dev,
+    )
+
+    for ext_rows in (8, 64, 256):
+        total = prefix + ext_rows
+        pages = (total + 63) // 64
+        perm = torch.randperm(pages, dtype=torch.int32, device=dev)
+        q_a = torch.randn(total, 1024, dtype=torch.bfloat16, device=dev) * 0.25
+        kv_a = torch.randn(total, 576, dtype=torch.bfloat16, device=dev) * 0.25
+        q_norm = torch.ones(1024, dtype=torch.bfloat16, device=dev)
+        kv_norm = torch.randn(512, dtype=torch.bfloat16, device=dev) + 1.0
+        q_raw = torch.randn(ext_rows, heads, 256, dtype=torch.bfloat16, device=dev) * 0.25
+        w_uk = torch.randn(heads, 512, 192, dtype=torch.bfloat16, device=dev) * 0.04
+        w_uv = torch.randn(heads, 256, 512, dtype=torch.bfloat16, device=dev) * 0.04
+        gate = torch.randn(ext_rows, heads, 256, dtype=torch.bfloat16, device=dev) * 0.5
+        sink = torch.randn(heads, dtype=torch.float32, device=dev) * 0.5
+
+        pos_all = torch.arange(total, dtype=torch.int64, device=dev)
+        slots = perm[pos_all // 64].to(torch.int64) * 64 + (pos_all % 64)
+        cache = torch.zeros(pages, 64, 656, dtype=torch.uint8, device=dev)
+        prog_pack.launch(
+            q_a, kv_a, q_norm, kv_norm, slots, _thw(pos_all), inv_freq,
+            torch.empty(total, 1024, dtype=torch.bfloat16, device=dev), cache, scalars=(total,),
+        )
+
+        pos_q = torch.arange(prefix, total, dtype=torch.int64, device=dev)
+        query = torch.empty(ext_rows, heads, 576, dtype=torch.bfloat16, device=dev)
+        prog_q.launch(q_raw, w_uk, _thw(pos_q), inv_freq, query, scalars=(ext_rows,))
+
+        attn_out = torch.empty(ext_rows, heads, 512, dtype=torch.bfloat16, device=dev)
+        lse_out = torch.empty(ext_rows, heads, dtype=torch.float32, device=dev)
+        prog_attn.launch(
+            query, cache, perm.unsqueeze(0),
+            torch.tensor([total], dtype=torch.int32, device=dev),
+            torch.tensor([0, ext_rows], dtype=torch.int32, device=dev),
+            attn_out, lse_out, scratch, scalars=(ext_rows, 1, pages, 1),
+        )
+        uv_out = torch.empty(ext_rows, heads, 256, dtype=torch.bfloat16, device=dev)
+        prog_uv.launch(attn_out, w_uv, gate, lse_out, sink, uv_out, scalars=(ext_rows,))
+        torch.cuda.synchronize()
+
+        k0_ref = _rms_norm(kv_a[:, :512], kv_norm, 1e-5)
+        kr_ref = _interleaved_rope(kv_a[:, 512:], pos_all, theta)
+        qn_ref = q_raw[:, :, :192].float()
+        qr_ref = _interleaved_rope(q_raw[:, :, 192:], pos_q, theta)
+        k_nope = torch.einsum("tc,hcd->thd", k0_ref, w_uk.float())
+        v_full = torch.einsum("tc,hvc->thv", k0_ref, w_uv.float())
+        q_full = torch.cat([qn_ref, qr_ref], dim=-1).transpose(0, 1)
+        k_full = torch.cat([k_nope, kr_ref.unsqueeze(1).expand(-1, heads, -1)], dim=-1).transpose(0, 1)
+        v_full = v_full.transpose(0, 1)
+        scores = torch.matmul(q_full, k_full.transpose(-1, -2)) * (256.0 ** -0.5)
+        q_idx = torch.arange(prefix, total, device=dev)[:, None]
+        k_idx = torch.arange(total, device=dev)[None, :]
+        dist = q_idx - k_idx
+        allowed = (dist >= 0) & (dist < window)
+        scores = scores.masked_fill(~allowed.unsqueeze(0), -1e30)
+        scores = torch.cat([scores, sink[:, None, None].expand(heads, ext_rows, 1)], dim=-1)
+        probs = torch.softmax(scores, dim=-1)[..., :-1]
+        ref_uv = torch.matmul(probs, v_full).transpose(0, 1) * torch.sigmoid(gate.float())
+        assert (uv_out.float() - ref_uv).abs().max().item() <= 0.08, f"swa_extend H=32 rows={ext_rows} mismatch"
+
+
+@pytest.mark.parametrize("heads,window,page_size", [(16, None, 1), (32, 512, 64)])
+def test_hy4_mla_tp2_fp8_big_pid_64bit_offset(heads: int, window: int | None, page_size: int):
+    """Pool-scaled byte offsets past 2 GiB (Int32 overflow line) must stay exact in Int64."""
+    dev = require_b12x()
+    torch.manual_seed(9501 + heads)
+    g = Hy4MlaGeometry(heads=heads, window_size=window, kv_cache="fp8")
+    # 52,000 pages * 64 tokens * 656 B = 2.183 GiB > 2^31 bytes.
+    total_pages = 52_000
+    high_pages = [total_pages - 3, total_pages - 1]
+    seq_len = 128
+    theta = 10_000.0 if window is not None else 10_000_000.0
+    inv_freq = (1.0 / (theta ** (torch.arange(0, 64, 2, dtype=torch.float32, device=dev) / 64.0))).contiguous()
+
+    kv_a = torch.randn(seq_len, 576, dtype=torch.bfloat16, device=dev) * 0.25
+    q_a = torch.zeros(seq_len, 1024, dtype=torch.bfloat16, device=dev)
+    q_norm = torch.ones(1024, dtype=torch.bfloat16, device=dev)
+    kv_norm = torch.ones(512, dtype=torch.bfloat16, device=dev)
+    pos = torch.arange(seq_len, dtype=torch.int64, device=dev)
+
+    big_cache = torch.empty(total_pages, 64, 656, dtype=torch.uint8, device=dev)
+    small_cache = torch.zeros(2, 64, 656, dtype=torch.uint8, device=dev)
+    hi_pt = torch.tensor(high_pages, dtype=torch.int32, device=dev)
+    lo_pt = torch.tensor([0, 1], dtype=torch.int32, device=dev)
+    hi_slots = hi_pt[pos // 64].to(torch.int64) * 64 + (pos % 64)
+    lo_slots = pos.clone()
+
+    pack = compile_hy4_mla_rank_norm_pack_aot(g)
+    q_res = torch.empty(seq_len, 1024, dtype=torch.bfloat16, device=dev)
+    pack.launch(q_a, kv_a, q_norm, kv_norm, hi_slots, _thw(pos), inv_freq, q_res, big_cache, scalars=(seq_len,))
+    pack.launch(q_a, kv_a, q_norm, kv_norm, lo_slots, _thw(pos), inv_freq, q_res, small_cache, scalars=(seq_len,))
+
+    q = torch.randn(4, heads, 576, dtype=torch.bfloat16, device=dev) * 0.25
+    prog = compile_hy4_mla_attention_aot(g, max_rows=16, max_context=2048 if page_size == 1 else 512,
+                                         mode="decode", page_size=page_size)
+    lay = hy4_attention_layout(g, 16, max_context=2048 if page_size == 1 else 512, mode="decode")
+    scratch = torch.empty(max(1024, lay["scratch_bytes"]), dtype=torch.uint8, device=dev)
+    o_hi, l_hi = torch.empty(4, heads, 512, dtype=torch.bfloat16, device=dev), torch.empty(4, heads, dtype=torch.float32, device=dev)
+    o_lo, l_lo = torch.empty_like(o_hi), torch.empty_like(l_hi)
+
+    if page_size == 64:
+        seqlens = torch.tensor([seq_len], dtype=torch.int32, device=dev)
+        cu = torch.tensor([0, 4], dtype=torch.int32, device=dev)
+        prog.launch(q, big_cache, hi_pt.unsqueeze(0), seqlens, cu, o_hi, l_hi, scratch, scalars=(4, 1, 2, lay["num_splits"]))
+        prog.launch(q, small_cache, lo_pt.unsqueeze(0), seqlens, cu, o_lo, l_lo, scratch, scalars=(4, 1, 2, lay["num_splits"]))
+    else:
+        pt_hi = hi_slots.to(torch.int32).unsqueeze(0).expand(4, seq_len).contiguous()
+        pt_lo = lo_slots.to(torch.int32).unsqueeze(0).expand(4, seq_len).contiguous()
+        seqlens = torch.full((4,), seq_len, dtype=torch.int32, device=dev)
+        cu = torch.arange(5, dtype=torch.int32, device=dev)
+        prog.launch(q, big_cache, pt_hi, seqlens, cu, o_hi, l_hi, scratch, scalars=(4, 4, seq_len, 1))
+        prog.launch(q, small_cache, pt_lo, seqlens, cu, o_lo, l_lo, scratch, scalars=(4, 4, seq_len, 1))
+    torch.cuda.synchronize()
+    assert torch.equal(o_hi, o_lo)
+    assert torch.equal(l_hi, l_lo)
+    del big_cache
