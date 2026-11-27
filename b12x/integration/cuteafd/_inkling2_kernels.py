@@ -55,7 +55,9 @@ from b12x.attention.paged._selected_forward import _cp_async_load_128b_zfill
 from ._mimo_kernels import LOG2_E, MAX_SPLITS, MimoGqaAttention, MimoSplitMerge, _ceil
 from ._fp8_weights import _e4m3x8_scaled_bf16
 
-__all__ = ["InklingGqaAttention", "InklingSplitMerge"]
+__all__ = ["DEFAULT_SPLIT_CHUNK", "InklingGqaAttention", "InklingSplitMerge"]
+
+DEFAULT_SPLIT_CHUNK = 512
 
 
 @dsl_user_op
@@ -119,13 +121,20 @@ class InklingGqaAttention(MimoGqaAttention):
 
     def __init__(self, *, heads: int, kv_heads: int, tokens: int, window: int, paged: bool, extent: int,
                  softmax_scale: float, direct: bool = True, page_rows: int = 64, ring_rows: int = 2048,
-                 kv_warps: int = 4, kv_format: str = "bf16"):
+                 kv_warps: int = 4, kv_format: str = "bf16", per_row_splits: bool = False,
+                 split_chunk: int = DEFAULT_SPLIT_CHUNK):
         super().__init__(heads=heads, kv_heads=kv_heads, tokens=tokens, window=window, paged=paged, sink=True,
                          direct=direct, softmax_scale=softmax_scale, page_rows=page_rows, ring_rows=ring_rows,
                          head=128, v_head=128, kv_warps=kv_warps)
         self.kv_format = kv_format
         if kv_format not in ("bf16", "fp8") or (kv_format == "fp8" and not paged):
             raise ValueError("Inkling FP8 records are global only")
+        self.per_row_splits = bool(per_row_splits)
+        self.split_chunk = int(split_chunk)
+        if self.split_chunk <= 0:
+            raise ValueError("split_chunk must be positive")
+        if self.per_row_splits and (self.tokens != 1 or not self.paged or self.direct):
+            raise ValueError("per_row_splits requires paged single-row non-direct decode")
         self.record_bytes = self.record + self.kv_heads * 8 if kv_format == "fp8" else self.record * 2
         self.scale_offset = self.record if kv_format == "fp8" else 0
         self.extent = int(extent)
@@ -148,7 +157,7 @@ class InklingGqaAttention(MimoGqaAttention):
         self.pipe_kv = self.tile_m == self.tile_n
 
     def key(self) -> tuple:
-        return (*super().key(), "inkling2_cache_v3", self.extent, self.kv_format)
+        return (*super().key(), "inkling2_cache_v4", self.extent, self.kv_format, self.per_row_splits, self.split_chunk)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
@@ -583,65 +592,17 @@ class InklingGqaAttention(MimoGqaAttention):
             cute.arch.cp_async_wait_group(1)
             cute.arch.sync_threads()
 
-    @cute.kernel
-    def kernel(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
-               page_table: cute.Pointer, table_indices: cute.Pointer, tile_rows: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer, rel: cute.Pointer,
-               sinks: cute.Pointer, out: cute.Pointer, partial_out: cute.Pointer, partial_lse: cute.Pointer,
-               rows: Int32, table_stride: Int32, tiles: Int32, splits: Int32, q_layout: cute.ComposedLayout,
-               k_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout, p_layout: cute.ComposedLayout,
-               tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma):
-        block, kv_head_idx, split_idx = cute.arch.block_idx()
-        thread = Int32(cute.arch.thread_idx()[0])
-        kv_head = Int32(kv_head_idx)
-        split = Int32(split_idx)
-        row0 = Int64(tile_rows[Int64(block)])
-        live = Int32(rows) - Int32(row0)
-        if live > Int32(self.tokens):
-            live = Int32(self.tokens)
-        # Segment starts are absolute packed-row indices, not logical positions.
-        for t in cutlass.range_constexpr(1, self.tokens):
-            if Int32(t) < live:
-                if seq_first[row0 + Int64(t)] != seq_first[row0]:
-                    live = Int32(t)
-
-        allocator = cutlass.utils.SmemAllocator()
-        s_k0 = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
-        s_v0 = allocator.allocate_tensor(element_type=BFloat16, layout=v_layout, byte_alignment=1024)
-        if const_expr(self.pipe_kv):
-            s_k1 = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
-            s_v1 = allocator.allocate_tensor(element_type=BFloat16, layout=v_layout, byte_alignment=1024)
-            s_q = s_k1
-        else:
-            s_k1 = s_k0
-            s_v1 = s_v0
-            s_q = allocator.allocate_tensor(element_type=BFloat16, layout=q_layout, byte_alignment=1024)
-        s_p = allocator.allocate_tensor(element_type=BFloat16, layout=p_layout, byte_alignment=1024)
-        rel_layout = cute.make_layout((self.tile_m, self.rel_stage), stride=(self.rel_stage, 1))
-        s_rel0 = allocator.allocate_tensor(element_type=BFloat16, layout=rel_layout, byte_alignment=16)
-        s_rel1 = s_rel0
-        if const_expr(self.pipe_kv):
-            s_rel1 = allocator.allocate_tensor(element_type=BFloat16, layout=rel_layout, byte_alignment=16)
-        s_scale = allocator.allocate_tensor(element_type=Float32, layout=cute.make_layout((self.tile_m,)),
-                                            byte_alignment=16)
-        if const_expr(self.kv_format == "fp8"):
-            fp8_scale_layout = cute.make_layout((self.tile_n,))
-            s_k_sc0 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
-            s_v_sc0 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
-            if const_expr(self.pipe_kv):
-                s_k_sc1 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
-                s_v_sc1 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
-            else:
-                s_k_sc1, s_v_sc1 = s_k_sc0, s_v_sc0
-        else:
-            s_k_sc0 = s_v_sc0 = s_k_sc1 = s_v_sc1 = s_scale
-        key_addr = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
-            (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
-        key_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
-            (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
-        token_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout((self.tokens,)),
-                                              byte_alignment=16)
-
-        pos_t = cute.make_tensor(positions, cute.make_layout((Int64(rows),)))
+    @cute.jit
+    def _run_cta(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
+                 page_table: cute.Pointer, table_indices: cute.Pointer, ring_slots: cute.Pointer,
+                 seq_first: cute.Pointer, rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer,
+                 partial_out: cute.Pointer, partial_lse: cute.Pointer, rows: Int32, table_stride: Int32,
+                 splits: Int32, row_splits: Int32, row0: Int64, live: Int32, kv_head: Int32, split: Int32,
+                 thread: Int32, pos_t: cute.Tensor, s_k0: cute.Tensor, s_v0: cute.Tensor, s_k1: cute.Tensor,
+                 s_v1: cute.Tensor, s_q: cute.Tensor, s_p: cute.Tensor, s_rel0: cute.Tensor, s_rel1: cute.Tensor,
+                 s_scale: cute.Tensor, s_k_sc0: cute.Tensor, s_v_sc0: cute.Tensor, s_k_sc1: cute.Tensor,
+                 s_v_sc1: cute.Tensor, key_addr: cute.Tensor, key_pos: cute.Tensor, token_pos: cute.Tensor,
+                 tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma):
         if thread < Int32(self.tokens):
             p = Int64(-1)
             if thread < live:
@@ -726,7 +687,7 @@ class InklingGqaAttention(MimoGqaAttention):
         tile_count = Int32((hi - lo + Int64(self.tile_n)) // Int64(self.tile_n))
         if live <= Int32(0):
             tile_count = Int32(0)
-        my_tiles = (tile_count - split + splits - Int32(1)) // splits
+        my_tiles = (tile_count - split + row_splits - Int32(1)) // row_splits
 
         # Preload r_q from s_q and resolve tile 0 concurrently; the barrier frees s_q (= s_k1).
         if thread < Int32(self.qk_warps * 32):
@@ -743,14 +704,14 @@ class InklingGqaAttention(MimoGqaAttention):
                 self._stage_tile(split, Int32(0), lo, p_min, row0, kv_head, cache, rel, live, token_pos,
                                  key_addr, s_k0, s_v0, s_rel0, s_k_sc0, s_v_sc0, thread)
                 if my_tiles > Int32(1):
-                    self._resolve(split + splits, Int32(1), lo, hi, cache, kv_step, page_table, table_base,
+                    self._resolve(split + row_splits, Int32(1), lo, hi, cache, kv_step, page_table, table_base,
                                   seq_start, step_first, ring_base, key_addr, key_pos, thread)
                 cute.arch.cp_async_wait_group(1)
                 cute.arch.sync_threads()
                 if const_expr(self.kv_format == "fp8"):
                     self._widen_fp8_plane(s_k0, s_k_sc0, thread)
 
-                self._pipe_step(Int32(0), my_tiles, split, splits, lo, hi, p_min, p_max, row0, kv_head, cache,
+                self._pipe_step(Int32(0), my_tiles, split, row_splits, lo, hi, p_min, p_max, row0, kv_head, cache,
                                 kv_step, page_table, table_base, seq_start, step_first, ring_base, rel, live,
                                 token_pos, key_addr, key_pos, s_k1, s_v1, s_rel1, s_k_sc1, s_v_sc1, s_v0, s_v_sc0,
                                 s_p, s_scale, s_rel0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
@@ -758,20 +719,20 @@ class InklingGqaAttention(MimoGqaAttention):
                 pairs = (my_tiles - Int32(1)) // Int32(2)
                 for pair in cutlass.range(pairs, unroll=1):
                     idx1 = Int32(1) + Int32(pair) * Int32(2)
-                    self._pipe_step(idx1, my_tiles, split, splits, lo, hi, p_min, p_max, row0, kv_head, cache,
+                    self._pipe_step(idx1, my_tiles, split, row_splits, lo, hi, p_min, p_max, row0, kv_head, cache,
                                     kv_step, page_table, table_base, seq_start, step_first, ring_base, rel, live,
                                     token_pos, key_addr, key_pos, s_k0, s_v0, s_rel0, s_k_sc0, s_v_sc0, s_v1, s_v_sc1,
                                     s_p, s_scale, s_rel1, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
                                     c_q, c_k, c_p, c_v, cs_q, cs_k1, cs_p, cs_v1, acc_o, softmax, cur_buf=1,
                                     is_first=False)
-                    self._pipe_step(idx1 + Int32(1), my_tiles, split, splits, lo, hi, p_min, p_max, row0, kv_head,
+                    self._pipe_step(idx1 + Int32(1), my_tiles, split, row_splits, lo, hi, p_min, p_max, row0, kv_head,
                                     cache, kv_step, page_table, table_base, seq_start, step_first, ring_base, rel,
                                     live, token_pos, key_addr, key_pos, s_k1, s_v1, s_rel1, s_k_sc1, s_v_sc1, s_v0,
                                     s_v_sc0, s_p, s_scale, s_rel0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p,
                                     r_v, c_q, c_k, c_p, c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax, cur_buf=0,
                                     is_first=False)
                 if (my_tiles - Int32(1)) % Int32(2) != Int32(0):
-                    self._pipe_step(my_tiles - Int32(1), my_tiles, split, splits, lo, hi, p_min, p_max, row0,
+                    self._pipe_step(my_tiles - Int32(1), my_tiles, split, row_splits, lo, hi, p_min, p_max, row0,
                                     kv_head, cache, kv_step, page_table, table_base, seq_start, step_first,
                                     ring_base, rel, live, token_pos, key_addr, key_pos, s_k0, s_v0, s_rel0, s_k_sc0,
                                     s_v_sc0, s_v1, s_v_sc1, s_p, s_scale, s_rel1, thread, tiled_mma_qk, tiled_mma_pv,
@@ -783,14 +744,14 @@ class InklingGqaAttention(MimoGqaAttention):
                                  key_addr, s_k0, s_v0, s_rel0, s_k_sc0, s_v_sc0, thread)
                 cute.arch.cp_async_wait_group(1)
                 cute.arch.sync_threads()
-                self._single_step(Int32(0), my_tiles, split, splits, Int32(0), lo, hi, p_min, p_max, row0, kv_head,
+                self._single_step(Int32(0), my_tiles, split, row_splits, Int32(0), lo, hi, p_min, p_max, row0, kv_head,
                                   cache, kv_step, page_table, table_base, seq_start, step_first, ring_base, rel,
                                   live, token_pos, key_addr, key_pos, s_k0, s_v0, s_p, s_scale, s_rel0, s_k_sc0,
                                   s_v_sc0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p,
                                   c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax, is_first=True)
                 for local in cutlass.range(my_tiles - Int32(1), unroll=1):
                     idx = Int32(local) + Int32(1)
-                    self._single_step(idx, my_tiles, split, splits, idx % Int32(2), lo, hi, p_min, p_max, row0,
+                    self._single_step(idx, my_tiles, split, row_splits, idx % Int32(2), lo, hi, p_min, p_max, row0,
                                       kv_head, cache, kv_step, page_table, table_base, seq_start, step_first,
                                       ring_base, rel, live, token_pos, key_addr, key_pos, s_k0, s_v0, s_p,
                                       s_scale, s_rel0, s_k_sc0, s_v_sc0, thread, tiled_mma_qk, tiled_mma_pv, r_q,
@@ -813,17 +774,60 @@ class InklingGqaAttention(MimoGqaAttention):
                         sink_valid, (row0 + Int64(sink_t_local)) * Int64(self.heads) + sink_head, Int64(0))
                     sink_vals[m] = Float32(sink_t[sink_row])
                 scale = softmax.finalize(sink_val=sink_vals)
+                if my_tiles <= Int32(0):
+                    for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
+                        scale[m] = Float32(0.0)
+                        softmax.row_sum[m] = -Float32.inf
+                if coords[0, 0][1] == Int32(0):
+                    for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
+                        s_scale[coords[m, 0][0]] = scale[m]
+            elif const_expr(self.per_row_splits):
+                if row_splits == Int32(1):
+                    sink_t = cute.make_tensor(sinks, cute.make_layout((Int64(rows) * Int64(self.heads),)))
+                    sink_vals = cute.make_rmem_tensor(cute.size(s_layout.shape[0]), Float32)
+                    for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
+                        sink_m = coords[m, 0][0]
+                        sink_t_local = sink_m // Int32(self.group)
+                        sink_head = Int64(kv_head * Int32(self.group) + sink_m % Int32(self.group))
+                        sink_valid = (sink_t_local < live) & (sink_m < Int32(self.tokens * self.group))
+                        sink_row = cutlass.select_(
+                            sink_valid, (row0 + Int64(sink_t_local)) * Int64(self.heads) + sink_head, Int64(0))
+                        sink_vals[m] = Float32(sink_t[sink_row])
+                    scale = softmax.finalize(sink_val=sink_vals)
+                    if my_tiles <= Int32(0):
+                        for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
+                            scale[m] = Float32(0.0)
+                            softmax.row_sum[m] = -Float32.inf
+                    if coords[0, 0][1] == Int32(0):
+                        for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
+                            s_scale[coords[m, 0][0]] = scale[m]
+                else:
+                    scale = softmax.finalize()
+                    if my_tiles <= Int32(0):
+                        for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
+                            scale[m] = Float32(0.0)
+                            softmax.row_sum[m] = -Float32.inf
+                    if coords[0, 0][1] == Int32(0):
+                        for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
+                            m_row = coords[m, 0][0]
+                            s_scale[m_row] = scale[m]
+                            lse_token = m_row // Int32(self.group)
+                            if (lse_token < live) & (m_row < Int32(self.tokens * self.group)):
+                                lse_head = kv_head * Int32(self.group) + m_row % Int32(self.group)
+                                lse_t = cute.make_tensor(partial_lse, cute.make_layout((Int64(rows) * Int64(
+                                    MAX_SPLITS * self.heads),)))
+                                lse_t[((row0 + Int64(lse_token)) * Int64(splits) + Int64(split)) * Int64(self.heads)
+                                      + Int64(lse_head)] = Float32(softmax.row_sum[m])
             else:
                 scale = softmax.finalize()
-            if my_tiles <= Int32(0):
-                for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
-                    scale[m] = Float32(0.0)
-                    softmax.row_sum[m] = -Float32.inf
-            if coords[0, 0][1] == Int32(0):
-                for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
-                    m_row = coords[m, 0][0]
-                    s_scale[m_row] = scale[m]
-                    if const_expr(not self.direct):
+                if my_tiles <= Int32(0):
+                    for m in cutlass.range_constexpr(cute.size(s_layout.shape[0])):
+                        scale[m] = Float32(0.0)
+                        softmax.row_sum[m] = -Float32.inf
+                if coords[0, 0][1] == Int32(0):
+                    for m in cutlass.range_constexpr(cute.size(softmax.row_sum)):
+                        m_row = coords[m, 0][0]
+                        s_scale[m_row] = scale[m]
                         lse_token = m_row // Int32(self.group)
                         if (lse_token < live) & (m_row < Int32(self.tokens * self.group)):
                             lse_head = kv_head * Int32(self.group) + m_row % Int32(self.group)
@@ -843,17 +847,117 @@ class InklingGqaAttention(MimoGqaAttention):
             if (o_token < live) & (o_row < Int32(self.tokens * self.group)):
                 o_head = Int64(kv_head * Int32(self.group) + o_row % Int32(self.group))
                 row = row0 + Int64(o_token)
-                for n in cutlass.range_constexpr(cute.size(o_mn.shape[1])):
-                    dim = Int64(o_coords[m, n][1])
-                    value = Float32(o_mn[m, n]) * o_scale
-                    if const_expr(self.direct):
+                if const_expr(self.direct):
+                    o_t = cute.make_tensor(out, cute.make_layout((Int64(rows) * Int64(self.heads * self.v_head),)))
+                    for n in cutlass.range_constexpr(cute.size(o_mn.shape[1])):
+                        dim = Int64(o_coords[m, n][1])
+                        o_t[(row * Int64(self.heads) + o_head) * Int64(self.v_head) + dim] = BFloat16(
+                            Float32(o_mn[m, n]) * o_scale
+                        )
+                elif const_expr(self.per_row_splits):
+                    if row_splits == Int32(1):
                         o_t = cute.make_tensor(out, cute.make_layout((Int64(rows) * Int64(self.heads * self.v_head),)))
-                        o_t[(row * Int64(self.heads) + o_head) * Int64(self.v_head) + dim] = BFloat16(value)
+                        for n in cutlass.range_constexpr(cute.size(o_mn.shape[1])):
+                            dim = Int64(o_coords[m, n][1])
+                            o_t[(row * Int64(self.heads) + o_head) * Int64(self.v_head) + dim] = BFloat16(
+                                Float32(o_mn[m, n]) * o_scale
+                            )
                     else:
                         po = cute.make_tensor(partial_out, cute.make_layout((Int64(rows) * Int64(
                             MAX_SPLITS * self.heads * self.v_head),)))
-                        po[((row * Int64(splits) + Int64(split)) * Int64(self.heads) + o_head) * Int64(self.v_head)
-                           + dim] = value
+                        for n in cutlass.range_constexpr(cute.size(o_mn.shape[1])):
+                            dim = Int64(o_coords[m, n][1])
+                            po[((row * Int64(splits) + Int64(split)) * Int64(self.heads) + o_head)
+                               * Int64(self.v_head) + dim] = Float32(o_mn[m, n]) * o_scale
+                else:
+                    po = cute.make_tensor(partial_out, cute.make_layout((Int64(rows) * Int64(
+                        MAX_SPLITS * self.heads * self.v_head),)))
+                    for n in cutlass.range_constexpr(cute.size(o_mn.shape[1])):
+                        dim = Int64(o_coords[m, n][1])
+                        po[((row * Int64(splits) + Int64(split)) * Int64(self.heads) + o_head)
+                           * Int64(self.v_head) + dim] = Float32(o_mn[m, n]) * o_scale
+
+    @cute.kernel
+    def kernel(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
+               page_table: cute.Pointer, table_indices: cute.Pointer, tile_rows: cute.Pointer, ring_slots: cute.Pointer, seq_first: cute.Pointer, rel: cute.Pointer,
+               sinks: cute.Pointer, out: cute.Pointer, partial_out: cute.Pointer, partial_lse: cute.Pointer,
+               rows: Int32, table_stride: Int32, tiles: Int32, splits: Int32, q_layout: cute.ComposedLayout,
+               k_layout: cute.ComposedLayout, v_layout: cute.ComposedLayout, p_layout: cute.ComposedLayout,
+               tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma):
+        block, kv_head_idx, split_idx = cute.arch.block_idx()
+        thread = Int32(cute.arch.thread_idx()[0])
+        kv_head = Int32(kv_head_idx)
+        split = Int32(split_idx)
+        row0 = Int64(tile_rows[Int64(block)])
+        live = Int32(rows) - Int32(row0)
+        if live > Int32(self.tokens):
+            live = Int32(self.tokens)
+        # Segment starts are absolute packed-row indices, not logical positions.
+        for t in cutlass.range_constexpr(1, self.tokens):
+            if Int32(t) < live:
+                if seq_first[row0 + Int64(t)] != seq_first[row0]:
+                    live = Int32(t)
+
+        allocator = cutlass.utils.SmemAllocator()
+        s_k0 = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
+        s_v0 = allocator.allocate_tensor(element_type=BFloat16, layout=v_layout, byte_alignment=1024)
+        if const_expr(self.pipe_kv):
+            s_k1 = allocator.allocate_tensor(element_type=BFloat16, layout=k_layout, byte_alignment=1024)
+            s_v1 = allocator.allocate_tensor(element_type=BFloat16, layout=v_layout, byte_alignment=1024)
+            s_q = s_k1
+        else:
+            s_k1 = s_k0
+            s_v1 = s_v0
+            s_q = allocator.allocate_tensor(element_type=BFloat16, layout=q_layout, byte_alignment=1024)
+        s_p = allocator.allocate_tensor(element_type=BFloat16, layout=p_layout, byte_alignment=1024)
+        rel_layout = cute.make_layout((self.tile_m, self.rel_stage), stride=(self.rel_stage, 1))
+        s_rel0 = allocator.allocate_tensor(element_type=BFloat16, layout=rel_layout, byte_alignment=16)
+        s_rel1 = s_rel0
+        if const_expr(self.pipe_kv):
+            s_rel1 = allocator.allocate_tensor(element_type=BFloat16, layout=rel_layout, byte_alignment=16)
+        s_scale = allocator.allocate_tensor(element_type=Float32, layout=cute.make_layout((self.tile_m,)),
+                                            byte_alignment=16)
+        if const_expr(self.kv_format == "fp8"):
+            fp8_scale_layout = cute.make_layout((self.tile_n,))
+            s_k_sc0 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+            s_v_sc0 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+            if const_expr(self.pipe_kv):
+                s_k_sc1 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+                s_v_sc1 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+            else:
+                s_k_sc1, s_v_sc1 = s_k_sc0, s_v_sc0
+        else:
+            s_k_sc0 = s_v_sc0 = s_k_sc1 = s_v_sc1 = s_scale
+        key_addr = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
+            (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
+        key_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
+            (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
+        token_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout((self.tokens,)),
+                                              byte_alignment=16)
+
+        pos_t = cute.make_tensor(positions, cute.make_layout((Int64(rows),)))
+        if const_expr(self.per_row_splits):
+            p_row = Int64(0)
+            if live > Int32(0):
+                p_row = Int64(pos_t[row0])
+            n64 = (p_row + Int64(self.split_chunk)) // Int64(self.split_chunk)
+            n64 = cutlass.select_(n64 < Int64(1), Int64(1), n64)
+            n64 = cutlass.select_(n64 > Int64(splits), Int64(splits), n64)
+            row_splits = Int32(n64)
+            if split < row_splits:
+                self._run_cta(
+                    q, cache, kv_step, positions, page_table, table_indices, ring_slots, seq_first, rel, sinks,
+                    out, partial_out, partial_lse, rows, table_stride, splits, row_splits, row0, live, kv_head,
+                    split, thread, pos_t, s_k0, s_v0, s_k1, s_v1, s_q, s_p, s_rel0, s_rel1, s_scale, s_k_sc0,
+                    s_v_sc0, s_k_sc1, s_v_sc1, key_addr, key_pos, token_pos, tiled_mma_qk, tiled_mma_pv,
+                )
+        else:
+            self._run_cta(
+                q, cache, kv_step, positions, page_table, table_indices, ring_slots, seq_first, rel, sinks,
+                out, partial_out, partial_lse, rows, table_stride, splits, splits, row0, live, kv_head,
+                split, thread, pos_t, s_k0, s_v0, s_k1, s_v1, s_q, s_p, s_rel0, s_rel1, s_scale, s_k_sc0,
+                s_v_sc0, s_k_sc1, s_v_sc1, key_addr, key_pos, token_pos, tiled_mma_qk, tiled_mma_pv,
+            )
 
 
 class InklingSplitMerge(MimoSplitMerge):
@@ -861,36 +965,70 @@ class InklingSplitMerge(MimoSplitMerge):
 
     ``out = sum_s w_s o_s / (sum_s w_s + exp(sink - M))``, ``w_s = exp(lse_s -
     M)``, ``M`` the max over the live splits and the sink. One CTA per (head,
-    row), one thread per value dim.
+    row), one thread per value dim. When ``per_row_splits`` is set, each row
+    derives its own split count ``n = clamp(ceil((positions[row] + 1) /
+    split_chunk), 1, max_splits)``; rows with ``n == 1`` were already written
+    directly by :class:`InklingGqaAttention` and exit immediately.
     """
 
-    def __init__(self, *, heads: int, v_head: int = 128):
+    def __init__(self, *, heads: int, v_head: int = 128, per_row_splits: bool = False,
+                 split_chunk: int = DEFAULT_SPLIT_CHUNK):
         super().__init__(heads=heads, v_head=v_head, sink=True, empty_rows_zero=False)
+        self.per_row_splits = bool(per_row_splits)
+        self.split_chunk = int(split_chunk)
+        if self.split_chunk <= 0:
+            raise ValueError("split_chunk must be positive")
 
-    @cute.kernel
-    def kernel(self, partial_out: cute.Pointer, partial_lse: cute.Pointer, sinks: cute.Pointer,
-               out: cute.Pointer, splits: Int32):
-        head_i, row_i, _ = cute.arch.block_idx()
-        dim = Int64(cute.arch.thread_idx()[0])
-        head, row = Int64(head_i), Int64(row_i)
+    def key(self) -> tuple:
+        return ("inkling2_split_merge_v2", self.heads, self.v_head, self.per_row_splits, self.split_chunk)
+
+    @cute.jit
+    def _merge_row(self, partial_out: cute.Pointer, partial_lse: cute.Pointer, sinks: cute.Pointer,
+                   out: cute.Pointer, head: Int64, row: Int64, dim: Int64, max_splits: Int32,
+                   row_splits: Int32):
         lse = cute.make_tensor(partial_lse, cute.make_layout((Int64(1) << Int64(40),)))
         po = cute.make_tensor(partial_out, cute.make_layout((Int64(1) << Int64(40),)))
         sink_t = cute.make_tensor(sinks, cute.make_layout((Int64(1) << Int64(40),)))
         sink = Float32(sink_t[row * Int64(self.heads) + head])
         top = sink
-        for s in cutlass.range(splits, unroll=1):
-            value = Float32(lse[(row * Int64(splits) + Int64(s)) * Int64(self.heads) + head])
+        for s in cutlass.range(row_splits, unroll=1):
+            value = Float32(lse[(row * Int64(max_splits) + Int64(s)) * Int64(self.heads) + head])
             if value > top:
                 top = value
         total = Float32(0.0)
         acc = Float32(0.0)
-        for s in cutlass.range(splits, unroll=1):
-            value = Float32(lse[(row * Int64(splits) + Int64(s)) * Int64(self.heads) + head])
+        for s in cutlass.range(row_splits, unroll=1):
+            value = Float32(lse[(row * Int64(max_splits) + Int64(s)) * Int64(self.heads) + head])
             if value > -Float32.inf:
                 w = cute.math.exp2((value - top) * Float32(LOG2_E), fastmath=False)
                 total = total + w
-                acc = acc + w * Float32(po[((row * Int64(splits) + Int64(s)) * Int64(self.heads) + head)
+                acc = acc + w * Float32(po[((row * Int64(max_splits) + Int64(s)) * Int64(self.heads) + head)
                                            * Int64(self.v_head) + dim])
         total = total + cute.math.exp2((sink - top) * Float32(LOG2_E), fastmath=False)
         o = cute.make_tensor(out, cute.make_layout((Int64(1) << Int64(40),)))
         o[(row * Int64(self.heads) + head) * Int64(self.v_head) + dim] = BFloat16(acc / total)
+
+    @cute.jit
+    def __call__(self, partial_out: cute.Pointer, partial_lse: cute.Pointer, positions: cute.Pointer,
+                 sinks: cute.Pointer, out: cute.Pointer, rows: Int32, max_splits: Int32,
+                 stream: cuda.CUstream):
+        self.kernel(partial_out, partial_lse, positions, sinks, out, rows, max_splits).launch(
+            grid=(self.heads, rows, 1), block=(self.v_head, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, partial_out: cute.Pointer, partial_lse: cute.Pointer, positions: cute.Pointer,
+               sinks: cute.Pointer, out: cute.Pointer, rows: Int32, max_splits: Int32):
+        head_i, row_i, _ = cute.arch.block_idx()
+        dim = Int64(cute.arch.thread_idx()[0])
+        head, row = Int64(head_i), Int64(row_i)
+        if const_expr(self.per_row_splits):
+            pos_t = cute.make_tensor(positions, cute.make_layout((Int64(rows),)))
+            p = Int64(pos_t[row])
+            n64 = (p + Int64(self.split_chunk)) // Int64(self.split_chunk)
+            n64 = cutlass.select_(n64 < Int64(1), Int64(1), n64)
+            n64 = cutlass.select_(n64 > Int64(max_splits), Int64(max_splits), n64)
+            row_splits = Int32(n64)
+            if row_splits > Int32(1):
+                self._merge_row(partial_out, partial_lse, sinks, out, head, row, dim, max_splits, row_splits)
+        else:
+            self._merge_row(partial_out, partial_lse, sinks, out, head, row, dim, max_splits, max_splits)

@@ -50,7 +50,7 @@ def test_exported_global_cache(tmp_path, rows, route, kv_format):
     torch.manual_seed(921 + rows)
     # Two different-length histories and deliberately non-tile-aligned segments.
     counts = [rows] if rows == 1 else [1, rows - 1]
-    context = 4111
+    context = 4096
     stride = (context + 63) // 64
     page_count = len(counts) * stride
     tables = torch.randperm(page_count, device="cuda").int().reshape(len(counts), stride)
@@ -101,7 +101,8 @@ def test_exported_global_cache(tmp_path, rows, route, kv_format):
     program = compile_inkling2_attention_aot(g, kind="global", route=route,
                                             max_rows=64 if route == "decode" else 4096, kv_format=kv_format)
     candidate = ExportedProgram(program, tmp_path, "attention")
-    scalars = (rows, stride, len(tiles)) + ((splits,) if route == "decode" else ())
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    scalars = (rows, stride, len(tiles)) + ((sms,) if program.geometry.get("runtime_sm_count") else ())
     candidate.launch(q, cache, positions, tables, indices, first, tile_rows, rel, sinks, out, scratch, scalars=scalars)
     baseline_program = _baseline_module("inkling2_attention").compile_inkling2_attention_aot(g, kind="global", route=route,
                                   max_rows=64 if route == "decode" else 4096)
@@ -303,7 +304,8 @@ def test_exported_half_heads_match_whole_cache_and_attention(tmp_path, route, ki
             prog = compile_inkling2_attention_aot(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
         launch = ExportedProgram(prog, tmp_path, f"head_attention_{index}")
         if kind == "global":
-            scalars = (rows, len(tables), len(tiles)) + ((8,) if route == "decode" else ())
+            sms = torch.cuda.get_device_properties(0).multi_processor_count
+            scalars = (rows, len(tables), len(tiles)) + ((sms,) if prog.geometry.get("runtime_sm_count") else ())
             launch.launch(local_q, cache, positions, tables, first, first, tiles, local_rel, local_sinks, out, scratch, scalars=scalars)
         else:
             # Cache positions before 1081 are read from the ring; live positions

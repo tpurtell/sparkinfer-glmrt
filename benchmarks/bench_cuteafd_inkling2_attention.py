@@ -163,14 +163,14 @@ def bench_decode(g, concurrency: int, context: int, samples: int, flush, gen, sp
     result["control_us"] = time_us(lambda: control.launch(q, records, ring2, positions, slots2, first, sinks_head,
                                                           out, scratch, scalars=(rows,)), samples, flush)
 
-    glob = compile_inkling2_attention_aot(g, kind="global", route="decode", max_rows=64)
+    glob = compile_inkling2_attention_aot(g, kind="global", route="decode", max_rows=64, max_splits=splits)
     pages = -(-(context + 1) // g.page_rows)
     cache = torch.randn((rows * pages * g.page_rows, g.record_elems), generator=gen, device="cuda").bfloat16()
     table = (torch.arange(rows, device="cuda")[:, None] * pages + torch.arange(pages, device="cuda")[None]).int()
     rel_g = rel if g.extent("global") == g.extent("local") else _inputs(g, rows, "global", gen)[1]
     gscratch = torch.empty(max(glob.scratch_bytes(rows)["scratch"], 1024), dtype=torch.uint8, device="cuda")
     result["global_us"] = time_us(lambda: glob.launch(q, cache, positions, table, first, first, tile_rows, rel_g, sinks, out, gscratch,
-                                                      scalars=(rows, pages, len(tile_rows), splits)), samples, flush)
+                                                      scalars=(rows, pages, len(tile_rows))), samples, flush)
     result["local_over_control"] = result["local_us"] / result["control_us"]
     # Bytes the local decode must stream: K/V of the window for every row (bias is 96 KiB/row on top).
     kv_bytes = rows * g.window * g.record_elems * 2
