@@ -38,12 +38,14 @@ def _pack_and_dequant_fp8(k: torch.Tensor, v: torch.Tensor, g):
 
 
 def _launch_global(program, q, cache, positions, tables, indices, first, tile_rows, rel, sinks,
-                   scratch=None):
+                   scratch=None, sm_count=None):
     out = torch.empty_like(q)
     rows = q.shape[0]
     if scratch is None:
         scratch = torch.empty(max(program.scratch_bytes(rows)["scratch"], 1024), dtype=torch.uint8, device="cuda")
     scalars = (rows, tables.shape[-1], tile_rows.shape[0])
+    if sm_count is not None and program.geometry.get("runtime_sm_count"):
+        scalars = (*scalars, sm_count)
     program.launch(q, cache, positions, tables, indices, first, tile_rows, rel, sinks, out, scratch, scalars=scalars)
     return out
 
@@ -137,8 +139,10 @@ def test_fp8_global_prefill_bit_identical_to_dequant_bf16(geom_name, rows):
 
 
 @pytest.mark.parametrize("geom_name", ["small_tp1", "mini"])
-def test_fp8_global_decode_batch_invariance(geom_name):
-    """Same row run alone vs packed with BOTH shorter and longer rows produces 0 bit differences."""
+@pytest.mark.parametrize("sm_count", [None, 48, 84, 170, 188])
+def test_fp8_global_decode_batch_invariance(geom_name, sm_count):
+    """Same row run alone vs packed with BOTH shorter and longer rows produces 0 bit differences
+    under both live device SM count and simulated SM tiers (GB10 48, 84, RTX 5090 170, PRO 6000 188)."""
     require_b12x()
     from b12x.integration.cuteafd import INKLING2_MINI, INKLING2_SMALL
     from b12x.integration.cuteafd.inkling2_attention import compile_inkling2_attention_aot
@@ -167,7 +171,7 @@ def test_fp8_global_decode_batch_invariance(geom_name):
     tiles_batch = torch.arange(n_batch, device="cuda", dtype=torch.int32)
 
     out_batch = _launch_global(prog, q_batch, fp8_cache, pos_batch, tables, idx_batch, first_batch, tiles_batch,
-                               rel_batch, sinks_batch)
+                               rel_batch, sinks_batch, sm_count=sm_count)
     torch.cuda.synchronize()
 
     z1 = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -180,16 +184,18 @@ def test_fp8_global_decode_batch_invariance(geom_name):
             tables, z1, z1, z1,
             rel_batch[row_idx:row_idx + 1].contiguous(),
             sinks_batch[row_idx:row_idx + 1].contiguous(),
+            sm_count=sm_count,
         )
         torch.cuda.synchronize()
         assert torch.equal(out_alone[0], out_batch[row_idx]), (
-            f"{geom_name} pos={batch_positions[row_idx]}: alone vs mixed-batch drifted "
+            f"{geom_name} sm_count={sm_count} pos={batch_positions[row_idx]}: alone vs mixed-batch drifted "
             f"(max diff {(out_alone[0].float() - out_batch[row_idx].float()).abs().max().item()})"
         )
 
 
 @pytest.mark.parametrize("geom_name", ["small_tp1", "mini"])
-def test_fp8_global_decode_verify_matches_decode_across_bucket_edges(geom_name):
+@pytest.mark.parametrize("sm_count", [None, 48, 170, 188])
+def test_fp8_global_decode_verify_matches_decode_across_bucket_edges(geom_name, sm_count):
     """Multi-row speculative verify straddling split-count bucket edges matches 1-by-1 decode bit-for-bit."""
     require_b12x()
     from b12x.integration.cuteafd import INKLING2_MINI, INKLING2_SMALL
@@ -217,7 +223,8 @@ def test_fp8_global_decode_verify_matches_decode_across_bucket_edges(geom_name):
         first = torch.zeros(verify_rows, device="cuda", dtype=torch.int32)
         tiles = torch.arange(verify_rows, device="cuda", dtype=torch.int32)
 
-        out_verify = _launch_global(prog, q, fp8_cache, positions, tables, idx, first, tiles, rel, sinks)
+        out_verify = _launch_global(prog, q, fp8_cache, positions, tables, idx, first, tiles, rel, sinks,
+                                    sm_count=sm_count)
         torch.cuda.synchronize()
         for r in range(verify_rows):
             out_decode = _launch_global(
@@ -228,9 +235,10 @@ def test_fp8_global_decode_verify_matches_decode_across_bucket_edges(geom_name):
                 tables, z1, z1, z1,
                 rel[r:r + 1].contiguous(),
                 sinks[r:r + 1].contiguous(),
+                sm_count=sm_count,
             )
             torch.cuda.synchronize()
             assert torch.equal(out_verify[r], out_decode[0]), (
-                f"{geom_name} verify start={start_pos} pos={start_pos + r}: verify vs decode drifted "
+                f"{geom_name} sm_count={sm_count} verify start={start_pos} pos={start_pos + r}: verify vs decode drifted "
                 f"(max diff {(out_verify[r].float() - out_decode[0].float()).abs().max().item()})"
             )

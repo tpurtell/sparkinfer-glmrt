@@ -101,7 +101,8 @@ def test_exported_global_cache(tmp_path, rows, route, kv_format):
     program = compile_inkling2_attention_aot(g, kind="global", route=route,
                                             max_rows=64 if route == "decode" else 4096, kv_format=kv_format)
     candidate = ExportedProgram(program, tmp_path, "attention")
-    scalars = (rows, stride, len(tiles))
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    scalars = (rows, stride, len(tiles)) + ((sms,) if program.geometry.get("runtime_sm_count") else ())
     candidate.launch(q, cache, positions, tables, indices, first, tile_rows, rel, sinks, out, scratch, scalars=scalars)
     baseline_program = _baseline_module("inkling2_attention").compile_inkling2_attention_aot(g, kind="global", route=route,
                                   max_rows=64 if route == "decode" else 4096)
@@ -303,7 +304,8 @@ def test_exported_half_heads_match_whole_cache_and_attention(tmp_path, route, ki
             prog = compile_inkling2_attention_aot(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
         launch = ExportedProgram(prog, tmp_path, f"head_attention_{index}")
         if kind == "global":
-            scalars = (rows, len(tables), len(tiles))
+            sms = torch.cuda.get_device_properties(0).multi_processor_count
+            scalars = (rows, len(tables), len(tiles)) + ((sms,) if prog.geometry.get("runtime_sm_count") else ())
             launch.launch(local_q, cache, positions, tables, first, first, tiles, local_rel, local_sinks, out, scratch, scalars=scalars)
         else:
             # Cache positions before 1081 are read from the ring; live positions

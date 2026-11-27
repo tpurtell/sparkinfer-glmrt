@@ -2,14 +2,19 @@
 
 Global operands are q, kv_cache, positions, page_table, table_indices,
 seq_first, tile_rows, rel, sinks, out, scratch; runtime scalars are rows,
-table_stride, and tiles. Each row selects the request page table at
-table_indices[row]*table_stride. Global decode derives each row's split count
-on device from its own context length (``clamp(ceil((pos + 1) / split_chunk),
-1, max_splits)``), so a row's reduction order is independent of batch
-composition and rows with 1 split write directly without touching scratch. FP8
-records contain K[1024] and V[1024] E4M3 payloads then K-scale[8] and
-V-scale[8] FP32 descales in one 2112-byte physical record. BF16 records retain
-their 4096-byte layout.
+table_stride, tiles, and (global decode with max_splits > 1) the launcher's
+runtime ``device_sm_count`` (``cudaDevAttrMultiProcessorCount``). Each row
+selects the request page table at table_indices[row]*table_stride. Global
+decode derives each row's split count on device from its own context length
+and the device's static SM count:
+
+    active_max_splits = device_max_splits(device_sm_count, max_splits)
+    row_splits = clamp(ceil((pos + 1) / split_chunk), 1, active_max_splits)
+
+so a row's reduction order is independent of batch composition and rows with
+1 split write directly without touching scratch. FP8 records contain K[1024]
+and V[1024] E4M3 payloads then K-scale[8] and V-scale[8] FP32 descales in
+one 2112-byte physical record. BF16 records retain their 4096-byte layout.
 
 Local operands are q, kv_step, ring, positions, ring_slots, seq_first,
 tile_rows, rel, sinks, out, scratch; scalars are rows and tiles. Local
@@ -40,6 +45,7 @@ __all__ = [
     "DEFAULT_SPLIT_CHUNK",
     "attention_scratch_bytes",
     "compile_inkling2_attention_aot",
+    "device_max_splits",
     "prefill_tokens",
     "record_bytes",
     "row_splits",
@@ -74,13 +80,34 @@ def prefill_tokens(g: Inkling2Geometry) -> int:
     return 64 // (g.heads // g.kv_heads)
 
 
+def device_max_splits(sm_count: int, max_splits: int = DEFAULT_MAX_SPLITS) -> int:
+    """Static per-device split cap derived from ``cudaDevAttrMultiProcessorCount``.
+
+    - ``sm_count >= 128`` (RTX PRO 6000 188 SMs, RTX 5090 170 SMs): up to 32 splits
+    - ``64 <= sm_count < 128`` (mid-SM SM120 cards): up to 16 splits
+    - ``0 < sm_count < 64`` (GB10 48 SMs, off the serving path): up to 8 splits
+    """
+    cap = max(1, int(max_splits))
+    sms = int(sm_count)
+    if sms <= 0:
+        return cap
+    if sms < 64:
+        limit = 8
+    elif sms < 128:
+        limit = 16
+    else:
+        limit = 32
+    return max(1, min(cap, limit))
+
+
 def row_splits(context_len: int, max_splits: int = DEFAULT_MAX_SPLITS,
-               split_chunk: int = DEFAULT_SPLIT_CHUNK) -> int:
+               split_chunk: int = DEFAULT_SPLIT_CHUNK, sm_count: int | None = None) -> int:
     """Per-row split count chosen on device for a row with ``context_len`` keys (``pos + 1``)."""
     if int(split_chunk) <= 0:
         raise ValueError("split_chunk must be positive")
+    cap = max(1, int(max_splits)) if sm_count is None else device_max_splits(sm_count, max_splits)
     n = (int(context_len) + int(split_chunk) - 1) // int(split_chunk)
-    return max(1, min(int(max_splits), n))
+    return max(1, min(cap, n))
 
 
 def attention_scratch_bytes(g: Inkling2Geometry, kind: str, route: str, rows: int,
@@ -110,6 +137,7 @@ class _GlobalAttention:
         self.split_chunk = int(split_chunk)
         decode = route == "decode"
         per_row = decode and self.max_splits > 1
+        self.runtime_sm_count = per_row
         if not decode and kv_format == "fp8" and _is_inkling2_mini_geometry(g):
             self.attn = InklingMiniGlobalFp8Prefill(softmax_scale=g.softmax_scale)
         else:
@@ -124,13 +152,13 @@ class _GlobalAttention:
 
     def key(self) -> tuple:
         return (self.attn.key(), None if self.merge is None else self.merge.key(),
-                self.route, self.max_splits, self.split_chunk)
+                self.route, self.max_splits, self.split_chunk, self.runtime_sm_count)
 
     @cute.jit
-    def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
-                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
-                 rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
-                 table_stride: Int32, tiles: Int32, stream: cuda.CUstream):
+    def run(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+            table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
+            rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+            table_stride: Int32, tiles: Int32, device_sm_count: Int32, stream: cuda.CUstream):
         base = Int64(scratch.toint())
         partials = cute.make_ptr(cutlass.Float32, base, cute.AddressSpace.gmem, assumed_align=16)
         lse_off = base + (Int64(rows) * Int64(self.max_splits * self.g.heads * self.g.head_dim * 4)
@@ -138,12 +166,45 @@ class _GlobalAttention:
         lse = cute.make_ptr(cutlass.Float32, lse_off, cute.AddressSpace.gmem, assumed_align=16)
         # The ring operands (kv_step, ring_slots, seq_first) are unused on the paged route.
         if cutlass.const_expr(self.merge is not None):
+            limit = Int32(self.max_splits)
+            if device_sm_count > Int32(0):
+                if device_sm_count < Int32(64):
+                    limit = Int32(8)
+                elif device_sm_count < Int32(128):
+                    limit = Int32(16)
+                else:
+                    limit = Int32(32)
+            active_splits = Int32(self.max_splits)
+            if limit < active_splits:
+                active_splits = limit
+            if active_splits < Int32(1):
+                active_splits = Int32(1)
             self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first,
-                      rel, sinks, out, partials, lse, rows, table_stride, tiles, Int32(self.max_splits), stream)
-            self.merge(partials, lse, positions, sinks, out, rows, Int32(self.max_splits), stream)
+                      rel, sinks, out, partials, lse, rows, table_stride, tiles, active_splits, stream)
+            self.merge(partials, lse, positions, sinks, out, rows, active_splits, stream)
         else:
             self.attn(q, kv_cache, kv_cache, positions, page_table, table_indices, tile_rows, seq_first, seq_first, rel,
                       sinks, out, partials, lse, rows, table_stride, tiles, Int32(1), stream)
+
+
+class _GlobalAttentionDecode(_GlobalAttention):
+    @cute.jit
+    def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
+                 rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 table_stride: Int32, tiles: Int32, device_sm_count: Int32, stream: cuda.CUstream):
+        self.run(q, kv_cache, positions, page_table, table_indices, seq_first, tile_rows, rel, sinks, out, scratch,
+                 rows, table_stride, tiles, device_sm_count, stream)
+
+
+class _GlobalAttentionDirect(_GlobalAttention):
+    @cute.jit
+    def __call__(self, q: cute.Pointer, kv_cache: cute.Pointer, positions: cute.Pointer, page_table: cute.Pointer,
+                 table_indices: cute.Pointer, seq_first: cute.Pointer, tile_rows: cute.Pointer,
+                 rel: cute.Pointer, sinks: cute.Pointer, out: cute.Pointer, scratch: cute.Pointer, rows: Int32,
+                 table_stride: Int32, tiles: Int32, stream: cuda.CUstream):
+        self.run(q, kv_cache, positions, page_table, table_indices, seq_first, tile_rows, rel, sinks, out, scratch,
+                 rows, table_stride, tiles, Int32(0), stream)
 
 
 class _LocalAttention:
@@ -190,8 +251,10 @@ def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind
     sinks = Operand("sinks", torch.float32, f"[rows,{n}]", align=4, note="unscaled sink logit per (row, head)")
     out = Operand("out", torch.bfloat16, f"[rows,{n},{d}]", "out")
     scratch = Operand("scratch", torch.uint8, "[attention_scratch_bytes]", "scratch")
+    runtime_sm_count = kind == "global" and route == "decode" and int(max_splits) > 1
     if kind == "global":
-        launch = _GlobalAttention(g, route, max_splits, split_chunk, kv_format)
+        cls = _GlobalAttentionDecode if runtime_sm_count else _GlobalAttentionDirect
+        launch = cls(g, route, max_splits, split_chunk, kv_format)
         operands = (q, Operand("kv_cache", torch.uint8 if kv_format == "fp8" else torch.bfloat16,
                                   f"[pages*{g.page_rows},{record_bytes(g, kv_format)} bytes]"),
                     Operand("positions", torch.int64, "[rows]", align=8),
@@ -200,6 +263,8 @@ def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind
                     Operand("seq_first", torch.int32, "[rows]", align=4),
                     Operand("tile_rows", torch.int32, "[tiles]", align=4), rel, sinks, out, scratch)
         scalars = (Scalar("rows"), Scalar("table_stride"), Scalar("tiles"))
+        if runtime_sm_count:
+            scalars += (Scalar("device_sm_count"),)
     else:
         launch = _LocalAttention(g, route)
         operands = (q, Operand("kv_step", torch.bfloat16, f"[rows,{r}]"),
@@ -209,17 +274,19 @@ def compile_inkling2_attention_aot(g: Inkling2Geometry = INKLING2_SMALL, *, kind
                     Operand("seq_first", torch.int32, "[rows]", align=4),
                     Operand("tile_rows", torch.int32, "[tiles]", align=4), rel, sinks, out, scratch)
         scalars = (Scalar("rows"), Scalar("tiles"))
+    geometry = {"kind": kind, "route": route, "heads": n, "kv_heads": g.kv_heads, "head_dim": d,
+                "record_elems": r, "record_bytes": record_bytes(g, kv_format),
+                "cache_abi": 2, "kv_format": kv_format, "scale_offset": g.record_elems if kv_format == "fp8" else 0,
+                "max_rows": max_rows, "window": g.window if kind == "local" else 0, "extent": extent,
+                "ring_rows": g.ring_rows, "page_rows": g.page_rows, "sinks": "per_row_head",
+                "max_splits": int(max_splits) if kind == "global" and route == "decode" else 1,
+                "split_chunk": int(split_chunk) if runtime_sm_count else 0,
+                "runtime_sm_count": runtime_sm_count,
+                "rows_per_cta": launch.attn.tokens}
     return compile_program(
         launch, name=f"inkling2_{kind}_attention", operands=operands, scalars=scalars,
         key=("cache_v2", max_rows, kind, route, kv_format, launch.key()),
-        geometry={"kind": kind, "route": route, "heads": n, "kv_heads": g.kv_heads, "head_dim": d,
-                  "record_elems": r, "record_bytes": record_bytes(g, kv_format),
-                  "cache_abi": 2, "kv_format": kv_format, "scale_offset": g.record_elems if kv_format == "fp8" else 0, "max_rows": max_rows,
-                  "window": g.window if kind == "local" else 0, "extent": extent, "ring_rows": g.ring_rows,
-                  "page_rows": g.page_rows, "sinks": "per_row_head",
-                  "max_splits": int(max_splits) if kind == "global" and route == "decode" else 1,
-                  "split_chunk": int(split_chunk) if kind == "global" and route == "decode" and int(max_splits) > 1 else 0,
-                  "rows_per_cta": launch.attn.tokens},
+        geometry=geometry,
         scratch={"scratch": lambda rows: attention_scratch_bytes(g, kind, route, rows, max_splits)},
         doc=__doc__,
     )
