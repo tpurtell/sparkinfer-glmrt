@@ -1,10 +1,12 @@
-"""Row-curve and route-exactness benchmark for small-row BF16 projections and Muse F32 router.
+"""Row-curve and route-exactness benchmark for small-row BF16 TMA tiles and Muse F32 router.
 
 Follows CuteAFD's kernel row-curve rule (AGENTS.md):
 - Measures warmed L2-cold time per routed row across decode/verify (1..64) and
   the live prefill band (2048/2752/4096 plus real tails).
 - Supports ``--capacity``, ``--routes``, ``--compare-routes-exact``, and
-  ``--check-prefix-rows``.
+  ``--check-prefix-rows``. Every route is verified bitwise-identical across all
+  row thresholds (1..capacity) against both stock prefill/scalar and a 64-row
+  single-row oracle.
 """
 from __future__ import annotations
 
@@ -30,11 +32,11 @@ CASES = {
     "muse_tp1_kv": ("p1", 8192, 1024, torch.bfloat16),
     "hy4f_latent_down": ("p1", 3072, 1536, torch.bfloat16),
     "hy4_q_a": ("p1", 6144, 2048, torch.bfloat16),
-    "step5_router": ("p2", 4096, 352, torch.float32),
-    "step5_attn_gate": ("p2", 4096, 64, torch.bfloat16),
-    "ml4_index_kw": ("p2", 6144, 160, torch.bfloat16),
-    "hy4f_indexer_wk": ("p2", 3072, 128, torch.bfloat16),
-    "step5_index_weight": ("p2_scale", 4096, 16, torch.float32),
+    "step5_router": ("p1", 4096, 352, torch.float32),
+    "step5_attn_gate": ("p1", 4096, 64, torch.bfloat16),
+    "ml4_index_kw": ("p1", 6144, 160, torch.bfloat16),
+    "hy4f_indexer_wk": ("p1", 3072, 128, torch.bfloat16),
+    "step5_index_weight": ("p1_scale", 4096, 16, torch.float32),
     "muse_router": ("p3", 8192, 256, torch.float32),
 }
 
@@ -99,58 +101,44 @@ def main():
             )
             run_new = lambda m: prog_new.launch(x[:m], w, out_new[:m], scalars=(m,))
             run_old = lambda m: prog_old.launch(x[:m], w, out_old[:m], scalars=(m,))
-            exact_cutoff = 0
-            prefix_cap = args.capacity
-        elif kind == "p2":
-            prog_new = pointwise.compile_bf16_projection_aot(
-                width=k, outputs=n, output_dtype=dtype, skinny_max_rows=64)
-            old_launch = TmaBf16Projection(n, k, out_dtype=c_dt, tiles_by_rows=())
-            prog_old = compile_program(
-                old_launch, name=f"old_{name}",
-                operands=(Operand("x", torch.bfloat16, f"[r,{k}]"),
-                          Operand("w", torch.bfloat16, f"[{n},{k}]"),
-                          Operand("o", dtype, f"[r,{n}]", "out")),
-                scalars=(Scalar("r"),), key=("old_p2", old_launch.key()),
-            )
-            run_new = lambda m: prog_new.launch(x[:m], w, out_new[:m], scalars=(m,))
-            run_old = lambda m: prog_old.launch(x[:m], w, out_old[:m], scalars=(m,))
-            exact_cutoff = 64
-            prefix_cap = 64
-        elif kind == "p2_scale":
+            run_one = lambda r, dst: prog_new.launch(x[r:r + 1], w, dst, scalars=(1,))
+        elif kind == "p1_scale":
             prog_new = pointwise.compile_bf16_scaled_projection_aot(width=k, outputs=n, prescale=0.5)
-            old_launch = pointwise.ScaleProjection(k, n, 0.5, skinny_max_rows=0)
+            old_tma = TmaBf16Projection(n, k, out_dtype=cutlass.BFloat16, tiles_by_rows=())
+            old_scale = pointwise.ScaleProjection(k, n, 0.5)
+            old_scale.projection = old_tma
             prog_old = compile_program(
-                old_launch, name=f"old_{name}",
+                old_scale, name=f"old_{name}",
                 operands=(Operand("x", torch.bfloat16, f"[r,{k}]"),
                           Operand("w", torch.bfloat16, f"[{n},{k}]"),
                           Operand("o", torch.float32, f"[r,{n}]", "out"),
                           Operand("s", torch.bfloat16, f"[r,{n}]", "scratch")),
-                scalars=(Scalar("r"),), key=("old_scale", k, n),
+                scalars=(Scalar("r"),), key=("old_scale_tma", k, n),
                 scratch={"s": lambda r: int(r) * int(n) * 2},
             )
             run_new = lambda m: prog_new.launch(x[:m], w, out_new[:m], scratch[:m], scalars=(m,))
             run_old = lambda m: prog_old.launch(x[:m], w, out_old[:m], scratch[:m], scalars=(m,))
-            exact_cutoff = 64
-            prefix_cap = 64
+            run_one = lambda r, dst: prog_new.launch(x[r:r + 1], w, dst, scratch[:1], scalars=(1,))
         else:
             prog_new = muse.compile_router_aot()
             prog_old = muse.compile_router_aot(scalar_max_rows=2**31 - 1)
             prog_old_tiled = muse.compile_router_aot(scalar_max_rows=0)
             run_new = lambda m: prog_new.launch(x[:m], w, out_new[:m], scalars=(m,))
             run_old = lambda m: (prog_old if m <= 16 else prog_old_tiled).launch(x[:m], w, out_old[:m], scalars=(m,))
-            exact_cutoff = 0
-            prefix_cap = args.capacity
+            run_one = lambda r, dst: prog_new.launch(x[r:r + 1], w, dst, scalars=(1,))
 
         print(f"\n=== {name} ({kind}, K={k}, N={n}) ===", flush=True)
         print(f"{'rows':>6} | {'old_us':>8} | {'new_us':>8} | {'speedup':>7} | {'us/row':>8} | checks", flush=True)
-        one_ref = None
+        singles = None
         if args.check_prefix_rows:
-            run_new(1)
+            n_ref = min(64, args.capacity)
+            singles = torch.empty((n_ref, n), dtype=dtype, device="cuda")
+            for r in range(n_ref):
+                run_one(r, singles[r:r + 1])
             torch.cuda.synchronize()
-            one_ref = out_new[:1].clone()
         for m in row_list:
             checks = []
-            if args.compare_routes_exact and (exact_cutoff == 0 or m > exact_cutoff):
+            if args.compare_routes_exact:
                 run_new(m)
                 run_old(m)
                 torch.cuda.synchronize()
@@ -158,10 +146,11 @@ def main():
                 checks.append(f"exact={'OK' if ok else 'FAIL'}")
                 if not ok:
                     raise AssertionError(f"{name} rows={m} failed --compare-routes-exact")
-            if args.check_prefix_rows and m <= prefix_cap:
+            if args.check_prefix_rows:
                 run_new(m)
                 torch.cuda.synchronize()
-                ok = bool(torch.equal(_bits(out_new[:1]), _bits(one_ref)))
+                check = min(m, singles.shape[0])
+                ok = bool(torch.equal(_bits(out_new[:check]), _bits(singles[:check])))
                 checks.append(f"prefix={'OK' if ok else 'FAIL'}")
                 if not ok:
                     raise AssertionError(f"{name} rows={m} failed --check-prefix-rows")

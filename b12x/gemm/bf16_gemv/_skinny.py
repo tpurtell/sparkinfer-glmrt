@@ -32,7 +32,6 @@ __all__ = [
     "TmaBf16Projection",
     "decode_tma_tiles",
     "default_decode_tma_tiles",
-    "narrow_skinny_tiles",
     "prefill_config",
     "skinny_config",
     "skinny_max_rows",
@@ -260,36 +259,6 @@ ROUTER_TILES_BY_ROWS = {
     (256, 4096): ((16, 4, 2, 256), (64, 8, 4, 256)),
     (384, 7168): ((16, 4, 2, 224), (64, 4, 4, 224)),
 }
-
-
-def narrow_skinny_tiles(n: int, k: int, max_rows: int = 64) -> tuple:
-    """Single-thread-count ``RowTiledSkinnyBf16Gemv`` tiles for narrow projections.
-
-    Every band shares one CTA thread count, so each thread sums the same K
-    vectors in the same order and every row's output is bit-identical across
-    ``1..=max_rows``. Wide CTA thread counts (up to 512 for very narrow N) keep
-    SM120 saturated when N is small (e.g. 16-64); for ``17..=max_rows`` the
-    tile grows to 16 rows and up to 4 columns to cut weight reloads in half.
-    """
-    n, k, max_rows = int(n), int(k), int(max_rows)
-    if k % 8 != 0 or n <= 0 or max_rows <= 0:
-        raise ValueError("narrow_skinny_tiles requires positive N, max_rows and K % 8 == 0")
-    vectors = k // 8
-    target = 512 if n <= 64 else 256
-    candidates = tuple(t for t in (512, 384, 288, 256, 224, 192, 160, 128, 96, 64, 32)
-                       if t <= target and vectors % t == 0)
-    if not candidates:
-        candidates = tuple(t for t in (512, 384, 288, 256, 224, 192, 160, 128, 96, 64, 32)
-                           if vectors % t == 0)
-    if not candidates:
-        raise ValueError(f"K/8={vectors} has no valid warp-multiple CTA thread count")
-    threads = candidates[0]
-    if max_rows <= 16:
-        return ((max_rows, 1, 8, threads),)
-    wide_cols = next(c for c in (8, 4, 2, 1)
-                     if n % c == 0 and 16 * c <= threads
-                     and ((c == 8 and n // c >= 32) or (c in (4, 2) and n // c >= 16) or c == 1))
-    return ((16, 1, 8, threads), (max_rows, wide_cols, 16, threads))
 
 
 def router_skinny(n: int, k: int, *, kernel_type=SkinnyBf16Gemv):

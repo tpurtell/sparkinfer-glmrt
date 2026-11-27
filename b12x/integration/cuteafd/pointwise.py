@@ -589,70 +589,20 @@ class PostSiluSplit:
             out[i] = Float32(_post_silu_product(Float32(gate[i]), Float32(up[i]), self.limit)).to(BFloat16)
 
 
-class _ScaledSkinnyBf16Gemv:
-    """Single-launch skinny GEMV with fused BF16-rounded prescale epilogue."""
-
-    def __init__(self, n: int, k: int, prescale: float, max_rows: int = 64):
-        from b12x.gemm.bf16_gemv._skinny import (
-            RowTiledSkinnyBf16Gemv,
-            SkinnyBf16Gemv,
-            narrow_skinny_tiles,
-        )
-
-        scale_val = float(prescale)
-
-        class _Kernel(SkinnyBf16Gemv):
-            @cute.jit
-            def _epilogue(self, value: Float32):
-                return _mul(_bf16(value), Float32(scale_val))
-
-        self.tiles_by_rows = narrow_skinny_tiles(n, k, max_rows=max_rows)
-        self.inner = RowTiledSkinnyBf16Gemv(
-            n, k, self.tiles_by_rows, out_dtype=Float32, kernel_type=_Kernel)
-
-    @cute.jit
-    def __call__(self, x: cute.Pointer, w: cute.Pointer, out: cute.Pointer, rows: Int32,
-                 stream: cuda.CUstream):
-        self.inner(x, w, out, rows, stream)
-
-
 class ScaleProjection:
-    def __init__(self, width, outputs, prescale, *, skinny_max_rows: int = 64):
+    def __init__(self, width, outputs, prescale):
         from ._glm_kernels import glm_projection
 
-        self.width, self.outputs, self.prescale = int(width), int(outputs), float(prescale)
-        self.skinny_max_rows = int(skinny_max_rows) if (self.width % 8 == 0 and self.outputs <= 256) else 0
-        self.skinny = (_ScaledSkinnyBf16Gemv(self.outputs, self.width, self.prescale,
-                                             max_rows=self.skinny_max_rows)
-                       if self.skinny_max_rows > 0 else None)
+        self.outputs, self.prescale = int(outputs), float(prescale)
         self.projection = glm_projection(outputs, width)
-
-    @property
-    def exact_row_cap(self) -> int:
-        return self.skinny_max_rows if self.skinny_max_rows > 0 else 2**31 - 1
-
-    def key(self) -> tuple:
-        if self.skinny is not None:
-            return (self.width, self.outputs, self.prescale, "skinny",
-                    self.skinny_max_rows, self.skinny.tiles_by_rows)
-        return (self.width, self.outputs, self.prescale)
 
     @cute.jit
     def __call__(self, x: cute.Pointer, weight: cute.Pointer, out: cute.Pointer,
                  scratch: cute.Pointer, rows: Int32, stream: cuda.CUstream):
-        if cutlass.const_expr(self.skinny is not None):
-            if rows <= Int32(self.skinny_max_rows):
-                self.skinny(x, weight, out, rows, stream)
-            else:
-                self.projection(x, weight, scratch, rows, stream)
-                self.scale(scratch, out, Int64(rows) * Int64(self.outputs)).launch(
-                    grid=((Int64(rows) * Int64(self.outputs) + Int64(255)) // Int64(256), 1, 1),
-                    block=(256, 1, 1), stream=stream)
-        else:
-            self.projection(x, weight, scratch, rows, stream)
-            self.scale(scratch, out, Int64(rows) * Int64(self.outputs)).launch(
-                grid=((Int64(rows) * Int64(self.outputs) + Int64(255)) // Int64(256), 1, 1),
-                block=(256, 1, 1), stream=stream)
+        self.projection(x, weight, scratch, rows, stream)
+        self.scale(scratch, out, Int64(rows) * Int64(self.outputs)).launch(
+            grid=((Int64(rows) * Int64(self.outputs) + Int64(255)) // Int64(256), 1, 1),
+            block=(256, 1, 1), stream=stream)
 
     @cute.kernel
     def scale(self, projected: cute.Pointer, out: cute.Pointer, count: Int64):
@@ -766,7 +716,7 @@ def compile_post_silu_split_aot(*, width, limit):
 
 
 def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, compensated=False,
-                                wide=False, skinny_max_rows=0):
+                                wide=False):
     """Canonical BF16 MMA projection, with one explicit output boundary.
 
     FP32 output preserves the accumulator (router/partial sums); BF16 output
@@ -779,16 +729,11 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, 
     ``wide`` adds the measured wide prefill route from the shape's floor
     (``WIDE_PREFILL_MIN_ROWS_BY_SHAPE``), still the same ordered-K16
     uncompensated fold.
-    ``skinny_max_rows`` opts narrow projections (``<= 64`` decode/verify rows)
-    into ``RowTiledSkinnyBf16Gemv`` with a single CTA thread count across
-    ``1..=skinny_max_rows`` (exact decode/verify row invariance) and the
-    standard TMA route above it.
     """
     from b12x.gemm.bf16_gemv._skinny import (
         COMPENSATED_TILES_BY_ROWS,
         RoutedBf16Projection,
         TmaBf16Projection,
-        narrow_skinny_tiles,
         wide_prefill_min_rows,
     )
 
@@ -798,30 +743,18 @@ def compile_bf16_projection_aot(*, width, outputs, output_dtype=torch.bfloat16, 
         raise ValueError("projection output is BF16 or FP32")
     if not isinstance(compensated, bool) or not isinstance(wide, bool):
         raise ValueError("projection compensated and wide must be boolean")
-    if not isinstance(skinny_max_rows, int) or isinstance(skinny_max_rows, bool) or skinny_max_rows < 0:
-        raise ValueError("projection skinny_max_rows must be a non-negative integer")
     if compensated and wide:
         raise ValueError("the wide prefill route is uncompensated")
-    if skinny_max_rows > 0 and (compensated or wide):
-        raise ValueError("skinny_max_rows requires an uncompensated non-wide projection")
     dtype = BFloat16 if output_dtype == torch.bfloat16 else Float32
     tiles_by_rows = COMPENSATED_TILES_BY_ROWS.get((int(outputs), int(width)), ()) if compensated else ()
     wide_min_rows = wide_prefill_min_rows(outputs, width, 2**31 - 1) if wide else None
     if wide and wide_min_rows is None:
         raise ValueError(f"no measured wide prefill floor for {outputs}x{width}")
-    if compensated:
-        launch = TmaBf16Projection(outputs, width, out_dtype=dtype, tiles_by_rows=tiles_by_rows,
-                                   compensated=True)
-    elif skinny_max_rows > 0:
-        skinny_tiles = narrow_skinny_tiles(outputs, width, max_rows=skinny_max_rows)
-        launch = RoutedBf16Projection(outputs, width, out_dtype=dtype,
-                                       max_skinny_rows=skinny_max_rows,
-                                       skinny_tiles_by_rows=skinny_tiles)
-    else:
-        launch = RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0,
-                                       wide=wide, wide_min_rows=wide_min_rows)
-    geometry = dict(width=width, outputs=outputs, output_dtype=str(output_dtype),
-                    skinny_rows=skinny_max_rows)
+    launch = TmaBf16Projection(outputs, width, out_dtype=dtype, tiles_by_rows=tiles_by_rows,
+                               compensated=True) \
+        if compensated else RoutedBf16Projection(outputs, width, out_dtype=dtype, max_skinny_rows=0,
+                                                 wide=wide, wide_min_rows=wide_min_rows)
+    geometry = dict(width=width, outputs=outputs, output_dtype=str(output_dtype), skinny_rows=0)
     if compensated:
         geometry["compensated"] = True
         if tiles_by_rows:
@@ -847,10 +780,9 @@ def compile_bf16_scaled_projection_aot(*, width, outputs, prescale):
         Operand("weight", torch.bfloat16, f"[{outputs},{width}] (rounded checkpoint weight)"),
         Operand("out", torch.float32, f"[rows,{outputs}]", "out"),
         Operand("scratch", torch.bfloat16, f"[rows,{outputs}]", "scratch")),
-        scalars=(Scalar("rows"),), key=launch.key(),
+        scalars=(Scalar("rows"),), key=(width, outputs, prescale),
         scratch={"scratch": lambda rows: int(rows) * int(outputs) * 2},
-        geometry=dict(width=width, outputs=outputs, prescale=prescale,
-                      exact_row_cap=launch.exact_row_cap))
+        geometry=dict(width=width, outputs=outputs, prescale=prescale))
 
 
 def compile_affine_norm_aot(*, width, heads=1, eps=1e-5, zero_centered=False,

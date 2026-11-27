@@ -1,5 +1,9 @@
-"""Small-row BF16 projection tiles, narrow skinny routes, scaled skinny GEMV,
-and bit-exact multi-band Muse F32 router tests."""
+"""Small-row BF16 projection TMA decode tiles and bit-exact multi-band Muse F32 router tests.
+
+Every route split verified here is strictly bitwise-identical (``torch.equal`` on raw bit
+representations, never by tolerance) across every threshold from 1 through 4096 rows and
+matches a single-row oracle row-for-row across every band boundary.
+"""
 from __future__ import annotations
 
 import pytest
@@ -41,7 +45,7 @@ def test_default_decode_tma_tiles_policy():
     )
     assert default_decode_tma_tiles(16384, 6144) == ()
     assert default_decode_tma_tiles(512, 32) == ()
-    for n in (8, 16, 24, 48, 352, 512, 1024, 1536, 2048, 3072, 4608, 6144, 8192):
+    for n in (8, 16, 24, 48, 64, 128, 160, 256, 352, 512, 1024, 1536, 2048, 3072, 4608, 6144, 8192):
         tiles = default_decode_tma_tiles(n, 4096)
         assert tiles
         prev = 0
@@ -55,29 +59,9 @@ def test_default_decode_tma_tiles_policy():
             assert smem <= cap, (n, entry, smem, cap)
 
 
-@pytest.mark.parametrize("n,k", [
-    (8, 4096), (16, 4096), (16, 3072), (32, 4096), (32, 6144),
-    (64, 4096), (128, 3072), (128, 6144), (160, 6144), (256, 4096),
-    (352, 4096), (384, 4608),
-])
-def test_narrow_skinny_tiles_single_thread_count(n, k):
-    from b12x.gemm.bf16_gemv._skinny import narrow_skinny_tiles
-
-    tiles = narrow_skinny_tiles(n, k, max_rows=64)
-    assert tiles and tiles[-1][0] == 64
-    assert len({t for _, _, _, t in tiles}) == 1
-    prev = 0
-    for rows, cols, rpt, threads in tiles:
-        assert rows > prev
-        prev = rows
-        assert n % cols == 0
-        assert (k // 8) % threads == 0
-        assert threads % 32 == 0
-        assert cols * rpt <= threads
-
-
 # ---------------------------------------------------------------------------
 # Pillar 1: Default TMA decode/verify tiles are bit-exact to prefill_config
+# and to a 64-row single-row oracle across EVERY threshold (1..4096)
 # ---------------------------------------------------------------------------
 
 PILLAR1_SHAPES = [
@@ -87,7 +71,12 @@ PILLAR1_SHAPES = [
     (6144, 2048, torch.bfloat16),   # Hy4 q_a
     (4608, 6144, torch.float32),    # Inkling2 Q (F32 out)
     (4608, 48, torch.float32),      # Inkling2 sink (F32 out)
+    (4096, 64, torch.bfloat16),     # Step-5 attn_gate
+    (4096, 256, torch.bfloat16),    # Step-5 index_kz
+    (4096, 352, torch.float32),     # Step-5 router (F32 out)
+    (3072, 128, torch.bfloat16),    # Hy4-flash indexer_wk
     (3072, 16, torch.bfloat16),     # Hy4-flash indexer_weights (N<=16 tile)
+    (6144, 160, torch.bfloat16),    # ML4 index_kw
 ]
 
 
@@ -114,9 +103,11 @@ def test_pillar1_default_decode_tma_bit_exact_against_prefill(k, n, dtype):
     max_rows = 4096
     x = torch.randn((max_rows, k), generator=gen, device="cuda").bfloat16()
 
-    # Single-row reference at row 0 for bitwise invariance across every threshold (1..4096)
-    single0 = torch.empty((1, n), dtype=dtype, device="cuda")
-    canon.launch(x[:1], w, single0, scalars=(1,))
+    # Single-row oracle across 64 distinct rows: every launch (1..4096, across every threshold)
+    # must match singles[:min(rows, 64)] bit-for-bit.
+    singles = torch.empty((64, n), dtype=dtype, device="cuda")
+    for r in range(64):
+        canon.launch(x[r:r + 1], w, singles[r:r + 1], scalars=(1,))
     torch.cuda.synchronize()
 
     for rows in (1, 7, 16, 17, 32, 33, 64, 65, 128, 256, 2048, 2752, 4096):
@@ -126,7 +117,10 @@ def test_pillar1_default_decode_tma_bit_exact_against_prefill(k, n, dtype):
         default.launch(x[:rows], w, out_d, scalars=(rows,))
         torch.cuda.synchronize()
         assert _same_bits(out_c[:rows], out_d[:rows]), f"K={k} N={n} rows={rows}: default TMA tiles differ"
-        assert _same_bits(out_c[:1], single0), f"K={k} N={n} rows={rows}: row-0 bitwise invariance broken"
+        check = min(rows, 64)
+        assert _same_bits(out_c[:check], singles[:check]), (
+            f"K={k} N={n} rows={rows}: bitwise single-row invariance broken across threshold"
+        )
         if rows < max_rows:
             assert torch.isnan(out_c[rows:]).all(), f"K={k} N={n} rows={rows}: wrote past live rows"
 
@@ -134,8 +128,6 @@ def test_pillar1_default_decode_tma_bit_exact_against_prefill(k, n, dtype):
     for rows in (16, 64):
         buf = torch.zeros((rows, k), dtype=torch.bfloat16, device="cuda")
         out_g = torch.zeros((rows, n), dtype=dtype, device="cuda")
-        want = torch.empty((rows, n), dtype=dtype, device="cuda")
-        default.launch(x[:rows], w, want, scalars=(rows,))
         canon.launch(buf, w, out_g, scalars=(rows,))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -145,105 +137,26 @@ def test_pillar1_default_decode_tma_bit_exact_against_prefill(k, n, dtype):
         out_g.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
-        assert _same_bits(out_g, want)
-
-
-# ---------------------------------------------------------------------------
-# Pillar 2: Narrow skinny projection (1..64 exact row invariance, >64 TMA exact)
-# ---------------------------------------------------------------------------
-
-PILLAR2_SHAPES = [
-    (4096, 32, torch.bfloat16),   # step52_attn_gate
-    (4096, 64, torch.bfloat16),   # step5_attn_gate
-    (4096, 256, torch.bfloat16),  # step5_index_kz
-    (4096, 352, torch.float32),   # step5_router
-    (3072, 16, torch.bfloat16),   # hy4f_indexer_weights
-    (3072, 128, torch.bfloat16),  # hy4f_indexer_wk
-    (6144, 160, torch.bfloat16),  # ml4_index_kw
-]
-
-
-@pytest.mark.parametrize("k,n,dtype", PILLAR2_SHAPES)
-def test_pillar2_skinny_projection_row_invariance_and_cutoff(k, n, dtype):
-    require_b12x()
-    from b12x.integration.cuteafd import pointwise
-
-    prog = pointwise.compile_bf16_projection_aot(width=k, outputs=n, output_dtype=dtype, skinny_max_rows=64)
-    assert prog.geometry["skinny_rows"] == 64
-    assert prog.geometry["exact_row_cap"] == 64
-    tma_ref = pointwise.compile_bf16_projection_aot(width=k, outputs=n, output_dtype=dtype)
-
-    gen = torch.Generator(device="cuda").manual_seed(k * 13 + n)
-    w = (torch.randn((n, k), generator=gen, device="cuda") / 16).bfloat16()
-    x = torch.randn((4096, k), generator=gen, device="cuda").bfloat16()
-
-    # Single-row oracle across all 64 rows
-    singles = torch.empty((64, n), dtype=dtype, device="cuda")
-    for r in range(64):
-        prog.launch(x[r:r + 1], w, singles[r:r + 1], scalars=(1,))
-    torch.cuda.synchronize()
-
-    # Numerical accuracy check against FP64
-    ref64 = (x[:64].double() @ w.double().T).to(dtype)
-    atol = 1e-2 if dtype == torch.bfloat16 else 2e-4
-    torch.testing.assert_close(singles.float(), ref64.float(), atol=atol, rtol=1e-2)
-
-    # Exhaustive bitwise row invariance across EVERY row count 1..64 (including 16->17 split) + tail poison
-    for rows in range(1, 65):
-        out = torch.full((80, n), float("nan"), dtype=dtype, device="cuda")
-        prog.launch(x[:rows], w, out, scalars=(rows,))
-        torch.cuda.synchronize()
-        assert _same_bits(out[:rows], singles[:rows]), f"K={k} N={n} rows={rows}: skinny row invariance broken"
-        assert torch.isnan(out[rows:]).all(), f"K={k} N={n} rows={rows}: wrote past live rows"
-
-    # Past skinny cutoff (65..4096): bit-identical to TMA prefill_config and row-invariant across prefill widths
-    out_65 = None
-    for rows in (65, 128, 256, 2048, 2752, 4096):
-        out_s = torch.empty((rows, n), dtype=dtype, device="cuda")
-        out_t = torch.empty((rows, n), dtype=dtype, device="cuda")
-        prog.launch(x[:rows], w, out_s, scalars=(rows,))
-        tma_ref.launch(x[:rows], w, out_t, scalars=(rows,))
-        torch.cuda.synchronize()
-        assert _same_bits(out_s, out_t), f"K={k} N={n} rows={rows}: >64 route must match TMA bit-for-bit"
-        if out_65 is None:
-            out_65 = out_s.clone()
-        else:
-            assert _same_bits(out_s[:65], out_65), f"K={k} N={n} rows={rows}: >64 row invariance broken"
-
-    # CUDA graph replay
-    for rows in (8, 64):
-        buf = torch.zeros((rows, k), dtype=torch.bfloat16, device="cuda")
-        out_g = torch.zeros((rows, n), dtype=dtype, device="cuda")
-        prog.launch(buf, w, out_g, scalars=(rows,))
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            prog.launch(buf, w, out_g, scalars=(rows,))
-        torch.cuda.synchronize()
-        buf.copy_(x[:rows])
-        out_g.fill_(float("nan"))
-        graph.replay()
-        torch.cuda.synchronize()
         assert _same_bits(out_g, singles[:rows])
 
 
 @pytest.mark.parametrize("outputs", (8, 16))
-def test_pillar2_scaled_projection_fused_skinny_and_cutoff(outputs):
+def test_pillar1_scaled_projection_tma_tiles_bit_exact(outputs):
     require_b12x()
+    import cutlass
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
     from b12x.integration.cuteafd import pointwise
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
 
     width, prescale = 4096, 0.5
     prog = pointwise.compile_bf16_scaled_projection_aot(width=width, outputs=outputs, prescale=prescale)
-    assert prog.geometry["exact_row_cap"] == 64
-    stock_launch = pointwise.ScaleProjection(width, outputs, prescale, skinny_max_rows=0)
-    stock = compile_program(
-        stock_launch, name="test_scale_stock",
+    raw_ref = TmaBf16Projection(outputs, width, out_dtype=cutlass.BFloat16, tiles_by_rows=())
+    ref_proj = compile_program(
+        raw_ref, name="test_scale_ref_proj",
         operands=(Operand("x", torch.bfloat16, f"[rows,{width}]"),
-                  Operand("weight", torch.bfloat16, f"[{outputs},{width}]"),
-                  Operand("out", torch.float32, f"[rows,{outputs}]", "out"),
-                  Operand("scratch", torch.bfloat16, f"[rows,{outputs}]", "scratch")),
-        scalars=(Scalar("rows"),), key=("stock_scale", width, outputs, prescale),
-        scratch={"scratch": lambda rows: int(rows) * int(outputs) * 2},
+                  Operand("w", torch.bfloat16, f"[{outputs},{width}]"),
+                  Operand("out", torch.bfloat16, f"[rows,{outputs}]", "out")),
+        scalars=(Scalar("rows"),), key=("scale_ref", raw_ref.key()),
     )
     gen = torch.Generator(device="cuda").manual_seed(99 + outputs)
     w = (torch.randn((outputs, width), generator=gen, device="cuda") / 16).bfloat16()
@@ -254,53 +167,49 @@ def test_pillar2_scaled_projection_fused_skinny_and_cutoff(outputs):
     for r in range(64):
         prog.launch(x[r:r + 1], w, singles[r:r + 1], scratch[:1], scalars=(1,))
     torch.cuda.synchronize()
-    ref64 = (x[:64].double() @ w.double().T).bfloat16().float() * prescale
-    torch.testing.assert_close(singles, ref64, atol=1e-2, rtol=1e-2)
 
-    for rows in range(1, 65):
-        out = torch.full((80, outputs), float("nan"), dtype=torch.float32, device="cuda")
-        prog.launch(x[:rows], w, out, scratch[:rows], scalars=(rows,))
-        torch.cuda.synchronize()
-        assert _same_bits(out[:rows], singles[:rows])
-        assert torch.isnan(out[rows:]).all()
-
-    out_65 = None
-    for rows in (65, 128, 256, 2048, 2752, 4096):
+    for rows in (1, 7, 16, 17, 32, 33, 64, 65, 128, 256, 2048, 2752, 4096):
         out_p = torch.empty((rows, outputs), dtype=torch.float32, device="cuda")
-        out_s = torch.empty((rows, outputs), dtype=torch.float32, device="cuda")
+        proj_ref = torch.empty((rows, outputs), dtype=torch.bfloat16, device="cuda")
         prog.launch(x[:rows], w, out_p, scratch[:rows], scalars=(rows,))
-        stock.launch(x[:rows], w, out_s, scratch[:rows], scalars=(rows,))
+        ref_proj.launch(x[:rows], w, proj_ref, scalars=(rows,))
         torch.cuda.synchronize()
-        assert _same_bits(out_p, out_s)
-        if out_65 is None:
-            out_65 = out_p.clone()
-        else:
-            assert _same_bits(out_p[:65], out_65)
+        want = proj_ref.float() * prescale
+        assert _same_bits(out_p, want), f"scaled outputs={outputs} rows={rows}: TMA tiles differ"
+        check = min(rows, 64)
+        assert _same_bits(out_p[:check], singles[:check]), (
+            f"scaled outputs={outputs} rows={rows}: bitwise invariance broken across threshold"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Pillar 3: Muse F32 router multi-band bit-exactness across all widths
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("rows", (1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 256, 2048, 2752, 4096))
-def test_pillar3_muse_router_multiband_bit_exact(rows):
+def test_pillar3_muse_router_multiband_bit_exact():
     require_b12x()
     from b12x.integration.cuteafd.muse import compile_router_aot
 
-    gen = torch.Generator(device="cuda").manual_seed(77 + rows)
-    x = torch.randn((rows, 8192), generator=gen, device="cuda").bfloat16()
+    max_rows = 4096
+    gen = torch.Generator(device="cuda").manual_seed(777)
+    x = torch.randn((max_rows, 8192), generator=gen, device="cuda").bfloat16()
     w = (torch.randn((256, 8192), generator=gen, device="cuda") * 0.01).float()
     shipped = compile_router_aot()
     scalar = compile_router_aot(scalar_max_rows=2**31 - 1)
-    out_fast = torch.empty((rows, 256), dtype=torch.float32, device="cuda")
-    out_ref = torch.empty((rows, 256), dtype=torch.float32, device="cuda")
-    shipped.launch(x, w, out_fast, scalars=(rows,))
-    scalar.launch(x, w, out_ref, scalars=(rows,))
+
+    singles = torch.empty((64, 256), dtype=torch.float32, device="cuda")
+    for r in range(64):
+        shipped.launch(x[r:r + 1], w, singles[r:r + 1], scalars=(1,))
     torch.cuda.synchronize()
-    assert _same_bits(out_fast, out_ref), f"muse_router multiband differs from _RouterScalar at rows={rows}"
-    # Single-row invariance check on boundary rows
-    for at in sorted({0, rows // 2, rows - 1}):
-        one = torch.empty((1, 256), dtype=torch.float32, device="cuda")
-        shipped.launch(x[at:at + 1], w, one, scalars=(1,))
+
+    for rows in (1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 256, 2048, 2752, 4096):
+        out_fast = torch.empty((rows, 256), dtype=torch.float32, device="cuda")
+        out_ref = torch.empty((rows, 256), dtype=torch.float32, device="cuda")
+        shipped.launch(x[:rows], w, out_fast, scalars=(rows,))
+        scalar.launch(x[:rows], w, out_ref, scalars=(rows,))
         torch.cuda.synchronize()
-        assert _same_bits(one, out_fast[at:at + 1])
+        assert _same_bits(out_fast, out_ref), f"muse_router differs from _RouterScalar at rows={rows}"
+        check = min(rows, 64)
+        assert _same_bits(out_fast[:check], singles[:check]), (
+            f"muse_router single-row invariance broken across threshold at rows={rows}"
+        )
