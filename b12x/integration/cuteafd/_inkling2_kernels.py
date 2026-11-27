@@ -40,16 +40,49 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import warp
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from b12x._lib.intrinsics import ld_global_v2_u32, ld_shared_bf16_to_f32, shared_ptr_to_u32, st_shared_v4_u32
+from b12x._lib.intrinsics import (
+    ld_shared_bf16_to_f32,
+    ld_shared_f32,
+    ld_shared_v4_u32,
+    shared_ptr_to_u32,
+    st_shared_v4_u32,
+)
 from b12x.attention._shared.contiguous import layout_utils
 from b12x.attention._shared.contiguous.forward import warp_mma_gemm
 from b12x.attention._shared.contiguous.softmax import Softmax
 from b12x.attention.paged._selected_forward import _cp_async_load_128b_zfill
 
 from ._mimo_kernels import LOG2_E, MAX_SPLITS, MimoGqaAttention, MimoSplitMerge, _ceil
-from ._fp8_weights import _e4m3x8_scaled_bf16, _ld_f32
+from ._fp8_weights import _e4m3x8_scaled_bf16
 
 __all__ = ["InklingGqaAttention", "InklingSplitMerge"]
+
+
+@dsl_user_op
+def _cp_async_load_32b_zfill(
+    smem_addr: Int32,
+    gmem_addr: Int64,
+    src_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """4-byte ``cp.async.ca`` copy with zero-fill past ``src_bytes``."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(src_bytes).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.ca.shared.global [$0], [$1], 4, $2;",
+        "r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -115,7 +148,7 @@ class InklingGqaAttention(MimoGqaAttention):
         self.pipe_kv = self.tile_m == self.tile_n
 
     def key(self) -> tuple:
-        return (*super().key(), "inkling2_cache_v2", self.extent, self.kv_format)
+        return (*super().key(), "inkling2_cache_v3", self.extent, self.kv_format)
 
     @cute.jit
     def __call__(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
@@ -132,16 +165,15 @@ class InklingGqaAttention(MimoGqaAttention):
             block=(self.threads, 1, 1), stream=stream)
 
     @cute.jit
-    def _stage_tile(self, tile: Int32, buf: Int32, lo: Int64, p_min: Int64, row0: Int64, kv_head: Int32,
-                    cache: cute.Pointer, rel: cute.Pointer, live: Int32, token_pos: cute.Tensor,
-                    key_addr: cute.Tensor, s_k: cute.Tensor, s_v: cute.Tensor, s_rel: cute.Tensor, thread: Int32):
-        """Issue two ``cp.async`` commit groups for ``tile`` from ``key_addr[buf]``:
-        group 1 stages ``K`` and (when any distance can fall below ``extent``) ``rel``;
-        group 2 stages ``V``."""
+    def _stage_k_rel(self, tile: Int32, buf: Int32, lo: Int64, p_min: Int64, row0: Int64, kv_head: Int32,
+                     cache: cute.Pointer, rel: cute.Pointer, live: Int32, token_pos: cute.Tensor,
+                     key_addr: cute.Tensor, s_k: cute.Tensor, s_rel: cute.Tensor, s_k_sc: cute.Tensor,
+                     thread: Int32):
+        """Issue one ``cp.async`` commit group for ``K`` (raw FP8 + scales or BF16) and ``rel``."""
         k_vectors = self.head // 8
         cache_fallback = Int64(cache.toint())
         if const_expr(self.kv_format == "fp8"):
-            self._stage_fp8_plane(key_addr, buf, kv_head, s_k, thread, False)
+            self._stage_fp8_plane_async(key_addr, buf, kv_head, cache_fallback, s_k, s_k_sc, thread, False)
         else:
             for it_k in cutlass.range_constexpr(self.tile_n * k_vectors // self.threads):
                 linear_k = thread + Int32(it_k * self.threads)
@@ -195,10 +227,15 @@ class InklingGqaAttention(MimoGqaAttention):
                     )
         cute.arch.cp_async_commit_group()
 
+    @cute.jit
+    def _stage_v(self, buf: Int32, kv_head: Int32, cache: cute.Pointer, key_addr: cute.Tensor,
+                 s_v: cute.Tensor, s_v_sc: cute.Tensor, thread: Int32):
+        """Issue one ``cp.async`` commit group for ``V`` (raw FP8 + scales or BF16)."""
         v_vectors = self.v_head // 8
         v0 = self.kv_heads * self.head
+        cache_fallback = Int64(cache.toint())
         if const_expr(self.kv_format == "fp8"):
-            self._stage_fp8_plane(key_addr, buf, kv_head, s_v, thread, True)
+            self._stage_fp8_plane_async(key_addr, buf, kv_head, cache_fallback, s_v, s_v_sc, thread, True)
         else:
             for it_v in cutlass.range_constexpr(self.tile_n * v_vectors // self.threads):
                 linear_v = thread + Int32(it_v * self.threads)
@@ -219,23 +256,87 @@ class InklingGqaAttention(MimoGqaAttention):
         cute.arch.cp_async_commit_group()
 
     @cute.jit
-    def _stage_fp8_plane(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32,
-                         shared: cute.Tensor, thread: Int32, value: cutlass.Constexpr):
-        # Eight E4M3 values widen into one aligned 16-byte BF16 shared store,
-        # reusing the existing native MiMo conversion instruction sequence.
-        for it in cutlass.range_constexpr(self.tile_n * 16 // self.threads):
-            index = thread + Int32(it * self.threads)
-            token, dim = index // Int32(16), (index % Int32(16))*Int32(8)
-            base = Int64(key_addr[buf, token])
-            lo, hi = cutlass.Uint32(0), cutlass.Uint32(0)
-            scale = Float32(1.0)
-            if base >= Int64(0):
-                plane = self.kv_heads if value else 0
-                lo, hi = ld_global_v2_u32(base + (Int64(plane)+Int64(kv_head))*Int64(128)+Int64(dim))
-                scale = _ld_f32(base+Int64(self.scale_offset)+(Int64(plane)+Int64(kv_head))*Int64(4))
-            w0, w1, w2, w3 = _e4m3x8_scaled_bf16(lo, hi, scale)
-            st_shared_v4_u32(shared_ptr_to_u32(shared.iterator + cute.crd2idx((token, dim), shared.layout)),
-                             w0, w1, w2, w3)
+    def _stage_tile(self, tile: Int32, buf: Int32, lo: Int64, p_min: Int64, row0: Int64, kv_head: Int32,
+                    cache: cute.Pointer, rel: cute.Pointer, live: Int32, token_pos: cute.Tensor,
+                    key_addr: cute.Tensor, s_k: cute.Tensor, s_v: cute.Tensor, s_rel: cute.Tensor,
+                    s_k_sc: cute.Tensor, s_v_sc: cute.Tensor, thread: Int32):
+        """Issue two ``cp.async`` commit groups for ``tile`` from ``key_addr[buf]``:
+        group 1 stages ``K`` and (when any distance can fall below ``extent``) ``rel``;
+        group 2 stages ``V``."""
+        self._stage_k_rel(tile, buf, lo, p_min, row0, kv_head, cache, rel, live, token_pos,
+                          key_addr, s_k, s_rel, s_k_sc, thread)
+        self._stage_v(buf, kv_head, cache, key_addr, s_v, s_v_sc, thread)
+
+    @cute.jit
+    def _stage_fp8_plane_async(self, key_addr: cute.Tensor, buf: Int32, kv_head: Int32, cache_fallback: Int64,
+                               shared: cute.Tensor, s_plane_scale: cute.Tensor, thread: Int32,
+                               value: cutlass.Constexpr):
+        """Stage one raw FP8 K or V plane (16-byte ``cp.async.cg``) into the first half of
+        ``shared`` and its per-token FP32 descales (4-byte ``cp.async.ca``) into ``s_plane_scale``."""
+        plane = self.kv_heads if value else 0
+        payload_off = (Int64(plane) + Int64(kv_head)) * Int64(128)
+        scale_off = Int64(self.scale_offset) + (Int64(plane) + Int64(kv_head)) * Int64(4)
+        dst_base = shared_ptr_to_u32(shared.iterator)
+        total_chunks = self.tile_n * 8
+        for it in cutlass.range_constexpr(_ceil(total_chunks, self.threads)):
+            linear = thread + Int32(it * self.threads)
+            if const_expr(total_chunks % self.threads == 0) or linear < Int32(total_chunks):
+                token = linear // Int32(8)
+                stripe = linear % Int32(8)
+                base = Int64(key_addr[buf, token])
+                valid = base >= Int64(0)
+                src = cutlass.select_(valid, base + payload_off + Int64(stripe * Int32(16)), cache_fallback)
+                _cp_async_load_128b_zfill(
+                    dst_base + linear * Int32(16),
+                    src,
+                    cutlass.select_(valid, Int32(16), Int32(0)),
+                )
+        if thread < Int32(self.tile_n):
+            base = Int64(key_addr[buf, thread])
+            valid = base >= Int64(0)
+            src_s = cutlass.select_(valid, base + scale_off, cache_fallback)
+            _cp_async_load_32b_zfill(
+                shared_ptr_to_u32(s_plane_scale.iterator) + thread * Int32(4),
+                src_s,
+                cutlass.select_(valid, Int32(4), Int32(0)),
+            )
+
+    @cute.jit
+    def _widen_fp8_plane(self, shared: cute.Tensor, s_plane_scale: cute.Tensor, thread: Int32):
+        """Widen raw FP8 bytes staged in the first half of ``shared`` with ``s_plane_scale`` into
+        the swizzled BF16 layout of ``shared`` (bit-identical to ``_e4m3x8_scaled_bf16``)."""
+        total_chunks = self.tile_n * 8
+        iters = _ceil(total_chunks, self.threads)
+        src_base = shared_ptr_to_u32(shared.iterator)
+        scale_base = shared_ptr_to_u32(s_plane_scale.iterator)
+        words = cute.make_rmem_tensor(cute.make_layout((iters, 4)), cutlass.Uint32)
+        scales = cute.make_rmem_tensor(cute.make_layout((iters,)), Float32)
+        for it in cutlass.range_constexpr(iters):
+            linear = thread + Int32(it * self.threads)
+            if const_expr(total_chunks % self.threads == 0) or linear < Int32(total_chunks):
+                token = linear // Int32(8)
+                a, b, c, d = ld_shared_v4_u32(src_base + linear * Int32(16))
+                words[it, 0], words[it, 1], words[it, 2], words[it, 3] = a, b, c, d
+                scales[it] = ld_shared_f32(scale_base + token * Int32(4))
+        # Raw payload aliases the first half of the BF16 tile; finish every raw read before overwriting.
+        cute.arch.sync_threads()
+        for it in cutlass.range_constexpr(iters):
+            linear = thread + Int32(it * self.threads)
+            if const_expr(total_chunks % self.threads == 0) or linear < Int32(total_chunks):
+                token = linear // Int32(8)
+                dim = (linear % Int32(8)) * Int32(16)
+                s = scales[it]
+                w0, w1, w2, w3 = _e4m3x8_scaled_bf16(words[it, 0], words[it, 1], s)
+                st_shared_v4_u32(
+                    shared_ptr_to_u32(shared.iterator + cute.crd2idx((token, dim), shared.layout)),
+                    w0, w1, w2, w3,
+                )
+                w4, w5, w6, w7 = _e4m3x8_scaled_bf16(words[it, 2], words[it, 3], s)
+                st_shared_v4_u32(
+                    shared_ptr_to_u32(shared.iterator + cute.crd2idx((token, dim + Int32(8)), shared.layout)),
+                    w4, w5, w6, w7,
+                )
+        cute.arch.sync_threads()
 
     @cute.jit
     def _qk_bias_softmax(self, buf: Int32, k0: Int64, p_min: Int64, p_max: Int64, live: Int32,
@@ -405,22 +506,23 @@ class InklingGqaAttention(MimoGqaAttention):
                    kv_step: cute.Pointer, page_table: cute.Pointer, table_base: Int64, seq_start: Int64,
                    step_first: Int64, ring_base: Int64, rel: cute.Pointer, live: Int32, token_pos: cute.Tensor,
                    key_addr: cute.Tensor, key_pos: cute.Tensor, s_k_next: cute.Tensor, s_v_next: cute.Tensor,
-                   s_rel_next: cute.Tensor, s_p: cute.Tensor, s_scale: cute.Tensor, s_rel_cur: cute.Tensor,
-                   thread: Int32, tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma, r_q: cute.Tensor,
-                   r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy, c_k: cute.TiledCopy,
-                   c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k_cur: cute.Tensor,
-                   cs_p: cute.Tensor, cs_v_cur: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax,
-                   cur_buf: cutlass.Constexpr, is_first: cutlass.Constexpr):
+                   s_rel_next: cute.Tensor, s_k_sc_next: cute.Tensor, s_v_sc_next: cute.Tensor,
+                   s_v_cur: cute.Tensor, s_v_sc_cur: cute.Tensor, s_p: cute.Tensor, s_scale: cute.Tensor,
+                   s_rel_cur: cute.Tensor, thread: Int32, tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma,
+                   r_q: cute.Tensor, r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy,
+                   c_k: cute.TiledCopy, c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor,
+                   cs_k_cur: cute.Tensor, cs_p: cute.Tensor, cs_v_cur: cute.Tensor, acc_o: cute.Tensor,
+                   softmax: Softmax, cur_buf: cutlass.Constexpr, is_first: cutlass.Constexpr):
         """One 2-stage pipelined tile step: issue ``(K+rel, V)`` of ``idx + 1`` before ``QK_idx``,
-        drain ``V_idx`` before ``PV_idx``, resolve ``idx + 2`` during ``PV_idx``, and drain
-        ``(K+rel)_{idx+1}`` after ``PV_idx``."""
+        drain (and for FP8 widen) ``V_idx`` before ``PV_idx``, resolve ``idx + 2`` during ``PV_idx``,
+        and drain (and for FP8 widen) ``(K+rel)_{idx+1}`` after ``PV_idx``."""
         next_buf = 1 - cur_buf
         has_next = (idx + Int32(1)) < my_tiles
         has_next2 = (idx + Int32(2)) < my_tiles
         tile_cur = split + idx * splits
         if has_next:
             self._stage_tile(tile_cur + splits, Int32(next_buf), lo, p_min, row0, kv_head, cache, rel, live,
-                             token_pos, key_addr, s_k_next, s_v_next, s_rel_next, thread)
+                             token_pos, key_addr, s_k_next, s_v_next, s_rel_next, s_k_sc_next, s_v_sc_next, thread)
         k0 = lo + Int64(tile_cur) * Int64(self.tile_n)
         self._qk_bias_softmax(Int32(cur_buf), k0, p_min, p_max, live, token_pos, key_pos, s_p, s_scale,
                               s_rel_cur, thread, tiled_mma_qk, r_q, r_k, c_q, c_k, cs_q, cs_k_cur, softmax,
@@ -430,6 +532,8 @@ class InklingGqaAttention(MimoGqaAttention):
         else:
             cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
+        if const_expr(self.kv_format == "fp8"):
+            self._widen_fp8_plane(s_v_cur, s_v_sc_cur, thread)
         if has_next2:
             self._resolve(tile_cur + Int32(2) * splits, Int32(cur_buf), lo, hi, cache, kv_step, page_table,
                           table_base, seq_start, step_first, ring_base, key_addr, key_pos, thread)
@@ -437,6 +541,9 @@ class InklingGqaAttention(MimoGqaAttention):
         if has_next:
             cute.arch.cp_async_wait_group(1)
         cute.arch.sync_threads()
+        if has_next:
+            if const_expr(self.kv_format == "fp8"):
+                self._widen_fp8_plane(s_k_next, s_k_sc_next, thread)
 
     @cute.jit
     def _single_step(self, idx: Int32, my_tiles: Int32, split: Int32, splits: Int32, buf: Int32, lo: Int64,
@@ -444,30 +551,37 @@ class InklingGqaAttention(MimoGqaAttention):
                      kv_step: cute.Pointer, page_table: cute.Pointer, table_base: Int64, seq_start: Int64,
                      step_first: Int64, ring_base: Int64, rel: cute.Pointer, live: Int32, token_pos: cute.Tensor,
                      key_addr: cute.Tensor, key_pos: cute.Tensor, s_k: cute.Tensor, s_v: cute.Tensor,
-                     s_p: cute.Tensor, s_scale: cute.Tensor, s_rel: cute.Tensor, thread: Int32,
-                     tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma, r_q: cute.Tensor, r_k: cute.Tensor,
-                     r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy, c_k: cute.TiledCopy,
-                     c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor, cs_k: cute.Tensor,
-                     cs_p: cute.Tensor, cs_v: cute.Tensor, acc_o: cute.Tensor, softmax: Softmax,
-                     is_first: cutlass.Constexpr):
-        """Decode single-stage K/V/rel step: overlap ``V`` transfer with ``QK + bias + softmax`` and
-        overlap next-tile address resolution with ``PV``."""
+                     s_p: cute.Tensor, s_scale: cute.Tensor, s_rel: cute.Tensor, s_k_sc: cute.Tensor,
+                     s_v_sc: cute.Tensor, thread: Int32, tiled_mma_qk: cute.TiledMma, tiled_mma_pv: cute.TiledMma,
+                     r_q: cute.Tensor, r_k: cute.Tensor, r_p: cute.Tensor, r_v: cute.Tensor, c_q: cute.TiledCopy,
+                     c_k: cute.TiledCopy, c_p: cute.TiledCopy, c_v: cute.TiledCopy, cs_q: cute.Tensor,
+                     cs_k: cute.Tensor, cs_p: cute.Tensor, cs_v: cute.Tensor, acc_o: cute.Tensor,
+                     softmax: Softmax, is_first: cutlass.Constexpr):
+        """Decode single-stage K/V/rel step: overlap ``V_idx`` transfer with ``QK_idx`` and
+        overlap ``(K+rel)_{idx+1}`` transfer with ``PV_idx`` using the idle ``s_k``/``s_rel`` slots."""
         tile_cur = split + idx * splits
         has_next = (idx + Int32(1)) < my_tiles
-        self._stage_tile(tile_cur, buf, lo, p_min, row0, kv_head, cache, rel, live, token_pos, key_addr,
-                         s_k, s_v, s_rel, thread)
-        cute.arch.cp_async_wait_group(1)
-        cute.arch.sync_threads()
+        if const_expr(self.kv_format == "fp8"):
+            self._widen_fp8_plane(s_k, s_k_sc, thread)
         k0 = lo + Int64(tile_cur) * Int64(self.tile_n)
         self._qk_bias_softmax(buf, k0, p_min, p_max, live, token_pos, key_pos, s_p, s_scale, s_rel, thread,
                               tiled_mma_qk, r_q, r_k, c_q, c_k, cs_q, cs_k, softmax, is_first)
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.sync_threads()
         if has_next:
             self._resolve(tile_cur + splits, Int32(1) - buf, lo, hi, cache, kv_step, page_table, table_base,
                           seq_start, step_first, ring_base, key_addr, key_pos, thread)
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+        if const_expr(self.kv_format == "fp8"):
+            self._widen_fp8_plane(s_v, s_v_sc, thread)
+        if has_next:
+            self._stage_k_rel(tile_cur + splits, Int32(1) - buf, lo, p_min, row0, kv_head, cache, rel, live,
+                              token_pos, key_addr, s_k, s_rel, s_k_sc, thread)
         self._pv_step(s_scale, thread, tiled_mma_pv, r_p, r_v, c_p, c_v, cs_p, cs_v, acc_o, is_first)
         cute.arch.sync_threads()
+        if has_next:
+            self._stage_v(Int32(1) - buf, kv_head, cache, key_addr, s_v, s_v_sc, thread)
+            cute.arch.cp_async_wait_group(1)
+            cute.arch.sync_threads()
 
     @cute.kernel
     def kernel(self, q: cute.Pointer, cache: cute.Pointer, kv_step: cute.Pointer, positions: cute.Pointer,
@@ -509,6 +623,17 @@ class InklingGqaAttention(MimoGqaAttention):
             s_rel1 = allocator.allocate_tensor(element_type=BFloat16, layout=rel_layout, byte_alignment=16)
         s_scale = allocator.allocate_tensor(element_type=Float32, layout=cute.make_layout((self.tile_m,)),
                                             byte_alignment=16)
+        if const_expr(self.kv_format == "fp8"):
+            fp8_scale_layout = cute.make_layout((self.tile_n,))
+            s_k_sc0 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+            s_v_sc0 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+            if const_expr(self.pipe_kv):
+                s_k_sc1 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+                s_v_sc1 = allocator.allocate_tensor(element_type=Float32, layout=fp8_scale_layout, byte_alignment=16)
+            else:
+                s_k_sc1, s_v_sc1 = s_k_sc0, s_v_sc0
+        else:
+            s_k_sc0 = s_v_sc0 = s_k_sc1 = s_v_sc1 = s_scale
         key_addr = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
             (2, self.tile_n), stride=(self.tile_n, 1)), byte_alignment=16)
         key_pos = allocator.allocate_tensor(element_type=Int64, layout=cute.make_layout(
@@ -616,52 +741,60 @@ class InklingGqaAttention(MimoGqaAttention):
         if const_expr(self.pipe_kv):
             if my_tiles > Int32(0):
                 self._stage_tile(split, Int32(0), lo, p_min, row0, kv_head, cache, rel, live, token_pos,
-                                 key_addr, s_k0, s_v0, s_rel0, thread)
+                                 key_addr, s_k0, s_v0, s_rel0, s_k_sc0, s_v_sc0, thread)
                 if my_tiles > Int32(1):
                     self._resolve(split + splits, Int32(1), lo, hi, cache, kv_step, page_table, table_base,
                                   seq_start, step_first, ring_base, key_addr, key_pos, thread)
                 cute.arch.cp_async_wait_group(1)
                 cute.arch.sync_threads()
+                if const_expr(self.kv_format == "fp8"):
+                    self._widen_fp8_plane(s_k0, s_k_sc0, thread)
 
                 self._pipe_step(Int32(0), my_tiles, split, splits, lo, hi, p_min, p_max, row0, kv_head, cache,
                                 kv_step, page_table, table_base, seq_start, step_first, ring_base, rel, live,
-                                token_pos, key_addr, key_pos, s_k1, s_v1, s_rel1, s_p, s_scale, s_rel0, thread,
-                                tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k0,
-                                cs_p, cs_v0, acc_o, softmax, cur_buf=0, is_first=True)
+                                token_pos, key_addr, key_pos, s_k1, s_v1, s_rel1, s_k_sc1, s_v_sc1, s_v0, s_v_sc0,
+                                s_p, s_scale, s_rel0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
+                                c_q, c_k, c_p, c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax, cur_buf=0, is_first=True)
                 pairs = (my_tiles - Int32(1)) // Int32(2)
                 for pair in cutlass.range(pairs, unroll=1):
                     idx1 = Int32(1) + Int32(pair) * Int32(2)
                     self._pipe_step(idx1, my_tiles, split, splits, lo, hi, p_min, p_max, row0, kv_head, cache,
                                     kv_step, page_table, table_base, seq_start, step_first, ring_base, rel, live,
-                                    token_pos, key_addr, key_pos, s_k0, s_v0, s_rel0, s_p, s_scale, s_rel1, thread,
-                                    tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q,
-                                    cs_k1, cs_p, cs_v1, acc_o, softmax, cur_buf=1, is_first=False)
+                                    token_pos, key_addr, key_pos, s_k0, s_v0, s_rel0, s_k_sc0, s_v_sc0, s_v1, s_v_sc1,
+                                    s_p, s_scale, s_rel1, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
+                                    c_q, c_k, c_p, c_v, cs_q, cs_k1, cs_p, cs_v1, acc_o, softmax, cur_buf=1,
+                                    is_first=False)
                     self._pipe_step(idx1 + Int32(1), my_tiles, split, splits, lo, hi, p_min, p_max, row0, kv_head,
                                     cache, kv_step, page_table, table_base, seq_start, step_first, ring_base, rel,
-                                    live, token_pos, key_addr, key_pos, s_k1, s_v1, s_rel1, s_p, s_scale, s_rel0,
-                                    thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v,
-                                    cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax, cur_buf=0, is_first=False)
+                                    live, token_pos, key_addr, key_pos, s_k1, s_v1, s_rel1, s_k_sc1, s_v_sc1, s_v0,
+                                    s_v_sc0, s_p, s_scale, s_rel0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p,
+                                    r_v, c_q, c_k, c_p, c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax, cur_buf=0,
+                                    is_first=False)
                 if (my_tiles - Int32(1)) % Int32(2) != Int32(0):
                     self._pipe_step(my_tiles - Int32(1), my_tiles, split, splits, lo, hi, p_min, p_max, row0,
                                     kv_head, cache, kv_step, page_table, table_base, seq_start, step_first,
-                                    ring_base, rel, live, token_pos, key_addr, key_pos, s_k0, s_v0, s_rel0, s_p,
-                                    s_scale, s_rel1, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q,
-                                    c_k, c_p, c_v, cs_q, cs_k1, cs_p, cs_v1, acc_o, softmax, cur_buf=1,
-                                    is_first=False)
+                                    ring_base, rel, live, token_pos, key_addr, key_pos, s_k0, s_v0, s_rel0, s_k_sc0,
+                                    s_v_sc0, s_v1, s_v_sc1, s_p, s_scale, s_rel1, thread, tiled_mma_qk, tiled_mma_pv,
+                                    r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k1, cs_p, cs_v1, acc_o, softmax,
+                                    cur_buf=1, is_first=False)
         else:
             if my_tiles > Int32(0):
+                self._stage_tile(split, Int32(0), lo, p_min, row0, kv_head, cache, rel, live, token_pos,
+                                 key_addr, s_k0, s_v0, s_rel0, s_k_sc0, s_v_sc0, thread)
+                cute.arch.cp_async_wait_group(1)
+                cute.arch.sync_threads()
                 self._single_step(Int32(0), my_tiles, split, splits, Int32(0), lo, hi, p_min, p_max, row0, kv_head,
                                   cache, kv_step, page_table, table_base, seq_start, step_first, ring_base, rel,
-                                  live, token_pos, key_addr, key_pos, s_k0, s_v0, s_p, s_scale, s_rel0, thread,
-                                  tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k0,
-                                  cs_p, cs_v0, acc_o, softmax, is_first=True)
+                                  live, token_pos, key_addr, key_pos, s_k0, s_v0, s_p, s_scale, s_rel0, s_k_sc0,
+                                  s_v_sc0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v, c_q, c_k, c_p,
+                                  c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax, is_first=True)
                 for local in cutlass.range(my_tiles - Int32(1), unroll=1):
                     idx = Int32(local) + Int32(1)
                     self._single_step(idx, my_tiles, split, splits, idx % Int32(2), lo, hi, p_min, p_max, row0,
                                       kv_head, cache, kv_step, page_table, table_base, seq_start, step_first,
                                       ring_base, rel, live, token_pos, key_addr, key_pos, s_k0, s_v0, s_p,
-                                      s_scale, s_rel0, thread, tiled_mma_qk, tiled_mma_pv, r_q, r_k, r_p, r_v,
-                                      c_q, c_k, c_p, c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax,
+                                      s_scale, s_rel0, s_k_sc0, s_v_sc0, thread, tiled_mma_qk, tiled_mma_pv, r_q,
+                                      r_k, r_p, r_v, c_q, c_k, c_p, c_v, cs_q, cs_k0, cs_p, cs_v0, acc_o, softmax,
                                       is_first=False)
 
         # Final scale per M row with its (row, head) sink (direct), or the LSE for split partials.
