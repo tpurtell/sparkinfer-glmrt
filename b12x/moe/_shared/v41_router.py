@@ -375,9 +375,12 @@ class _V41RouterScores:
 
 
 
-# One canonical reduction order for every V4.1 decode/verify width (#736).
-# Keep the kernel choice here so a measured row-invariant winner can replace it.
-V41_ROUTER_SKINNY_MAX_ROWS = 64
+# One canonical reduction order for every V4.1 decode/verify width (#736, #2793).
+# DeepSeek V4.1 one-lane 1x RTX resolves DECODE_ROWS=128 and family admission
+# covers up to 256 decode/verify rows; keeping skinny through 256 preserves
+# bitwise M=1 row-invariance across every admitted decode wave while keeping
+# M<=64 tiles unchanged and >256 prefill chunks on the TMA MMA route.
+V41_ROUTER_SKINNY_MAX_ROWS = 256
 
 
 from b12x.gemm.bf16_gemv._skinny import SkinnyBf16Gemv, router_skinny
