@@ -149,11 +149,12 @@ class _Sequence:
         return self.ring_id * self.g.ring_rows + positions % self.g.ring_rows
 
 
-def _step(g, kind, route, sequences, splits=8):
+def _step(g, kind, route, sequences, max_splits=32):
     """One engine step over ``(sequence, inputs, n)`` rows in order; returns the BF16 output."""
     capacity = DECODE if route == "decode" else PREFILL
     rows = sum(n for _, _, n in sequences)
-    program = _program(g, kind=kind, route=route, max_rows=capacity)
+    program = _program(g, kind=kind, route=route, max_rows=capacity,
+                       **({"max_splits": max_splits} if kind == "global" and route == "decode" else {}))
     positions = torch.cat([torch.arange(s.len, s.len + n, device="cuda") for s, _, n in sequences])
     q = torch.cat([x.q[s.len:s.len + n] for s, x, n in sequences]).contiguous()
     rel = torch.cat([x.rel[s.len:s.len + n] for s, x, n in sequences]).contiguous()
@@ -174,7 +175,7 @@ def _step(g, kind, route, sequences, splits=8):
             tiles.extend(range(r0, r0+n, 1 if route == "decode" else 10))
             r0 += n
         i32 = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
-        scalars = (rows, stride, len(tiles)) + ((splits,) if route == "decode" else ())
+        scalars = (rows, stride, len(tiles))
         program.launch(q, cache, positions, page_table, i32(indices), i32(firsts), i32(tiles), rel, sinks,
                        out, _scratch(program, rows), scalars=scalars)
     else:
@@ -239,17 +240,17 @@ def test_inkling2_attention_chain(g, kind, schedule):
     assert worst >= COS and worst_ratio <= 1.0
 
 
-@pytest.mark.parametrize("splits", [1, 8, 32])
-def test_inkling2_global_decode_splits(g, splits):
+@pytest.mark.parametrize("max_splits", [1, 8, 32])
+def test_inkling2_global_decode_splits(g, max_splits):
     """Split-K decode over a long context: partials + the per-(row, head) sink merge."""
     kind, length, new = "global", 3000, 16
     x = _Inputs(g, kind, length + new, seed=11)
     expected, ceiling = x.reference(), x.ceiling()
     seq = _Sequence(g, kind, length + new)
     _step(g, kind, "prefill", [(seq, x, length)])
-    got = _step(g, kind, "decode", [(seq, x, new)], splits=splits)
+    got = _step(g, kind, "decode", [(seq, x, new)], max_splits=max_splits)
     torch.cuda.synchronize()
-    c, delta, bound = _check(f"inkling2_global_attention decode splits={splits} at {length}", got,
+    c, delta, bound = _check(f"inkling2_global_attention decode max_splits={max_splits} at {length}", got,
                              expected[length:], ceiling[length:])
     assert c >= COS and delta <= bound
 

@@ -35,13 +35,14 @@ def _program(g, **kw):
     return _PROGRAMS[key]
 
 
-def _step(g, kind, route, sequences, splits=8, kv_format="bf16"):
+def _step(g, kind, route, sequences, max_splits=32, kv_format="bf16"):
     from b12x.integration.cuteafd.inkling2_attention import prefill_tokens
     from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_kv_pack_aot
 
     capacity = DECODE if route == "decode" else PREFILL
     rows = sum(n for _, _, n in sequences)
-    program = _program(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format)
+    program = _program(g, kind=kind, route=route, max_rows=capacity, kv_format=kv_format,
+                       **({"max_splits": max_splits} if kind == "global" and route == "decode" else {}))
     positions = torch.cat([torch.arange(s.len, s.len + n, device="cuda") for s, _, n in sequences])
     q = torch.cat([x.q[s.len:s.len + n] for s, x, n in sequences]).contiguous()
     rel = torch.cat([x.rel[s.len:s.len + n] for s, x, n in sequences]).contiguous()
@@ -74,7 +75,7 @@ def _step(g, kind, route, sequences, splits=8, kv_format="bf16"):
             tiles.extend(range(r0, r0 + n, step_tokens))
             r0 += n
         i32 = lambda values: torch.tensor(values, dtype=torch.int32, device="cuda")
-        scalars = (rows, stride, len(tiles)) + ((splits,) if route == "decode" else ())
+        scalars = (rows, stride, len(tiles))
         program.launch(q, cache, positions, page_table, i32(indices), i32(firsts), i32(tiles),
                        rel, sinks, out, small_attn._scratch(program, rows), scalars=scalars)
     else:
@@ -118,8 +119,8 @@ def test_inkling2_mini_attention_chain(g, kind, schedule):
     assert worst >= COS and worst_ratio <= 1.0
 
 
-@pytest.mark.parametrize("splits", [1, 8, 32])
-def test_inkling2_mini_global_decode_splits_bf16_and_fp8(g, splits):
+@pytest.mark.parametrize("max_splits", [1, 8, 32])
+def test_inkling2_mini_global_decode_splits_bf16_and_fp8(g, max_splits):
     from b12x.integration.cuteafd.inkling2_attention import record_bytes
 
     length, new = 2200, 16
@@ -134,10 +135,10 @@ def test_inkling2_mini_global_decode_splits_bf16_and_fp8(g, splits):
                 dtype=torch.uint8, device="cuda",
             )
         _step(g, "global", "prefill", [(seq, x, length)], kv_format=kv_format)
-        got = _step(g, "global", "decode", [(seq, x, new)], splits=splits, kv_format=kv_format)
+        got = _step(g, "global", "decode", [(seq, x, new)], max_splits=max_splits, kv_format=kv_format)
         torch.cuda.synchronize()
         c = small_attn.cosine(got, expected[length:])
-        print(f"inkling2_mini_global {kv_format} decode splits={splits}: cosine {c:.7f}")
+        print(f"inkling2_mini_global {kv_format} decode max_splits={max_splits}: cosine {c:.7f}")
         assert c >= (COS if kv_format == "bf16" else FP8_COS)
 
 
